@@ -7,98 +7,89 @@ from datetime import datetime
 Base = declarative_base()
 
 @declarative_mixin
-class UrlStateMixin:
+class UrlStateCurrentMixin:
     url = Column(String, primary_key=True)
-    domain = Column(String, index=True)
+    domain_id = Column(Integer, nullable=False)
 
-    # Typesense contents
-    content_path = Column(String)
-
-    # Scheduler timestamps
+    # Scheduler timestamps.
     first_seen = Column(DateTime(timezone=True), server_default=func.now())
-    last_offered = Column(DateTime(timezone=True), default=datetime.min, index=True)
-    last_fetched = Column(DateTime(timezone=True), default=datetime.min, index=True)
-    last_typesense_push = Column(DateTime(timezone=True), default=datetime.min, index=True)
-    next_recrawl = Column(DateTime(timezone=True), default=datetime.min, index=True)
+    last_scheduled = Column(DateTime(timezone=True))
+    last_fetch_ok = Column(DateTime(timezone=True))
+    last_content_update = Column(DateTime(timezone=True))
 
-    # Status
-    fetch_ok = Column(Integer, default=0)
-    fetch_fail = Column(Integer, default=0)
-    update_count = Column(Integer, default=0)
-    typesense_ok = Column(Integer, default=0)
-    typesense_fail = Column(Integer, default=0)
-    status = Column(String, default="new", index=True)  # new / queued / ok / failed
-    failed_reason = Column(String)
-    content_hash = Column(String, index=True)
-    has_update = Column(Boolean, default=False, index=True)
+    # 90-day event counter
+    num_scheduled_90d = Column(Integer, default=0)
+    num_fetch_ok_90d = Column(Integer, default=0)
+    num_fetch_fail_90d = Column(Integer, default=0)
+    num_content_update_90d = Column(Integer, default=0)
 
-    # Link count
-    inlink_count = Column(Integer, default=0)
-    outlink_count = Column(Integer, default=0)
+    num_consecutive_fail = Column(Integer, default=0)
+    last_fail_reason = Column(String)
 
-    # Scheduling parameters
-    crawl_priority = Column(Float, default=0.0, index=True)
-    index_priority = Column(Float, default=0.0, index=True)
-    domain_score = Column(Float, default=0.0, index=True)
+    content_hash = Column(String)
 
-    indexed = Column(Integer, default=0, index=True)
-    indexed_reason = Column(String, default="", index=True)
+    should_crawl = Column(Boolean, default=True)
 
-@declarative_mixin
-class DomainStatsMixin:
-    domain = Column(String, primary_key=True)
-    url_count = Column(Integer, default=0)
+    # Priority signals
+    url_score = Column(Float, default=0.0)
     domain_score = Column(Float, default=0.0)
-    offered_count = Column(Integer, default=0)
-    fetch_ok = Column(Integer, default=0)
-    fetch_fail = Column(Integer, default=0)
-    update_count = Column(Integer, default=0)
-    typesense_ok = Column(Integer, default=0)
-    typesense_fail = Column(Integer, default=0)
-    failed_rate = Column(Float, default=0.0)
-    update_rate = Column(Float, default=0.0)
-    fail_reasons = Column(JSONB, default=dict)
 
 @declarative_mixin
-class DomainStatsDailyMixin:
-    domain = Column(String, primary_key=True)
-    stat_date = Column(Date, primary_key=True)
-    offered_count = Column(Integer, default=0)
-    fetch_ok = Column(Integer, default=0)
-    fetch_fail = Column(Integer, default=0)
-    update_count = Column(Integer, default=0)
-    typesense_ok = Column(Integer, default=0)
-    typesense_fail = Column(Integer, default=0)
-    failed_rate = Column(Float, default=0.0)
-    update_rate = Column(Float, default=0.0)
+class ContentFeatureCurrentMixin:
+    url = Column(String, primary_key=True)
+    domain_id = Column(Integer, nullable=False)
+
+    fetched_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    content_length = Column(Integer, default=0)
+    content_hash = Column(String)
+    num_links = Column(Integer, default=0)
+
+class DomainState(Base):
+    __tablename__ = "domain_state"
+
+    domain_id = Column(Integer, primary_key=True)
+    domain = Column(String, nullable=False, unique=True)
+
+    shard_id = Column(Integer, nullable=False)
+
+    # Crawl priority signal
+    domain_score = Column(Float, default=0.0)
+
+class DomainStatsDaily(Base):
+    __tablename__ = "domain_stats_daily"
+
+    domain_id = Column(Integer, primary_key=True)
+    event_date = Column(Date, primary_key=True)
+
+    shard_id = Column(Integer, nullable=False)
+
+    num_scheduled = Column(Integer, default=0)
+    num_fetch_ok = Column(Integer, default=0)
+    num_fetch_fail = Column(Integer, default=0)
+    num_content_update = Column(Integer, default=0)
+
     fail_reasons = Column(JSONB, default=dict)
 
 class SummaryDaily(Base):
     __tablename__ = "summary_daily"
-    stat_date = Column(Date, primary_key=True)
 
-    # Crawling status
+    event_date = Column(Date, primary_key=True)
+
     new_links = Column(Integer, default=0)
-    offered_count = Column(Integer, default=0)
-    fetch_ok = Column(Integer, default=0)
-    fetch_fail = Column(Integer, default=0)
-    update_count = Column(Integer, default=0)
-    failed_rate = Column(Float, default=0.0)
-    update_rate = Column(Float, default=0.0)
+    num_scheduled = Column(Integer, default=0)
+    num_fetch_ok = Column(Integer, default=0)
+    num_fetch_fail = Column(Integer, default=0)
+    num_content_update = Column(Integer, default=0)
+
     fail_reasons = Column(JSONB, default=dict)
 
-    # Indexing status
-    typesense_ok = Column(Integer, default=0)
-    typesense_fail = Column(Integer, default=0)
-
-    # scheduler server error
     error_count = Column(Integer, default=0)
-    ingest_error = Column(Integer, default=0)
-    upload_error = Column(Integer, default=0)
-    refill_error = Column(Integer, default=0)
     offer_error = Column(Integer, default=0)
-    update_error = Column(Integer, default=0)
-    json_read_error = Column(Integer, default=0)
+    route_error = Column(Integer, default=0)
+    ingest_error = Column(Integer, default=0)
+    stats_error = Column(Integer, default=0)
+    extract_error = Column(Integer, default=0)
 
 class UrlLink(Base):
     __tablename__ = "url_link"

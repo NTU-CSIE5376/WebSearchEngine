@@ -1,6 +1,6 @@
 from Database.ModelFactory.DynamicModelFactory import DynamicModelFactory
 from Database.MetricModels import CrawlerStatMixin, MetricCoverageMixin, MetricBatch, MetricQuery, MetricURL
-from Database.CrawlerModels import UrlStateMixin, DomainStatsMixin, DomainStatsDailyMixin, SummaryDaily, UrlLink
+from Database.CrawlerModels import UrlStateCurrentMixin, ContentFeatureCurrentMixin, DomainState, DomainStatsDaily, SummaryDaily, UrlLink
 
 class AppModelFactory():
     def __init__(self, crawlerBase, metricBase):
@@ -42,30 +42,28 @@ class AppModelFactory():
     def create_metric_url(self):
         return MetricURL
     
-    def create_url_state_model(self, idx: int):
-        """Dynamically create UrlState ORM class for a given shard table."""
+    def create_url_state_current_model(self, idx: int):
+        """Dynamically create UrlStateCurrent ORM class for a given shard table."""
         return self.crawlerModelFactory.get_or_create(
-            mixin=UrlStateMixin,
-            table_base_name=f'url_state',
-            class_base_name=f'url_state',
+            mixin=UrlStateCurrentMixin,
+            table_base_name=f'url_state_current',
+            class_base_name=f'UrlStateCurrent',
             suffix=f'{idx:03}'
         )
 
-    def create_domain_stats_model(self, idx: int):
+    def create_content_feature_current_model(self, idx: int):
         return self.crawlerModelFactory.get_or_create(
-            mixin=DomainStatsMixin,
-            table_base_name=f'domain_stats',
-            class_base_name=f'domain_stats',
+            mixin=ContentFeatureCurrentMixin,
+            table_base_name=f'content_feature_current',
+            class_base_name=f'ContentFeatureCurrent',
             suffix=f'{idx:03}'
         )
 
-    def create_domain_daily_model(self, idx: int):
-        return self.crawlerModelFactory.get_or_create(
-            mixin=DomainStatsDailyMixin,
-            table_base_name=f'domain_stats_daily',
-            class_base_name=f'domain_stats_daily',
-            suffix=f'{idx:03}'
-        )
+    def create_domain_state_model(self):
+        return DomainState
+
+    def create_domain_daily_model(self):
+        return DomainStatsDaily
     
     def create_summary_model(self):
         return SummaryDaily

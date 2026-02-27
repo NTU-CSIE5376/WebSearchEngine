@@ -5,7 +5,7 @@ import time
 # --- 設定區 ---
 
 # 1. 來源：ws2 (沒有 SSL)
-SOURCE_URL = "postgresql+psycopg2://metric:metric@ws2.csie.ntu.edu.tw:22215/metricdb"
+SOURCE_URL = "postgresql+psycopg2://metric:metric@172.16.191.1:5433/metricdb"
 
 # 2. 目的：Neon (有 SSL)
 # 注意：我移除了 channel_binding=require 以增加相容性，保留 sslmode=require

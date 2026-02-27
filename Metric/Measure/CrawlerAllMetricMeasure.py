@@ -37,45 +37,52 @@ class CrawlerAllMetricMeasure(Measure):
         except:
             return ""
 
-    def _scan_domain_shard(self, shard_ids, domain_tuple):
+    def _scan_domain_shard(self, domain_tuple):
         """
         掃描 CrawlerDB 的 Domain Tables，建立 Domain -> Shard ID 的映射
         """
+        if not domain_tuple:
+            return {}
+
         found_map = {}
         with self.crawlerDB.session() as session:
-            for i in shard_ids:
-                try:
-                    DomainStats = self.modelFactory.create_domain_stats_model(i)
-                    stmt = select(DomainStats.domain).where(DomainStats.domain.in_(domain_tuple))
-                    result = session.execute(stmt).scalars()
-                    for domain in result:
-                        found_map[domain] = i
-                except Exception:
-                    pass
+            try:
+                DomainState = self.modelFactory.create_domain_state_model()
+                stmt = (
+                    select(DomainState.domain, DomainState.shard_id)
+                    .where(DomainState.domain.in_(domain_tuple))
+                )
+
+                for domain, shard_id in session.execute(stmt).all():
+                    found_map[domain] = shard_id
+
+            except Exception:
+                print("[Error] scan domain_state failed")
+
         return found_map
 
     def _scan_url_shard(self, shard_ids, url_tuple):
         """
         掃描 CrawlerDB 的 Url State Tables，取得 URL 的發現/爬取/索引狀態
+        回傳: List[(url: str, crawled: bool, indexed: bool, shard_id: int)]
+
         """
-        found_data = [] # List of (url, fetch_ok, indexed, table_id)
+        found_data = []
         
         with self.crawlerDB.session() as session:
             for i in shard_ids:
                 try:
-                    UrlState = self.modelFactory.create_url_state_model(i)
+                    UrlState = self.modelFactory.create_url_state_current_model(i)
                     # 判斷 URL 是否存在於該分片
                     stmt = select(
-                        UrlState.url, 
-                        UrlState.fetch_ok, 
-                        UrlState.indexed
+                        UrlState.url,
+                        UrlState.last_fetch_ok.is_not(None).label("crawled")
                     ).where(UrlState.url.in_(url_tuple))
 
-                    result = session.execute(stmt)
-                    for row in result:
-                        found_data.append((row.url, row.fetch_ok, row.indexed, i))
+                    for url, crawled in session.execute(stmt).all():
+                        found_data.append((url, bool(crawled), False, i))
                 except Exception:
-                    pass
+                    print("[Error] scan url_state_current failed")
         return found_data
 
     def test(self):
@@ -147,12 +154,8 @@ class CrawlerAllMetricMeasure(Measure):
         shard_chunks = [range(i, min(i + chunk_size, 256)) for i in range(0, 256, chunk_size)]
 
         # A. 掃描 Domain Tables (為了確定 Shard ID / Team)
-        domain_shard_map = {}
-        print(f"🔍 Scanning Domain Tables ({MAX_WORKERS} threads)...")
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(self._scan_domain_shard, chunk, domain_tuple) for chunk in shard_chunks]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Domains"):
-                domain_shard_map.update(future.result())
+        print(f"🔍 Scanning Domain Tables ...")
+        domain_shard_map = self._scan_domain_shard(domain_tuple)
 
         # B. 掃描 URL Tables (為了確定 Status)
         # 初始化 URL 狀態
@@ -166,11 +169,11 @@ class CrawlerAllMetricMeasure(Measure):
             futures = [executor.submit(self._scan_url_shard, chunk, url_tuple) for chunk in shard_chunks]
             for future in tqdm(as_completed(futures), total=len(futures), desc="URLs"):
                 results = future.result()
-                for (url, fetch_ok, indexed, shard_id) in results:
+                for (url, crawled, indexed, shard_id) in results:
                     if url in url_status_map:
                         url_status_map[url]['discovered'] = True
-                        url_status_map[url]['crawled'] = (fetch_ok > 0)
-                        url_status_map[url]['indexed'] = (indexed == 1)
+                        url_status_map[url]['crawled'] = crawled
+                        url_status_map[url]['indexed'] = indexed
                         url_status_map[url]['shard_id'] = shard_id
 
         # ==========================================

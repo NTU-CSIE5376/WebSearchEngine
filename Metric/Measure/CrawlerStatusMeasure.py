@@ -18,19 +18,20 @@ class CrawlerStatusMeasure(Measure):
     def _scan_shard(self, shard_id):
         """
         掃描單一分片，取得目前的 Snapshot 狀態
+        回傳 (shard_id, discovered, crawled, indexed)
+        * indexed 為 0，需另建立 Index DB
         """
         with self.crawlerDB.session() as session:
             try:
-                UrlState = self.modelFactory.create_url_state_model(shard_id)
+                UrlState = self.modelFactory.create_url_state_current_model(shard_id)
                 
                 stmt = select(
                     func.count(), # discovered
-                    func.count(case((UrlState.fetch_ok > 0, 1))), # crawled
-                    func.count(case((UrlState.indexed > 0, 1)))   # indexed
+                    func.count().filter(UrlState.last_fetch_ok.is_not(None)) # crawled
                 )
                 
                 result = session.execute(stmt).one()
-                return shard_id, result[0], result[1], result[1]
+                return shard_id, result[0], result[1], 0
                 
             except Exception as e:
                 return shard_id, 0, 0, 0
@@ -50,24 +51,24 @@ class CrawlerStatusMeasure(Measure):
         with self.crawlerDB.session() as session:
             # 一次撈取過去 30 天的資料
             rows = session.query(SummaryDaily).filter(
-                and_(SummaryDaily.stat_date >= start_date_30, SummaryDaily.stat_date <= target_date)
+                and_(SummaryDaily.event_date >= start_date_30, SummaryDaily.event_date <= target_date)
             ).all()
             
             # 在記憶體中進行聚合計算 (Python loop)
             # 這樣處理 JSONB 的 key 累加比寫複雜 SQL 容易維護
             for row in rows:
                 # 計算該列與目標日期的差距
-                delta_days = (target_date - row.stat_date).days
+                delta_days = (target_date - row.event_date).days
                 
                 # 基礎數值
-                f_ok = row.fetch_ok or 0
-                f_fail = row.fetch_fail or 0
+                f_ok = row.num_fetch_ok or 0
+                f_fail = row.num_fetch_fail or 0
                 f_total = f_ok + f_fail
                 
                 # 解析 fail_reasons (JSONB)
                 reasons = row.fail_reasons if row.fail_reasons else {}
                 err_404 = reasons.get("HttpError 404", 0)
-                err_500 = reasons.get("HttpError 500", 0) # 依據你的需求 HttpError 505
+                err_500 = reasons.get("HttpError 500", 0)
                 
                 # 1. 當日數據 (delta_days == 0)
                 if delta_days == 0:
