@@ -5,6 +5,9 @@ paths. Production stages wrap them and publish their outputs in
 `pointers.json`; a backtest calls them on its own directory and leaves the
 production state alone. One process at a time changes the work directory: the
 CLI and the daemon take `manifest.work_lock` at their entry points.
+
+After a measurement, `forward_eval` scores the list that was live on the batch
+that measurement created, and logs labels for later sweeps and training.
 """
 
 from __future__ import annotations
@@ -22,8 +25,8 @@ import duckdb
 import psycopg
 
 import idxsel
-from idxsel.config import Config
-from idxsel.duck import open_duckdb
+from idxsel.config import Config, ConfigError
+from idxsel.duck import open_duckdb, sql_str
 from idxsel.evaluate import evaluate, verify_live
 from idxsel.export import (
     ExportContext,
@@ -36,6 +39,7 @@ from idxsel.export import (
 from idxsel.features import PriorKind, build_features
 from idxsel.golden import build_golden
 from idxsel.guards import DbProbe, Guard, GuardAbort, LocalProbe, PreflightFailed, RemoteProbe
+from idxsel.labels import sweep, write_labels
 from idxsel.load import ensure_schema, load_selection, swap, update_eval_metrics
 from idxsel.log import EventLog
 from idxsel.manifest import (
@@ -133,6 +137,22 @@ def _latest_as_of(state: dict[str, Any]) -> datetime:
     if state.get("compacted"):
         stamps.append(state["compacted"]["as_of"])
     return max(datetime.fromisoformat(str(s)) for s in stamps)
+
+
+def _post_feature_deltas(rt: Runtime, features_id: str) -> tuple[list[Path], datetime | None]:
+    """Deltas exported after feature set `features_id`, and the time they cover.
+
+    Only the compacted feature set has its later deltas listed in the state. A
+    shard's history is read up to its watermark time, so the oldest watermark
+    time bounds what the deltas hold.
+    """
+    state = load_state(rt.layout)
+    if (state.get("compacted") or {}).get("features") != features_id or not state["deltas"]:
+        return [], None
+    stamps = [datetime.fromisoformat(str(w["wm_at"]))
+              for w in state["watermarks"].values() if w.get("wm_at")]
+    return ([rt.layout.delta_dir(d["id"]) for d in state["deltas"]],
+            min(stamps) if stamps else None)
 
 
 def stage_export(rt: Runtime, mode: str, shards: Sequence[int] | None = None,
@@ -385,12 +405,15 @@ def stage_swap(rt: Runtime, db_run_id: int | None = None) -> dict[str, Any]:
 
 
 def eval_run(rt: Runtime, run_dir: Path, features_dir: Path, golden_dir: Path,
-             db_run_id: int | None) -> dict[str, Any]:
+             db_run_id: int | None, *, out_dir: Path | None = None,
+             deltas: Sequence[Path] = (), covered_until: datetime | None = None
+             ) -> dict[str, Any]:
     """Evaluates a run's own selection; records it on its model_runs row if it was loaded."""
     con = rt.duck()
     try:
         report = evaluate(rt.cfg, con, run_dir / "selected.parquet", golden_dir, features_dir,
-                          read_json(golden_dir / "meta.json"), run_dir)
+                          read_json(golden_dir / "meta.json"), out_dir or run_dir,
+                          deltas=deltas, covered_until=covered_until)
     finally:
         con.close()
     if db_run_id is not None:
@@ -505,20 +528,67 @@ def deadline_before_build(rt: Runtime, what: str) -> datetime | None:
     return start
 
 
-def backtest(rt: Runtime) -> dict[str, Any]:
+def _with_cfg(rt: Runtime, **sections: Any) -> Runtime:
+    """A runtime on the same work dir whose config replaces fields in some sections."""
+    cfg = rt.cfg
+    return Runtime(dataclasses.replace(cfg, **{
+        name: dataclasses.replace(getattr(cfg, name), **fields)
+        for name, fields in sections.items()}))
+
+
+def _log_labels(rt: Runtime, report: dict[str, Any], *, features_dir: Path,
+                run_golden_dir: Path, eval_golden_dir: Path, selected: Path,
+                forward: bool, source: str) -> dict[str, str]:
+    """Writes a label set per evaluated batch; batches that fed the list are skipped."""
+    used = set(read_json(run_golden_dir / "meta.json")["batches_used"])
+    state = load_state(rt.layout)
+    dims = rt.layout.dims_dir(state["dims"]) if state.get("dims") else None
+    out: dict[str, str] = {}
+    con = rt.duck()
+    try:
+        for batch in report["batches"]:
+            entries = {k: v for k, v in report["results"].items()
+                       if k.startswith(f"batch{batch}_")}
+            if batch in used or not entries:
+                out[str(batch)] = "skipped"
+                rt.events.emit("labels.skipped", batch=batch,
+                               reason="fed the list" if batch in used else "no results")
+                continue
+            path = write_labels(
+                rt.cfg, con, batch=batch, features_dir=features_dir,
+                run_golden_dir=run_golden_dir, eval_golden_dir=eval_golden_dir,
+                selected=selected, root=rt.layout.labels, dims_dir=dims,
+                in_sample=any(e["in_sample"] for e in entries.values()), forward=forward,
+                extra={"source": source, "eval": entries})
+            out[str(batch)] = "written" if path else "kept"
+            rt.events.emit(f"labels.{out[str(batch)]}", batch=batch, forward=forward)
+    finally:
+        con.close()
+    return out
+
+
+def backtest(rt: Runtime, profile: str | None = None) -> dict[str, Any]:
     """Golden -> select -> eval on the latest feature set for `golden.target_batch`.
 
     Reads metricdb only. crawlerdb, selectdb, the export state and the pointers
-    stay untouched; the outputs go to `backtests/<id>/`.
+    stay untouched; the outputs go to `backtests/<id>/` and `labels/`.
 
-    Run after a measurement and before the next build, with `target_batch =
-    "next"`, it scores the live list on the batch that measurement created: the
-    only out-of-sample number (see `evaluate`).
+    Args:
+        rt: Runtime.
+        profile: A selection profile to use instead of `selection.profile`.
 
     Raises:
         WorkDirBusy: Inside the pre-measurement build window, which must not wait.
+        ConfigError: For an unknown profile.
+        PreflightFailed: If the work fs lacks room for the scored candidates.
     """
     deadline_before_build(rt, "backtest")
+    if profile is not None:
+        if profile not in rt.cfg.selection.profiles:
+            raise ConfigError(f"unknown profile {profile!r}")
+        rt = _with_cfg(rt, selection={"profile": profile})
+    rt.guard(None).preflight("backtest", reads_crawlerdb=False,
+                             reserve_gb=rt.cfg.guard.build_reserve_gb, host1=False)
     features_id = rt.pointers().get("features")
     if not features_id:
         raise RuntimeError("no feature set yet; run `features` first")
@@ -527,13 +597,104 @@ def backtest(rt: Runtime) -> dict[str, Any]:
     root = rt.layout.backtest_dir(utc_id())
     golden = golden_into(rt, root / "golden", as_of)
     manifest = select_into(rt, features_dir, root / "golden", root / "run")
-    report = eval_run(rt, root / "run", features_dir, root / "golden", None)
+    deltas, covered = _post_feature_deltas(rt, features_id)
+    report = eval_run(rt, root / "run", features_dir, root / "golden", None,
+                      deltas=deltas, covered_until=covered)
+    labels = _log_labels(rt, report, features_dir=features_dir, run_golden_dir=root / "golden",
+                         eval_golden_dir=root / "golden",
+                         selected=root / "run" / "selected.parquet", forward=False,
+                         source="backtest")
     summary = {"backtest_dir": str(root), "features": features_id,
+               "profile": rt.cfg.selection.profile,
                "target_batch": golden["target_batch"], "selection": manifest["selection"],
-               "eval": report["results"]}
+               "eval": report["results"], "labels": labels}
     atomic_write_json(root / "backtest.json", summary)
     rt.events.emit("backtest.done", backtest_dir=str(root), results=report["results"])
     return summary
+
+
+def _utc(ts: datetime) -> datetime:
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
+
+
+def forward_eval(rt: Runtime, measured_at: datetime) -> dict[str, Any]:
+    """Scores the list that was live at `measured_at` on the batch the measurement made.
+
+    The list is evaluated as it was loaded, never rebuilt. Reads metricdb and,
+    as the reader role, our selectdb's `model_runs`; writes `forward_evals/<id>/`
+    and leak-free labels. It records why it skipped when the live run is unknown
+    (no run, or a swap or rollback after the measurement) or no batch is newer
+    than the list's feature set (the metric reused its last batch).
+    """
+    reader = rt.reader_session()
+    try:
+        runs = [(label, _utc(at)) for label, at in reader.fetchall(
+            "SELECT run_label, activated_at FROM public.model_runs "
+            "WHERE activated_at IS NOT NULL ORDER BY activated_at")]
+    finally:
+        reader.close()
+    now = datetime.now(UTC)
+    if any(measured_at < at <= now for _, at in runs):
+        rt.events.emit("forward_eval.ambiguous_live", measured_at=measured_at)
+        return {"skipped": "ambiguous_live"}
+    live = [label for label, at in runs if at <= measured_at]
+    run_dir = rt.layout.run_dir(live[-1]) if live else None
+    manifest = read_json(run_dir / "manifest.json") if run_dir else None
+    if (manifest is None
+            or not (rt.layout.features_dir(manifest["features"]) / "meta.json").exists()
+            or not (rt.layout.golden_dir(manifest["golden"]) / "meta.json").exists()):
+        rt.events.emit("forward_eval.no_live_run", measured_at=measured_at,
+                       run=live[-1] if live else None)
+        return {"skipped": "no_live_run"}
+    rt.guard(None).preflight("forward_eval", reads_crawlerdb=False, host1=False)
+    features_dir = rt.layout.features_dir(manifest["features"])
+    as_of = datetime.fromisoformat(str(read_json(features_dir / "meta.json")["as_of"]))
+    root = rt.layout.forward_eval_dir(utc_id())
+    nxt = _with_cfg(rt, golden={"target_batch": "next"})
+    golden_into(nxt, root / "golden", as_of)
+    con = rt.duck()
+    try:
+        created = {b: _utc(t) for b, t in con.execute(
+            f"SELECT batch_id, max(batch_created_at)::TIMESTAMP FROM "
+            f"read_parquet({sql_str(str(root / 'golden' / 'golden.parquet'))}) GROUP BY batch_id"
+        ).fetchall()}
+    finally:
+        con.close()
+    newer = sorted(b for b, t in created.items() if t > as_of)
+    if not newer:
+        latest = max(created, key=created.get) if created else None
+        shutil.rmtree(root)
+        rt.events.emit("forward_eval.no_new_batch", measured_at=measured_at,
+                       latest_batch=latest, latest_created_at=created.get(latest),
+                       features_as_of=as_of)
+        return {"skipped": "no_new_batch", "latest_batch": latest}
+    scoped = _with_cfg(nxt, eval={"batches": newer})
+    deltas, covered = _post_feature_deltas(rt, manifest["features"])
+    report = eval_run(scoped, run_dir, features_dir, root / "golden", None, out_dir=root,
+                      deltas=deltas, covered_until=covered)
+    labels = _log_labels(scoped, report, features_dir=features_dir,
+                         run_golden_dir=rt.layout.golden_dir(manifest["golden"]),
+                         eval_golden_dir=root / "golden", selected=run_dir / "selected.parquet",
+                         forward=True, source="forward_eval")
+    summary = {"forward_eval_dir": str(root), "measured_at": measured_at,
+               "run": manifest["run_id"], "features": manifest["features"], "batches": newer,
+               "eval": report["results"], "labels": labels}
+    atomic_write_json(root / "forward_eval.json", summary)
+    rt.events.emit("forward_eval.done", run=manifest["run_id"], batches=newer,
+                   results=report["results"])
+    return summary
+
+
+def sweep_labels(rt: Runtime, profiles: Sequence[str] | None = None,
+                 batches: Sequence[int] | None = None) -> dict[str, Any]:
+    """Runs `labels.sweep` without the work lock: no spill, a small memory cap."""
+    con = rt.duck(spill=False)
+    try:
+        con.execute("SET memory_limit = ?", [rt.cfg.labels.sweep_memory_limit])
+        return sweep(rt.cfg, con, rt.layout.labels,
+                     list(profiles or rt.cfg.selection.profiles), batches)
+    finally:
+        con.close()
 
 
 def _dirs_by_completion(root: Path, marker: str) -> tuple[list[Path], list[Path]]:
@@ -543,7 +704,7 @@ def _dirs_by_completion(root: Path, marker: str) -> tuple[list[Path], list[Path]
 
 
 def gc_storage(rt: Runtime) -> dict[str, int]:
-    """Deletes exports, golden sets, feature sets, runs and backtests nobody needs.
+    """Deletes exports, golden sets, feature sets, runs, backtests and partial labels.
 
     It runs only under the work lock, so a directory without its completion
     marker is a failed attempt, and no DuckDB or load is using the temp dir.
@@ -574,12 +735,17 @@ def gc_storage(rt: Runtime) -> dict[str, int]:
     for root, marker, keep in ((layout.root / "golden", "meta.json", cfg.storage.keep_runs),
                                (layout.root / "runs", "manifest.json", cfg.storage.keep_runs),
                                (layout.root / "backtests", "backtest.json",
+                                cfg.storage.keep_runs),
+                               (layout.root / "forward_evals", "forward_eval.json",
                                 cfg.storage.keep_runs)):
         complete, unfinished = _dirs_by_completion(root, marker)
         doomed += [p for p in unfinished + complete[:-keep] if p.name not in protected]
     # A feature set nothing points at can never be merged again: its deltas are gone.
     doomed += [p for p in sorted((layout.root / "features").glob("*"))
                if p.is_dir() and p.name not in protected]
+    # Complete label sets are kept forever (small); anything else there is a failed write.
+    doomed += [p for p in sorted(layout.labels.glob("*")) if p.is_dir()
+               and not (p.name.isdigit() and (p / "meta.json").exists())]
     for p in doomed:
         shutil.rmtree(p)
     shutil.rmtree(layout.duckdb_tmp, ignore_errors=True)
@@ -656,6 +822,9 @@ def _tick(rt: Runtime, sched: dict[str, Any], now: datetime) -> None:
             sched["last_delta_at"] = now.isoformat()
         elif decision.action == Action.BUILD:
             _build(rt, sched, target)
+        elif decision.action == Action.FORWARD_EVAL:
+            forward_eval(rt, decision.measurement)
+            sched["forward_eval_for"] = target
     except NeedFullRefresh as exc:
         _request_full(rt, str(exc))
     except (PreflightFailed, GuardAbort) as exc:

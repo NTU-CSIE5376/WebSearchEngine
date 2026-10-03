@@ -7,6 +7,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
@@ -14,9 +15,8 @@ import psycopg
 import pyarrow.parquet as pq
 import pytest
 from conftest import ENV, K
-from fixture_db import STATE_COLUMNS, write_accounting_rows
+from fixture_db import STATE_COLUMNS, add_batch, drop_batch, write_accounting_rows
 from helpers import EXAMPLE
-from psycopg.types.json import Jsonb
 
 from idxsel.manifest import work_lock
 from idxsel.urlnorm import canonicalize, md5_number_lower
@@ -219,18 +219,11 @@ def test_backtest_after_a_measurement_scores_the_live_list_out_of_sample(
     live, _ = _selection(servers)
     crawled_not_listed = sorted(set(_truth(servers)) - set(live))
     # The measurement creates batch 4 after the list was built.
-    metric_dsn = servers["crawler"].dsn(user="metric", password="metric", db="metricdb")
-    created = datetime.now(UTC).replace(tzinfo=None)
-    with psycopg.connect(metric_dsn, autocommit=True) as conn:
-        conn.execute("INSERT INTO metric_batches (id, created_at) VALUES (4, %s)", (created,))
-        for q in range(10):
-            (qid,) = conn.execute(
-                "INSERT INTO metric_queries (batch_id, keyword, tags) VALUES (4, %s, %s) "
-                "RETURNING id", (f"kw4-{q}", Jsonb(["head", "random"]))).fetchone()
-            urls = sorted(live)[q * 3:q * 3 + 3] + crawled_not_listed[q * 3:q * 3 + 3]
-            for rank, url in enumerate(urls, 1):
-                conn.execute("INSERT INTO metric_url (query_id, url, rank) VALUES (%s, %s, %s)",
-                             (qid, url, rank))
+    metric_dsn = _metric_dsn(servers)
+    add_batch(metric_dsn, 4, datetime.now(UTC), [
+        (f"kw4-{q}", ["head", "random"],
+         sorted(live)[q * 3:q * 3 + 3] + crawled_not_listed[q * 3:q * 3 + 3])
+        for q in range(10)])
     try:
         out = _cli(nxt, "backtest")
         head = out["eval"]["batch4_head"]
@@ -244,12 +237,65 @@ def test_backtest_after_a_measurement_scores_the_live_list_out_of_sample(
                 (sorted(set(golden)),))}
         assert head["indexed_exact_rate"] == pytest.approx(len(hits) / len(set(golden)))
         assert 0 < head["indexed_exact_rate"] < 1
+        # The labels of batch 4 are out of sample; batch 3 fed the list and is skipped.
+        assert out["labels"] == {"4": "written"}
+        label = overlay.parent / "work" / "labels" / "4"
+        meta = json.loads((label / "meta.json").read_text())
+        assert meta["in_sample"] is False and meta["forward"] is False
+        rows = pq.read_table(label / "golden.parquet").to_pylist()
+        head_urls = {r["raw_url"] for r in rows if "head" in r["tags"]}
+        listed = {r["raw_url"] for r in rows if "head" in r["tags"] and r["selected_exact"]}
+        assert len(listed) / len(head_urls) == pytest.approx(head["indexed_exact_rate"])
     finally:
-        with psycopg.connect(metric_dsn, autocommit=True) as conn:
-            conn.execute("DELETE FROM metric_url WHERE query_id IN "
-                         "(SELECT id FROM metric_queries WHERE batch_id = 4)")
-            conn.execute("DELETE FROM metric_queries WHERE batch_id = 4")
-            conn.execute("DELETE FROM metric_batches WHERE id = 4")
+        drop_batch(metric_dsn, 4)
+
+
+def _metric_dsn(servers):
+    return servers["crawler"].dsn(user="metric", password="metric", db="metricdb")
+
+
+def test_sweep_matches_backtest_per_profile(overlay, servers):
+    _cli(overlay, "export", "--mode", "full")
+    _cli(overlay, "features")
+    runs = {p: _cli(overlay, "backtest", "--profile", p) for p in ("baseline_v1", "ext_tier_v1")}
+    assert runs["baseline_v1"]["labels"] == {"3": "written"}  # in sample: features are newer
+    assert runs["ext_tier_v1"]["labels"] == {"3": "kept"}
+    swept = _cli(overlay, "sweep", "--profiles", "baseline_v1,ext_tier_v1")
+    assert swept["batches"]["3"]["in_sample"] is True
+    for profile, run in runs.items():
+        assert run["profile"] == profile
+        for tag in ("head", "random"):
+            exact = run["eval"][f"batch3_{tag}"]
+            got = swept["batches"]["3"]["tags"][tag][profile]
+            assert got["indexed_exact"] == exact["indexed_exact"], (profile, tag)
+            assert got["ci95"] == pytest.approx(exact["indexed_exact_ci95"])
+    assert swept["pooled"]["forward"] == {}  # no post-measurement labels yet
+    err = _cli(overlay, "backtest", "--profile", "nope", code=2)
+    assert err["error"] == "ConfigError" and "nope" in err["reason"]
+
+
+def test_backtest_reports_cutoff_loss(overlay, servers):
+    nxt = _with(overlay, "target_batch = 3", 'target_batch = "next"', "next.toml")
+    _cli(nxt, "export", "--mode", "full")
+    _cli(nxt, "features")
+    time.sleep(1.5)
+    early = _fetch_fresh(servers, per_shard=2)  # fetched after the features, before the batch
+    time.sleep(1.5)
+    created = datetime.now(UTC)
+    time.sleep(1.5)
+    late = _fetch_fresh(servers, per_shard=1)  # fetched after the batch: no cutoff loss
+    metric_dsn = _metric_dsn(servers)
+    add_batch(metric_dsn, 4, created, [
+        (f"kw4-{q}", ["head", "random"], early[q * 2:q * 2 + 2] + late[q:q + 1])
+        for q in range(4)])
+    try:
+        _cli(nxt, "export", "--mode", "delta")
+        head = _cli(nxt, "backtest")["eval"]["batch4_head"]
+        assert head["in_sample"] is False and head["crawled_exact"] == 0
+        assert head["cutoff_loss_exact"] == len(early) == head["cutoff_loss_canonical"]
+        assert head["cutoff_loss_exact_rate"] == pytest.approx(len(early) / (len(early) + 4))
+    finally:
+        drop_batch(metric_dsn, 4)
 
 
 def test_long_manual_commands_refuse_inside_the_build_window(overlay, servers):

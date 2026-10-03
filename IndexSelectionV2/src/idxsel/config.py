@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import tomllib
 import types
 import typing
@@ -149,6 +150,7 @@ class ScheduleCfg:
     min_hours_between_deltas: float
     delta_max_h: float
     error_cooldown_s: float
+    forward_eval_delay_h: float
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,7 @@ class DuckDbCfg:
 class GoldenCfg:
     target_batch: int | str
     prior_half_life_days: float
+    prior_rate_pseudo_golden: float
     tldextract_offline: bool
 
 
@@ -178,9 +181,11 @@ class CapsCfg:
     ext_inlinks: float
     parent_page_score: float
     prior: float
-    fetch_ok_90d: float
+    prior_rate_lift: float
+    domain_ext_inlinks: float
     url_len: float
     fresh_tau_days: float
+    url_date_tau_days: float
 
 
 @dataclass(frozen=True)
@@ -196,7 +201,6 @@ class WeightsCfg:
     url_score: float
     prior: float
     parent: float
-    fetch_ok: float
     short: float
     root: float
     query: float
@@ -204,6 +208,12 @@ class WeightsCfg:
     redirect: float
     fresh: float
     pageview: float
+    prior_rate: float
+    domain_ext: float
+    url_date: float
+    json_ld: float
+    hreflang: float
+    no_title: float
 
 
 @dataclass(frozen=True)
@@ -220,6 +230,7 @@ class SelectionCfg:
     url_score_natural_source: int
     pageview_source: int
     emit_raw_spelling_for_past_golden: bool
+    url_date_regex: str
     filters: FiltersCfg
     caps: CapsCfg
     impute: ImputeCfg
@@ -234,6 +245,13 @@ class EvalCfg:
     bootstrap_samples: int
     bootstrap_seed: int
     live_check_sample_size: int
+
+
+@dataclass(frozen=True)
+class LabelsCfg:
+    sample_mod: int
+    sweep_memory_limit: str
+    top_domains: int
 
 
 @dataclass(frozen=True)
@@ -260,6 +278,7 @@ class Config:
     golden: GoldenCfg
     selection: SelectionCfg
     eval: EvalCfg
+    labels: LabelsCfg
     storage: StorageCfg
     logging: LoggingCfg
 
@@ -398,6 +417,22 @@ def _validate(cfg: Config) -> None:
         errors.append("guard.work_dir_scan_interval_s must be >= 0")
     if cfg.eval.live_check_sample_size < 1:
         errors.append("eval.live_check_sample_size must be >= 1")
+    if cfg.schedule.forward_eval_delay_h <= 0:
+        errors.append("schedule.forward_eval_delay_h must be > 0")
+    if cfg.golden.prior_rate_pseudo_golden <= 0:
+        errors.append("golden.prior_rate_pseudo_golden must be > 0")
+    if s.caps.prior_rate_lift <= 1:
+        errors.append("selection.caps.prior_rate_lift must be > 1")
+    try:
+        if re.compile(s.url_date_regex).groups != 3:
+            errors.append("selection.url_date_regex needs 3 groups: year, month, day")
+    except re.error as exc:
+        errors.append(f"selection.url_date_regex does not compile: {exc}")
+    lb = cfg.labels
+    if lb.sample_mod < 1 or lb.top_domains < 1:
+        errors.append("labels.sample_mod and labels.top_domains must be >= 1")
+    if not lb.sweep_memory_limit:
+        errors.append("labels.sweep_memory_limit must not be empty")
     if errors:
         raise ConfigError("; ".join(errors))
 

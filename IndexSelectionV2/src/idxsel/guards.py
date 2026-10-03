@@ -256,7 +256,8 @@ class Guard:
         self._events = events
         self._now = now
 
-    def _all(self, starting: bool, reserve_gb: float = 0.0) -> list[Finding]:
+    def _all(self, starting: bool, reserve_gb: float = 0.0, host1: bool = True
+             ) -> list[Finding]:
         found: list[Finding] = []
         reason = blackout_reason(self._now(), self._cfg.schedule)
         if reason:
@@ -265,11 +266,12 @@ class Guard:
         if self._db is not None and self._cfg.guard.db_checks_enabled:
             found += self._db.findings(starting=starting)
         found += self._local.findings(starting=starting, reserve_gb=reserve_gb)
-        found += self._remote.findings(starting=starting)
+        if host1:
+            found += self._remote.findings(starting=starting)
         return found
 
     def preflight(self, stage: str, *, reads_crawlerdb: bool = True,
-                  reserve_gb: float = 0.0) -> None:
+                  reserve_gb: float = 0.0, host1: bool = True) -> None:
         """Raises PreflightFailed if any check forbids starting `stage`.
 
         Args:
@@ -277,8 +279,9 @@ class Guard:
             reads_crawlerdb: False skips blackouts and the crawlerdb disk, which only
                 constrain crawlerdb reads.
             reserve_gb: Space on the work fs the stage will still fill after it starts.
+            host1: False skips the Host1 probe, for stages that touch Host1 not at all.
         """
-        bad = [f.reason for f in self._all(starting=True, reserve_gb=reserve_gb)
+        bad = [f.reason for f in self._all(starting=True, reserve_gb=reserve_gb, host1=host1)
                if f.verdict >= Verdict.PAUSE and (reads_crawlerdb or not f.crawlerdb_only)]
         self._events.emit("guard.preflight", stage=stage, ok=not bad, reasons=bad)
         if bad:

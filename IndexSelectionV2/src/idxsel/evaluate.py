@@ -14,13 +14,17 @@ batches (WebCrawler `update_golden_domain_scores.py` re-ranks their domains
 daily, `golden_inject.py` injects them after four weeks), so their URLs get
 crawled because they are golden. Only a list built before its batch existed
 gives an out-of-sample number.
+
+`cutoff_loss` counts golden URLs the crawler fetched after the feature set was
+observed but before the batch existed: no list built from that feature set
+could hold them. It needs a later delta that covers the batch's creation.
 """
 
 from __future__ import annotations
 
 import random
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -46,26 +50,51 @@ def lookup(session: ReadOnlySession, urls: Iterable[str], chunk: int) -> set[str
     return found
 
 
-def _bootstrap(queries: dict[int, set[str]], hits: set[str], samples: int, seed: int
+def _per_query(queries: dict[Any, set[str]], hits: set[str]) -> list[tuple[float, float]]:
+    """(hit weight, total weight) per query; a URL shared by c queries weighs 1/c in each.
+
+    Queries come in id order, so the draws do not depend on how rows were read.
+    """
+    shared = Counter(u for urls in queries.values() for u in urls)
+    return [(sum(1 / shared[u] for u in sorted(queries[q]) if u in hits),
+             sum(1 / shared[u] for u in sorted(queries[q]))) for q in sorted(queries)]
+
+
+def _interval(values: list[float]) -> tuple[float, float]:
+    values.sort()
+    return values[int(0.025 * (len(values) - 1))], values[int(0.975 * (len(values) - 1))]
+
+
+def _bootstrap(queries: dict[Any, set[str]], hits: set[str], samples: int, seed: int
                ) -> tuple[float, float]:
     """95% interval of the distinct-URL hit rate, resampling whole queries.
 
-    A URL shared by c queries weighs 1/c in each, so the full sample gives exactly
-    the distinct-URL rate, and a query drawn twice counts twice.
+    The full sample gives exactly the distinct-URL rate, and a query drawn twice
+    counts twice.
     """
-    shared = Counter(u for urls in queries.values() for u in urls)
-    per_query = [(sum(1 / shared[u] for u in urls if u in hits),
-                  sum(1 / shared[u] for u in urls)) for urls in queries.values()]
+    per_query = _per_query(queries, hits)
     rng = random.Random(seed)
     rates = []
     for _ in range(samples):
         draw = rng.choices(per_query, k=len(per_query))
         weight = sum(w for _, w in draw)
         rates.append(sum(h for h, _ in draw) / weight if weight else 0.0)
-    rates.sort()
-    lo = rates[int(0.025 * (samples - 1))]
-    hi = rates[int(0.975 * (samples - 1))]
-    return lo, hi
+    return _interval(rates)
+
+
+def _paired_bootstrap(queries: dict[Any, set[str]], hits_a: set[str], hits_b: set[str],
+                      samples: int, seed: int) -> tuple[float, float]:
+    """95% interval of rate(b) - rate(a); both rates use the same query draws."""
+    a, b = _per_query(queries, hits_a), _per_query(queries, hits_b)
+    rng = random.Random(seed)
+    index = range(len(a))
+    diffs = []
+    for _ in range(samples):
+        draw = rng.choices(index, k=len(a))
+        weight = sum(a[i][1] for i in draw)
+        diffs.append((sum(b[i][0] for i in draw) - sum(a[i][0] for i in draw)) / weight
+                     if weight else 0.0)
+    return _interval(diffs)
 
 
 def target_batches(cfg: Config, golden_meta: dict[str, Any], golden_path: Path) -> list[int]:
@@ -77,13 +106,43 @@ def target_batches(cfg: Config, golden_meta: dict[str, Any], golden_path: Path) 
     return [max(batch_ids)] if batch_ids else []
 
 
+def _late_fetches(con: duckdb.DuckDBPyConnection, golden: str, deltas: Sequence[Path],
+                  after: datetime) -> dict[str, datetime]:
+    """First fetch after `after` of each golden URL (raw or canonical) in the deltas."""
+    files = [f for d in deltas for f in sorted(d.glob("shard=*/*.parquet"))]
+    if not files:
+        return {}
+    paths = "[" + ", ".join(sql_str(str(f)) for f in files) + "]"
+    rows = con.execute(
+        f"SELECT d.url, epoch_us(min(d.last_fetch_ok)) "
+        f"FROM read_parquet({paths}, hive_partitioning = false) d "
+        f"SEMI JOIN (SELECT raw_url AS u FROM read_parquet({golden}) UNION ALL "
+        f"SELECT canonical_url FROM read_parquet({golden})) g ON g.u = d.url "
+        f"WHERE d.last_fetch_ok > {sql_str(after.isoformat())}::TIMESTAMPTZ GROUP BY d.url"
+    ).fetchall()
+    return {u: _EPOCH + timedelta(microseconds=us) for u, us in rows}
+
+
 def evaluate(cfg: Config, con: duckdb.DuckDBPyConnection, selected: Path, golden_dir: Path,
-             features_dir: Path, golden_meta: dict[str, Any], out_dir: Path) -> dict[str, Any]:
+             features_dir: Path, golden_meta: dict[str, Any], out_dir: Path, *,
+             deltas: Sequence[Path] = (), covered_until: datetime | None = None
+             ) -> dict[str, Any]:
     """Computes the metric replica, funnel and bootstrap CI per (batch, tag).
 
     A batch that fed the past-golden tier or the prior, or that existed when the
     feature set was observed, is marked `in_sample`: its rate is inflated and
     does not predict the next batch.
+
+    Args:
+        cfg: Config.
+        con: DuckDB connection.
+        selected: The evaluated run's `selected.parquet`.
+        golden_dir: Golden set holding the evaluated batches.
+        features_dir: The feature set the run was selected from.
+        golden_meta: The golden set's meta (target batch, batches used).
+        out_dir: Where `eval.json` and `report.md` go.
+        deltas: Delta exports newer than the feature set, for `cutoff_loss`.
+        covered_until: The time up to which `deltas` hold every shard's history.
     """
     golden_path = golden_dir / "golden.parquet"
     golden = sql_str(str(golden_path))
@@ -93,8 +152,10 @@ def evaluate(cfg: Config, con: duckdb.DuckDBPyConnection, selected: Path, golden
     features_glob = sql_str(str(features_dir / "shard=*" / "*.parquet"))
     crawled = {r[0] for r in con.execute(
         f"SELECT DISTINCT f.url FROM read_parquet({features_glob}, hive_partitioning = false) f "
-        f"SEMI JOIN read_parquet({golden}) g ON g.canonical_url = f.url"
+        f"SEMI JOIN (SELECT raw_url AS u FROM read_parquet({golden}) UNION ALL "
+        f"SELECT canonical_url FROM read_parquet({golden})) g ON g.u = f.url"
     ).fetchall()}
+    late = _late_fetches(con, golden, deltas, features_as_of)
     listed = {r[0] for r in con.execute(
         f"SELECT DISTINCT s.url FROM read_parquet({sql_str(str(selected))}) s "
         f"SEMI JOIN (SELECT raw_url AS u FROM read_parquet({golden}) UNION ALL "
@@ -119,7 +180,15 @@ def evaluate(cfg: Config, con: duckdb.DuckDBPyConnection, selected: Path, golden
             exact = {u for u in raw_urls if u in listed}
             canonical = {u for u in raw_urls if canon[u] in listed}
             crawled_raw = {u for u in raw_urls if canon[u] in crawled}
+            crawled_exact = {u for u in raw_urls if u in crawled}
             n = len(raw_urls)
+            covered = covered_until is not None and covered_until >= created[batch]
+
+            def lost(url: str, batch: int = batch) -> bool:
+                return url not in crawled and url in late and late[url] <= created[batch]
+
+            loss_exact = sum(lost(u) for u in raw_urls) if covered else None
+            loss_canon = sum(lost(canon[u]) for u in raw_urls) if covered else None
             lo, hi = _bootstrap(queries, exact, cfg.eval.bootstrap_samples,
                                 cfg.eval.bootstrap_seed)
             results[f"batch{batch}_{tag}"] = {
@@ -130,6 +199,12 @@ def evaluate(cfg: Config, con: duckdb.DuckDBPyConnection, selected: Path, golden
                 "queries": len(queries),
                 "crawled_in_export": len(crawled_raw),
                 "crawled_rate": len(crawled_raw) / n,
+                "crawled_exact": len(crawled_exact),
+                "crawled_exact_rate": len(crawled_exact) / n,
+                "cutoff_loss_exact": loss_exact,
+                "cutoff_loss_exact_rate": None if loss_exact is None else loss_exact / n,
+                "cutoff_loss_canonical": loss_canon,
+                "cutoff_loss_canonical_rate": None if loss_canon is None else loss_canon / n,
                 "indexed_exact": len(exact),
                 "indexed_exact_rate": len(exact) / n,
                 "indexed_exact_ci95": [lo, hi],
@@ -164,14 +239,17 @@ def verify_live(cfg: Config, con: duckdb.DuckDBPyConnection, reader: ReadOnlySes
 
 def render_markdown(report: dict[str, Any]) -> str:
     lines = ["# Index Selection V2 evaluation", "",
-             "| set | in sample | golden URLs | crawled | indexed (exact) | 95% CI |"
-             " indexed (canonical) | recall of crawled |",
-             "|---|---|---|---|---|---|---|---|"]
+             "| set | in sample | golden URLs | crawled | crawled (exact) | indexed (exact) |"
+             " 95% CI | indexed (canonical) | recall of crawled | cutoff loss (exact) |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for name, e in report["results"].items():
         lo, hi = e["indexed_exact_ci95"]
         recall = "-" if e["recall_of_crawled"] is None else f"{e['recall_of_crawled']:.1%}"
+        loss = ("-" if e["cutoff_loss_exact_rate"] is None
+                else f"{e['cutoff_loss_exact_rate']:.1%}")
         lines.append(
             f"| {name} | {'yes' if e['in_sample'] else 'no'} | {e['golden_urls']} | "
-            f"{e['crawled_rate']:.1%} | {e['indexed_exact_rate']:.1%} | {lo:.1%}–{hi:.1%} | "
-            f"{e['indexed_canonical_rate']:.1%} | {recall} |")
+            f"{e['crawled_rate']:.1%} | {e['crawled_exact_rate']:.1%} | "
+            f"{e['indexed_exact_rate']:.1%} | {lo:.1%}–{hi:.1%} | "
+            f"{e['indexed_canonical_rate']:.1%} | {recall} | {loss} |")
     return "\n".join(lines) + "\n"

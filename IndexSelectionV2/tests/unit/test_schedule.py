@@ -8,6 +8,7 @@ from idxsel.schedule import (
     in_window,
     next_measurement,
     plan_next_action,
+    previous_measurement,
     swap_allowed,
 )
 
@@ -77,3 +78,38 @@ def test_plan_waits_in_blackout_even_when_work_is_due():
     d = plan_next_action(t(15, 3), {}, S, full_refresh_due=False, has_base=True)
     assert d.action == Action.WAIT
     assert "blackout" in d.reason
+
+
+def test_previous_measurement_crosses_month_start():
+    assert previous_measurement(t(1, 11), S) == datetime(2026, 9, 16, 12, tzinfo=UTC)
+    assert previous_measurement(t(1, 12), S) == t(1, 12)
+    assert previous_measurement(t(15, 23), S) == t(1, 12)
+
+
+MEASURED = {"built_for": t(1, 12).isoformat(), "last_delta_at": t(2, 5, 30).isoformat()}
+
+
+def test_plan_forward_eval_once_after_delay():
+    assert plan_next_action(t(2, 7, 59), MEASURED, S, False, True).action == Action.WAIT
+    d = plan_next_action(t(2, 8), MEASURED, S, False, True)
+    assert d.action == Action.FORWARD_EVAL and d.measurement == t(1, 12)
+    done = {**MEASURED, "forward_eval_for": t(1, 12).isoformat()}
+    assert plan_next_action(t(2, 8), done, S, False, True).action == Action.WAIT
+
+
+def test_plan_forward_eval_needs_built_for_prev():
+    other = {**MEASURED, "built_for": t(16, 12, month=9).isoformat()}
+    assert plan_next_action(t(2, 8), other, S, False, True).action == Action.WAIT
+
+
+def test_plan_forward_eval_precedes_due_delta():
+    stale = {**MEASURED, "last_delta_at": t(1, 9, 30).isoformat()}
+    assert plan_next_action(t(2, 8), stale, S, False, True).action == Action.FORWARD_EVAL
+    done = {**stale, "forward_eval_for": t(1, 12).isoformat()}
+    assert plan_next_action(t(2, 8), done, S, False, True).action == Action.EXPORT_DELTA
+
+
+def test_plan_never_forward_evals_near_next_build():
+    # 54 h before the next measurement the next cycle's exports may start.
+    late = {**MEASURED, "last_delta_at": t(14, 5, 30).isoformat()}
+    assert plan_next_action(t(14, 6), late, S, False, True).action != Action.FORWARD_EVAL

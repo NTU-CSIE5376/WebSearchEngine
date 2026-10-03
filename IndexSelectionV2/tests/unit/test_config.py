@@ -67,6 +67,16 @@ def test_semantic_validation(tmp_path, old, new, message):
     ("guard", "work_dir_scan_interval_s = -1", "work_dir_scan_interval_s"),
     ("storage", "keep_base_exports = 1", "unknown keys"),
     ("storage", "keep_feature_sets = 1", "unknown keys"),
+    ("schedule", "forward_eval_delay_h = 0", "forward_eval_delay_h"),
+    ("labels", "sample_mod = 0", "labels.sample_mod"),
+    ("labels", "top_domains = 0", "labels.top_domains"),
+    ("labels", "sweep_memory_limit = ''", "sweep_memory_limit"),
+    ("golden", "prior_rate_pseudo_golden = 0", "prior_rate_pseudo_golden"),
+    ("selection.caps", "prior_rate_lift = 1", "prior_rate_lift"),
+    ("selection.caps", "fetch_ok_90d = 10", "unknown keys"),
+    ("selection.profiles.baseline_v1.weights", "fetch_ok = 1", "unknown keys"),
+    ("selection", "url_date_regex = '/(20[0-9]{2})/'", "needs 3 groups"),
+    ("selection", "url_date_regex = '/(20'", "does not compile"),
 ])
 def test_bounds_rejected(tmp_path, section, body, message):
     overlay = tmp_path / "o.toml"

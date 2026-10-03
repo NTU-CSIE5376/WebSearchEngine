@@ -65,12 +65,13 @@ idxsel --config config/idxsel.example.toml --config config/idxsel.host.toml <com
 | `eval` | 用該次 run 自己的 `selected.parquet` 重算 metric（完全比對＋canonical），結果寫回 `model_runs` | 本機；有載入時寫 selectdb |
 | `verify-live` | 用 metric 的 reader 角色確認：線上清單是這次 run、共 K 列、抽樣查得到 | 我們的 selectdb（唯讀） |
 | `run --once [--full]` | 從頭到尾跑完一輪正式流程，清單會上線 | 以上全部 |
-| `backtest` | 用最新的 feature set 跑 golden → select → eval，結果寫到 `backtests/<id>/`。不改 state 和 pointers；BUILD 視窗內拒絕 | metricdb（唯讀）、本機 |
-| `daemon` | 依排程執行：每日 delta、全量更新、量測前建置 | 以上全部 |
+| `backtest [--profile NAME]` | 用最新的 feature set 跑 golden → select → eval，結果寫到 `backtests/<id>/`，並寫 labels。不改 state 和 pointers；BUILD 視窗內拒絕；開始前檢查磁碟（預留 `build_reserve_gb`）；未知的 profile 以回傳碼 2 結束 | metricdb（唯讀）、本機 |
+| `sweep [--profiles a,b] [--batches 18,19]` | 用 labels 在幾秒內估計各 profile 的 indexed rate，並和第一個 profile 做成對比較。只讀 labels、不寫檔、不溢寫 | 本機 |
+| `daemon` | 依排程執行：每日 delta、全量更新、量測前建置、量測後的前瞻評估 | 以上全部 |
 | `status` / `gc` | 查看狀態、清理舊資料 | 本機 |
 
 會改工作目錄的指令要先取工作目錄鎖。拿不到鎖時，指令以回傳碼 4 結束，並印出持鎖者。
-不取鎖的指令：`status`、`probe`、`preflight`、`verify-live`、`rollback`（緊急用，不能排在長時間的匯出後面）、`init-selectdb`。
+不取鎖的指令：`status`、`probe`、`preflight`、`verify-live`、`rollback`（緊急用，不能排在長時間的匯出後面）、`init-selectdb`、`sweep`。
 
 所有參數都在 `config/idxsel.example.toml`，載入時會嚴格檢查：多出未知的 key、缺少 key、型別錯誤都會直接報錯。
 本機或主機專屬的差異放在第二個 `--config` overlay 檔。
@@ -80,15 +81,60 @@ idxsel --config config/idxsel.example.toml --config config/idxsel.host.toml <com
 - **樣本內的定義。** 符合任一條件，報告就標 `in_sample: true`，數字偏高，不能預測下一批：
   - 這一批進了 past-golden tier 或網域先驗（`golden.target_batch = "next"` 的正式執行就是這樣）
   - 這一批在 feature set 的 `as_of` 之前就已建立。crawler 會依新 batch 調整爬取：`update_golden_domain_scores.py` 每天依最近兩批調整網域排序，`golden_inject.py` 會把滿 4 週的 batch 注入回去。所以這些 URL 可能正是因為是 golden 才被爬到
-- **無洩漏的前瞻數字：** 量測之後、下一次 BUILD 之前，用預設的 `target_batch = "next"` 跑 `backtest`。
-  - 這時 feature set 還是 BUILD 用的那份，`as_of` 早於量測產生的新 batch。
-  - golden 只用 `as_of` 之前的 batch 建 tier 和先驗，所以選出的清單和線上那份相同。
-  - 報告裡新 batch 標 `in_sample: false`，`indexed_exact` 就是官方 metric 會量到的數字。
-  - 中間如果有人手動跑過 `features` 或 `run --once`，報告會自動改標樣本內。
+- **無洩漏的前瞻數字由 daemon 自動產生（`forward_eval`）。** 量測後 `schedule.forward_eval_delay_h`（20 小時，約隔天 08:00，那時當天的 delta 已跑完），daemon 做一次：
+  1. 用 reader 角色唯讀查 `model_runs`，找出量測當下 live 的 run。量測之後如果有過 swap 或 rollback，就記 `forward_eval.ambiguous_live` 並跳過，不猜。找不到 run 時記 `forward_eval.no_live_run`。
+  2. 讀 metricdb，找比那個 run 的 feature set 新的 batch。沒有時記 `forward_eval.no_new_batch`：metric 只在上一批滿 14 天才建新 batch，所以 2/16 → 3/1 那一期一定會重用。
+  3. 直接對 live run 的 `selected.parquet` 評估，不重新 select。結果寫到 `forward_evals/<id>/`，記 `forward_eval.done`。
+  4. 為新 batch 寫一份樣本外的 labels。
+  - 只有我們建的清單被量測過（`built_for` 等於那次量測）才會做，每次量測只做一次。它不讀 crawlerdb、不寫 selectdb。
+- 手動的 `backtest` 在量測之後、下一次 BUILD 之前用 `target_batch = "next"` 跑，也會得到同一個數字，但它會重新 select 一次。中間如果有人手動跑過 `features` 或 `run --once`，報告會自動改標樣本內。
 - **整數 `target_batch` 的回測**一律標樣本內，因為 feature set 晚於那一批。它只能用來比較 profile 的相對好壞。
 - 量測前的 BUILD 視窗內，如果這一期還沒建好，`backtest` 會拒絕執行（回傳碼 4），避免擋住 BUILD。
 - `indexed_exact` 與官方 metric 相同：原始 golden 字串必須完全等於清單裡的一列。`indexed_canonical` 是正規化後才相等的比例，兩者差距就是拼法造成的損失；`selection.emit_raw_spelling_for_past_golden` 可以補回其中 past-golden 的部分（維持關閉，見 ARCHITECTURE_SPEC §6.10）。
-- 95% 信賴區間用群集 bootstrap：整個 query 一起重抽。出現在 c 個 query 的 URL，在每個 query 裡權重 1/c，所以全樣本時等於不重複 URL 的比例。
+- 95% 信賴區間用群集 bootstrap：整個 query 一起重抽。出現在 c 個 query 的 URL，在每個 query 裡權重 1/c，所以全樣本時等於不重複 URL 的比例。query 依 id 排序後才抽，所以結果和讀取順序無關。
+- **其他欄位：**
+  - `crawled_exact`：原始字串完全等於已爬 URL 的比例。crawler 存的是正規化後的字串，所以它低於 `crawled_rate`（正規化比對），完全比對的上限是它。
+  - `cutoff_loss_exact` / `cutoff_loss_canonical`：在 feature set 之後、batch 建立之前才被爬到的 golden URL。用那份 feature set 建的清單不可能有它們。資料來自 feature set 之後的 delta；沒有 delta 涵蓋到 batch 建立時間時是空值。連續兩期 ≥ 1pp，才值得做量測前的 top-up。
+
+### labels（特徵日誌）
+
+依 Rules of ML #29，保存清單建立時用的特徵，之後調參和訓練都用它。每個 golden batch 一份 `labels/<batch>/`：
+
+| 檔案 | 內容 |
+|---|---|
+| `golden.parquet` | 這一批的 golden 列，加上旗標：`crawled_exact`、`crawled_canonical`、`selected_exact`、`selected_canonical`，以及在該 profile 下的 `tier`、`score` |
+| `golden_features.parquet` | golden URL（原始或正規化拼法）的完整特徵列 |
+| `sample.parquet` | 候選列中 `md5_number_lower(url) % labels.sample_mod = 0` 的列（預設 1/1000，約 150 萬列），加上 `selected` 旗標。這是純雜湊樣本，不額外加入 golden 列 |
+| `past_golden.parquet`、`domain_prior.parquet`、`domain_stats.parquet` | 建清單時的 tier、先驗與網域統計（只留樣本和 golden 出現的網域） |
+| `meta.json`（最後寫） | batch、feature set 與 `as_of`、`in_sample`、`forward`、`candidates`（套用 filters 後的候選總數）、`filters`、`p0`、config 雜湊、評估結果、診斷 |
+
+- 寫入規則：先寫到隱藏目錄再 rename。進了 tier 或先驗的 batch 會跳過（記 `labels.skipped`）。已存在的 label 只在「舊的樣本內、新的樣本外」時被取代。
+- 診斷（從樣本估計）：清單中佔比最高的 `labels.top_domains` 個網域和它們的 golden 命中數；被選頁面的 `content_hash64` 在候選中重複的比例。重複比例高時，才值得做依內容去重。
+- gc 永遠保留完整的 label，每期約 0.2 GB；缺 `meta.json` 或不是數字名稱的目錄會被刪。
+
+### sweep
+
+- 每個 label、每個 profile，用和正式流程相同的 SQL 對樣本和 golden 特徵列打分。
+- 依正式排序（`tier DESC, key52 DESC, h, url, shard`，同 URL 只留最好的一份）取樣本中排名 round(K·n/N) 的列當邊界。n 是樣本列數，N 是 meta 的 `candidates`。
+- golden URL 的最佳一份排在邊界或之前，就算命中。同分和 tier 都和正式流程一樣處理；只比分數時，大群同分會偏差到約 1.8pp。
+- `sample_mod = 1` 時結果就是精確的 top-K。預設 1/1000 時，邊界的 1σ 約 0.3% K，對比例的影響約 0.03–0.1pp，遠小於 query 抽樣的區間（約 ±1.5pp）。
+- 報告每個 batch 的結果，以及兩種合併：只用 `forward` 的 label，和全部 label。`diff_vs_first_ci95` 是和第一個 profile 的成對差異（同一組 query 重抽）。
+- 在同一批上調參又報告會偏高。調參用 t−1，報告用 t。
+- caps、`prior_rate_pseudo_golden`、`url_date_tau_days` 是全域設定；要掃它們，就每個值疊一個 `--config` overlay。label 寫入時的 filters 必須和現在相同，否則拒絕。
+
+### 候選訊號（所有 profile 的權重都是 0）
+
+| 訊號 | 定義 |
+|---|---|
+| `prior_rate` | 網域的平滑 golden 比例。每個過去 batch b 的截止時間 t_b = 建立時間 − `build_start_h_before_measure`，權重 w_b 依 `prior_half_life_days` 衰減。e = Σ w_b·（到 t_b 為止已抓的候選數），g = Σ w_b·（原始字串等於到 t_b 為止已抓候選的 golden 數）。r = (g + a)/(e + a/p0)，取 ln(r/p0) 截在 ±ln(`prior_rate_lift`) 再映到 [0, 1]。沒有統計的網域是 0.5 |
+| `domain_ext` | 網域內所有候選頁的外部連入總數，log 後除以 `caps.domain_ext_inlinks` 的 log |
+| `url_date` | 路徑裡的日期（`selection.url_date_regex`）的新鮮度，exp(−天數 / `url_date_tau_days`)；沒有日期或日期無效時是 0 |
+| `json_ld`、`hreflang`、`no_title` | 0/1 旗標 |
+
+- 網域統計只在 profile 用到網域訊號時才計算（一次 `GROUP BY domain_id`）。現有 profile 產生的 SQL 和以前相同。
+- p0 用 `math.fsum` 算，結果和列的順序無關，`key52` 每次都一樣。
+- `prior_rate` 的分母依賴「每個 URL 只抓一次」。Phase 0b 要確認 `num_fetch_ok_90d > 1` 的比例接近 0。
+- 不採用 `first_seen` 新鮮度：golden 會讓 crawler 去爬它們，注入時也會重設 `first_seen`，回測一定偏高。
 
 ## 磁碟預算（Host2 工作目錄）
 
@@ -113,7 +159,9 @@ idxsel --config config/idxsel.example.toml --config config/idxsel.host.toml <com
 
 - history 增量的估計假設每天的已爬完整列 ≤ 8 GB。調研只量到 history 總量（每天約 1.6 億列，多數是新連結的插入列，會被濾掉）。Phase 0b 要量出完整列的比例，再校正這一行，並決定最壞情況要不要改成「放棄延後中的全量」。
 - `guard.work_dir_max_gb`（500）只在匯出時檢查。
-- gc 只把有完成標記的 golden、run、backtest 算進保留份數；失敗留下的半成品目錄直接刪。feature set 只保留 pointer 和壓縮後的那份。daemon 每個 tick 開頭都會先跑 gc。
+- gc 只把有完成標記的 golden、run、backtest、forward_eval 算進保留份數；失敗留下的半成品目錄直接刪。feature set 只保留 pointer 和壓縮後的那份。daemon 每個 tick 開頭都會先跑 gc。
+- labels 每期約 0.2 GB，永遠保留。
+- 前瞻評估不 select，只寫評估結果和 labels，磁碟用量遠小於 BUILD。
 
 ## 開發與測試
 
@@ -129,7 +177,10 @@ crawlerdb 的 33 欄、fillfactor 80、按月分區的 history；metricdb；我�
 涵蓋：
 
 - CLI 端到端三輪（full → delta → delta），以及回滾；評估結果等於 reader 角色跑的 metric SQL
-- 量測後的回測：重建出和線上相同的清單，新 batch 標樣本外，數字等於 metric SQL；早於 feature set 的 batch 標樣本內
+- 量測後的回測：重建出和線上相同的清單，新 batch 標樣本外，數字等於 metric SQL；早於 feature set 的 batch 標樣本內；labels 的 `selected_exact` 比例等於 `indexed_exact_rate`
+- cutoff loss：只有在 feature set 之後、batch 之前爬到的頁面才計入
+- sweep：`sample_mod = 1` 時，每個 profile 的數字和信賴區間都等於完整 `backtest --profile`；單元測試另外用大量同分、跨 K 的 tier、跨 shard 的重複 URL 和原始拼法，比對正式流程的 top-K
+- 現有 profile 的清單和改動前完全相同（`baseline_v1`；`ext_tier_v1` 因為拿掉 `fetch_ok` 而改變）
 - 合併壓縮：第二輪後 base 和已併入的 delta 已刪；第三輪在壓縮後的 feature set 上仍選出真值的 top-K；單元測試確認壓縮與一次合併全部結果相同，同一交易的 history 列以 `snapshot_id` 決定
 - accounting 型的不完整 history 列不會改變排名
 - `backtest` 不讀 crawlerdb、不寫 selectdb，state 和 pointers 不變
@@ -148,6 +199,7 @@ crawlerdb 的 33 欄、fillfactor 80、按月分區的 history；metricdb；我�
   - swap 碰到 freeze 時留到之後的 tick，冷卻中也會完成，完成後再 verify
   - 錯誤後冷卻；全量進度不被 delta 覆蓋；全量拖過 history 保留期時重新開始
   - select 失敗不留下 scored；gc 清掉半成品目錄；BUILD 結束時舊的 set 和 delta 已刪，run 目錄沒有 `load.csv`
+  - 前瞻評估：沒有新 batch 時記 `no_new_batch`；有新 batch 時對 live run 寫出樣本外 labels，不重新 select，也不需要 crawlerdb 和 selectdb admin；沒有 live run、或量測後換過清單時跳過；metricdb 讀不到時進冷卻並重試
 
 ## 部署（Phase 0 之後才做）
 

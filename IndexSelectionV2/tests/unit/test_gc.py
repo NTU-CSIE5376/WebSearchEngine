@@ -49,3 +49,18 @@ def test_gc_follows_compaction_completion_and_retention(tmp_path):
     assert names("runs") == ["r2"]
     assert names("backtests") == [f"t{i}" for i in range(2, 8)]
     assert not (root / "duckdb_tmp").exists()
+
+
+def test_gc_keeps_complete_labels_and_drops_partial_ones(tmp_path):
+    rt = Runtime(with_changes(example_config(), run__work_dir=str(tmp_path)))
+    labels = tmp_path / "labels"
+    _dir(labels / "18", "meta.json")
+    _dir(labels / "19", "meta.json")
+    _dir(labels / "20")  # crashed before its meta was written
+    _dir(labels / ".21.20261003T000000000000Z", "meta.json")  # an unrenamed build
+    for i in range(1, 9):
+        _dir(tmp_path / "forward_evals" / f"e{i}", "forward_eval.json")
+    gc_storage(rt)
+    assert sorted(p.name for p in labels.iterdir()) == ["18", "19"]
+    assert sorted(p.name for p in (tmp_path / "forward_evals").iterdir()) == [
+        f"e{i}" for i in range(3, 9)]

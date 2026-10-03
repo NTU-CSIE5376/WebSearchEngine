@@ -176,3 +176,52 @@ def test_verify_live_checks_count_run_and_sample(tmp_path):
     assert good["ok"] and good["sampled"] == 2 == good["sample_found"]
     assert not verify_live(cfg, _con(), FakeSession(selected=urls, run_id=6), sel, 7)["ok"]
     assert not verify_live(cfg, _con(), FakeSession(selected=urls[:2], run_id=7), sel, 7)["ok"]
+
+
+def test_crawled_exact_below_canonical(tmp_path):
+    cfg = with_changes(example_config(), eval__batches=[2], eval__bootstrap_samples=50)
+    con, g, meta, sel = _eval_inputs(tmp_path, cfg, set())
+    rand = evaluate(cfg, con, sel, g, tmp_path / "features", meta,
+                    tmp_path / "run")["results"]["batch2_random"]
+    # The crawler stores the canonical spelling; the raw golden string is not crawled.
+    assert rand["crawled_in_export"] == 1 and rand["crawled_exact"] == 0
+    assert rand["crawled_exact_rate"] == 0.0
+
+
+def _late_inputs(tmp_path, fetched_at):
+    """Batch 3 holds a.com/z (in the features) and fr.wikipedia B (fetched later only)."""
+    cfg = with_changes(example_config(), golden__target_batch=3, eval__bootstrap_samples=50)
+    con, g, meta, sel = _eval_inputs(tmp_path, cfg, {"https://a.com/z"})
+    pq.write_table(pa.table({"url": ["https://a.com/z"]}),
+                   tmp_path / "features" / "shard=000" / "part.parquet")
+    d = tmp_path / "delta" / "shard=001"
+    d.mkdir(parents=True)
+    pq.write_table(pa.table({
+        "url": ["https://fr.wikipedia.org/wiki/B", "https://a.com/z"],
+        "last_fetch_ok": pa.array([fetched_at, datetime(2026, 8, 20, tzinfo=UTC)],
+                                  pa.timestamp("us", tz="UTC"))}), d / "part.parquet")
+    return cfg, con, g, meta, sel
+
+
+@pytest.mark.parametrize(("fetched_at", "lost"), [
+    (datetime(2026, 8, 20, tzinfo=UTC), 1),   # after the features, before the batch
+    (datetime(2026, 9, 5, tzinfo=UTC), 0),    # after the batch: not a cutoff loss
+    (datetime(2026, 8, 10, tzinfo=UTC), 0),   # before the features' as_of
+])
+def test_cutoff_loss_counts_fetches_between_as_of_and_batch(tmp_path, fetched_at, lost):
+    cfg, con, g, meta, sel = _late_inputs(tmp_path, fetched_at)
+    head = evaluate(cfg, con, sel, g, tmp_path / "features", meta, tmp_path / "run",
+                    deltas=[tmp_path / "delta"],
+                    covered_until=datetime(2026, 9, 10, tzinfo=UTC))["results"]["batch3_head"]
+    assert head["cutoff_loss_exact"] == lost == head["cutoff_loss_canonical"]
+    assert head["cutoff_loss_exact_rate"] == lost / 2
+
+
+def test_cutoff_loss_none_without_covering_delta(tmp_path):
+    cfg, con, g, meta, sel = _late_inputs(tmp_path, datetime(2026, 8, 20, tzinfo=UTC))
+    for deltas, covered in (([tmp_path / "delta"], datetime(2026, 8, 25, tzinfo=UTC)),
+                            ([], None)):
+        head = evaluate(cfg, con, sel, g, tmp_path / "features", meta, tmp_path / "run",
+                        deltas=deltas, covered_until=covered)["results"]["batch3_head"]
+        assert head["cutoff_loss_exact"] is None and head["cutoff_loss_exact_rate"] is None
+    assert "| - |" in (tmp_path / "run" / "report.md").read_text()

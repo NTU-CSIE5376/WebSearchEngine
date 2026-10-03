@@ -199,6 +199,13 @@ class Layout:
     def backtest_dir(self, backtest_id: str) -> Path:
         return self.root / "backtests" / backtest_id
 
+    def forward_eval_dir(self, eval_id: str) -> Path:
+        return self.root / "forward_evals" / eval_id
+
+    @property
+    def labels(self) -> Path:
+        return self.root / "labels"
+
     @property
     def lock_file(self) -> Path:
         return self.root / "state" / "lock"

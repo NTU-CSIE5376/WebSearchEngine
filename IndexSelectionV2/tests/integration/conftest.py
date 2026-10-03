@@ -93,6 +93,9 @@ exact_sort_max_rows = 50
 [eval]
 bootstrap_samples = 200
 live_check_sample_size = 100
+
+[labels]
+sample_mod = 1
 """
 
 

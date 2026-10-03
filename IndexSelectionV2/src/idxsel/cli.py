@@ -12,7 +12,7 @@ import json
 import sys
 from typing import Any
 
-from idxsel.config import load_config
+from idxsel.config import ConfigError, load_config
 from idxsel.guards import GuardAbort, PreflightFailed
 from idxsel.load import init_selectdb, rollback
 from idxsel.log import setup_logging
@@ -35,12 +35,14 @@ from idxsel.pipeline import (
     stage_swap,
     stage_verify_live,
     status,
+    sweep_labels,
 )
 
 # Read-only checks, selectdb-only commands (rollback is the emergency path and
-# must not queue behind a long export) and the daemon, which locks per tick.
+# must not queue behind a long export), the sweep (it reads labels only and
+# never spills) and the daemon, which locks per tick.
 _UNLOCKED = frozenset({"init-selectdb", "preflight", "probe", "verify-live", "rollback",
-                       "status", "daemon"})
+                       "status", "sweep", "daemon"})
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -65,8 +67,12 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--once", action="store_true", required=True)
     run.add_argument("--full", action="store_true", help="force a full export")
     run.add_argument("--shards", help="e.g. 0-3,7 (default: all)")
-    sub.add_parser("backtest", help="golden -> select -> eval on the latest feature set; "
-                                    "reads neither crawlerdb nor selectdb")
+    bt = sub.add_parser("backtest", help="golden -> select -> eval on the latest feature set; "
+                                         "reads neither crawlerdb nor selectdb")
+    bt.add_argument("--profile", help="selection profile (default: selection.profile)")
+    sw2 = sub.add_parser("sweep", help="estimate profiles' indexed rate on the label sets")
+    sw2.add_argument("--profiles", help="e.g. baseline_v1,ext_tier_v1 (default: all)")
+    sw2.add_argument("--batches", help="label batches, e.g. 18,19 (default: all)")
     dm = sub.add_parser("daemon", help="follow the schedule forever")
     dm.add_argument("--max-ticks", type=int)
     return p
@@ -110,6 +116,11 @@ def _dispatch(rt: Runtime, args: argparse.Namespace) -> Any:
         return {"daemon": "stopped"}
     if cmd == "swap":
         return stage_swap(rt, args.run_id)
+    if cmd == "backtest":
+        return backtest(rt, profile=args.profile)
+    if cmd == "sweep":
+        return sweep_labels(rt, args.profiles.split(",") if args.profiles else None,
+                            [int(b) for b in args.batches.split(",")] if args.batches else None)
     if cmd == "rollback":
         admin = rt.admin_conn()
         try:
@@ -118,7 +129,7 @@ def _dispatch(rt: Runtime, args: argparse.Namespace) -> Any:
             admin.close()
     simple = {"golden": stage_golden, "features": stage_features, "select": stage_select,
               "load": stage_load, "eval": stage_eval, "verify-live": stage_verify_live,
-              "status": status, "gc": gc_storage, "backtest": backtest}
+              "status": status, "gc": gc_storage}
     return simple[cmd](rt)
 
 
@@ -135,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
     except WorkDirBusy as exc:
         print(json.dumps({"error": "WorkDirBusy", "reason": str(exc)}), file=sys.stderr)
         return 4
+    except ConfigError as exc:
+        print(json.dumps({"error": "ConfigError", "reason": str(exc)}), file=sys.stderr)
+        return 2
     except (PreflightFailed, GuardAbort) as exc:
         print(json.dumps({"error": type(exc).__name__, "reason": str(exc)}), file=sys.stderr)
         return 3

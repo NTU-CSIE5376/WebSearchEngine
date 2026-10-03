@@ -303,3 +303,26 @@ def start_selectdb() -> PgContainer:
         conn.execute("CREATE ROLE idxsel_admin LOGIN CREATEROLE PASSWORD 'adminpw'")
         conn.execute("CREATE DATABASE selectdb OWNER idxsel_admin")
     return pg
+
+
+def add_batch(metric_dsn: str, batch_id: int, created: datetime,
+              queries: list[tuple[str, list[str], list[str]]]) -> None:
+    """Adds a golden batch the way the metric's `--create` run does (naive UTC time)."""
+    with psycopg.connect(metric_dsn, autocommit=True) as conn:
+        conn.execute("INSERT INTO metric_batches (id, created_at) VALUES (%s, %s)",
+                     (batch_id, created.astimezone(UTC).replace(tzinfo=None)))
+        for keyword, tags, urls in queries:
+            (qid,) = conn.execute(
+                "INSERT INTO metric_queries (batch_id, keyword, tags) VALUES (%s, %s, %s) "
+                "RETURNING id", (batch_id, keyword, Jsonb(tags))).fetchone()
+            for rank, url in enumerate(urls, 1):
+                conn.execute("INSERT INTO metric_url (query_id, url, rank) VALUES (%s, %s, %s)",
+                             (qid, url, rank))
+
+
+def drop_batch(metric_dsn: str, batch_id: int) -> None:
+    with psycopg.connect(metric_dsn, autocommit=True) as conn:
+        conn.execute("DELETE FROM metric_url WHERE query_id IN "
+                     "(SELECT id FROM metric_queries WHERE batch_id = %s)", (batch_id,))
+        conn.execute("DELETE FROM metric_queries WHERE batch_id = %s", (batch_id,))
+        conn.execute("DELETE FROM metric_batches WHERE id = %s", (batch_id,))

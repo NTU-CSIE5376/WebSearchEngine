@@ -21,6 +21,7 @@ class Action(StrEnum):
     EXPORT_FULL = "export_full"
     EXPORT_DELTA = "export_delta"
     BUILD = "build"
+    FORWARD_EVAL = "forward_eval"
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,20 @@ def next_measurement(now: datetime, cfg: ScheduleCfg) -> datetime:
     raise ValueError("schedule.measure_days yields no measurement in the next 64 days")
 
 
+def previous_measurement(now: datetime, cfg: ScheduleCfg) -> datetime:
+    """Returns the latest measurement time at or before `now`."""
+    now = now.astimezone(UTC)
+    minute = _minutes(cfg.measure_time_utc)
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    for _ in range(0, 64):
+        if day.day in cfg.measure_days:
+            candidate = day + timedelta(minutes=minute)
+            if candidate <= now:
+                return candidate
+        day -= timedelta(days=1)
+    raise ValueError("schedule.measure_days yields no measurement in the last 64 days")
+
+
 def plan_next_action(now: datetime, state: dict[str, Any], cfg: ScheduleCfg,
                      full_refresh_due: bool, has_base: bool) -> Decision:
     """Chooses the daemon's next action.
@@ -94,13 +109,14 @@ def plan_next_action(now: datetime, state: dict[str, Any], cfg: ScheduleCfg,
     Args:
         now: Current time.
         state: Schedule state with optional keys `built_for`, `full_done_for`,
-            `last_delta_at` (ISO timestamps).
+            `forward_eval_for`, `last_delta_at` (ISO timestamps).
         cfg: Schedule config.
         full_refresh_due: True if this cycle needs a full export.
         has_base: True if a completed base export exists.
 
     Returns:
-        The decision and the measurement time it targets.
+        The decision and the measurement time it targets; for FORWARD_EVAL, the
+        measurement that just took place.
     """
     measurement = next_measurement(now, cfg)
     hours_left = (measurement - now).total_seconds() / 3600
@@ -121,6 +137,14 @@ def plan_next_action(now: datetime, state: dict[str, Any], cfg: ScheduleCfg,
     if (has_base and state.get("built_for") != target
             and hours_left <= cfg.build_start_h_before_measure and swap_allowed(now, cfg)):
         return Decision(Action.BUILD, f"build window, {hours_left:.1f}h left", measurement)
+    # After a measurement of our list: score it on the new batch once the next
+    # daily delta has run, well before the next cycle's exports start.
+    prev = previous_measurement(now, cfg)
+    if (state.get("built_for") == prev.isoformat()
+            and state.get("forward_eval_for") != prev.isoformat()
+            and now >= prev + timedelta(hours=cfg.forward_eval_delay_h)
+            and hours_left > cfg.full_export_start_h_before_measure):
+        return Decision(Action.FORWARD_EVAL, f"measurement {prev.isoformat()} done", prev)
     last = state.get("last_delta_at")
     hours_since = (
         (now - datetime.fromisoformat(last)).total_seconds() / 3600 if last else float("inf")

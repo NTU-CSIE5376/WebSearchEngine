@@ -154,6 +154,20 @@ def test_build_preflight_skips_crawlerdb_limits_but_not_host1_root(tmp_path):
     with pytest.raises(PreflightFailed, match="remote / free"):
         guard(PROBE_OK.replace("700000000000", "100000000000")).preflight(
             "build", reads_crawlerdb=False)
+    # Stages that never touch Host1 (backtest, forward eval) skip its probe entirely.
+    calls = []
+
+    def failing(cmd, timeout):
+        calls.append(cmd)
+        raise OSError("no route to host1")
+
+    offline = Guard(cfg, None, LocalProbe(cfg), RemoteProbe(cfg, runner=failing,
+                                                            clock=lambda: 0.0),
+                    EventLog(None), now=lambda: measure_day_blackout)
+    offline.preflight("backtest", reads_crawlerdb=False, host1=False)
+    assert calls == []
+    with pytest.raises(PreflightFailed, match="remote probe failed"):
+        offline.preflight("build", reads_crawlerdb=False)
 
 
 def test_reserve_counts_against_the_work_fs_floor(tmp_path):

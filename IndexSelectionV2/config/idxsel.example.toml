@@ -127,6 +127,8 @@ daily_delta_utc = "05:00"
 min_hours_between_deltas = 20
 delta_max_h = 2.0                        # a daily delta gives up (and resumes later) after this long
 error_cooldown_s = 1800                  # after an unexpected error the daemon waits this long
+forward_eval_delay_h = 20.0              # after a measurement: scores the live list on the new
+                                         # batch once the next daily delta has run
 
 [duckdb]
 threads = 16
@@ -137,6 +139,7 @@ preserve_insertion_order = false
 [golden]
 target_batch = "next"                    # or a batch id for backtests (prior uses batches < target)
 prior_half_life_days = 90
+prior_rate_pseudo_golden = 1.0           # prior_rate: Gamma-Poisson pseudo-count, in golden URLs
 tldextract_offline = true                # use the bundled public-suffix snapshot
 
 [selection]
@@ -146,6 +149,8 @@ max_dedupe_rounds = 5
 url_score_natural_source = 0             # url_score from injected rows (source != 0) is a sentinel
 pageview_source = 2                      # wiki pageview injection: url_score = 1 + pageviews / max
 emit_raw_spelling_for_past_golden = false  # list past-golden URLs in their raw golden spelling
+# url_date: year, month and optional day in the path (/2026/09/17/, /2026-09/)
+url_date_regex = '/(20\d{2})[/-](0[1-9]|1[0-2])(?:[/-](0[1-9]|[12]\d|3[01]))?(?:[/-]|$)'
 
 [selection.filters]
 exclude_robots_bits = []                 # 2 = disallowed; empty keeps everything crawled
@@ -156,9 +161,11 @@ inlinks = 10_000
 ext_inlinks = 1_000
 parent_page_score = 1.0
 prior = 200
-fetch_ok_90d = 10
+prior_rate_lift = 20.0                   # prior_rate maps log(rate / mean rate) in +-ln(this)
+domain_ext_inlinks = 1_000_000           # external inlinks summed over a domain's crawled pages
 url_len = 200
 fresh_tau_days = 30
+url_date_tau_days = 30
 
 [selection.impute]
 parent_page_score = 0.0
@@ -172,7 +179,6 @@ ext = 1.0
 url_score = 1.0
 prior = 2.0
 parent = 0.0
-fetch_ok = 0.0
 short = 0.0
 root = 0.0
 query = 0.0
@@ -180,6 +186,12 @@ anchor = 0.0
 redirect = 0.0
 fresh = 0.0
 pageview = 0.0
+prior_rate = 0.0                         # candidates below: weight 0 until a sweep
+domain_ext = 0.0                         # shows a gain on forward labels
+url_date = 0.0
+json_ld = 0.0
+hreflang = 0.0
+no_title = 0.0
 
 [selection.profiles.ext_tier_v1]         # candidate for the Phase 1 sweep
 tiers = ["past_golden", "external_inlink"]
@@ -189,7 +201,6 @@ ext = 0.0
 url_score = 0.5
 prior = 2.0
 parent = 0.5
-fetch_ok = 0.5
 short = 0.3
 root = 0.5
 query = -0.5
@@ -197,6 +208,12 @@ anchor = 0.2
 redirect = 0.3
 fresh = 0.0
 pageview = 0.0
+prior_rate = 0.0
+domain_ext = 0.0
+url_date = 0.0
+json_ld = 0.0
+hreflang = 0.0
+no_title = 0.0
 
 [eval]
 batches = []                             # empty = the target batch (or the latest batch for "next")
@@ -205,6 +222,11 @@ lookup_chunk_size = 10_000               # same chunking as CrawlerAllMetricMeas
 bootstrap_samples = 1000
 bootstrap_seed = 7
 live_check_sample_size = 1000            # verify-live: selected URLs looked up as the reader role
+
+[labels]                                 # feature logs per golden batch (never deleted)
+sample_mod = 1000                        # uniform sample: md5(url) % sample_mod == 0
+sweep_memory_limit = "4GB"               # `sweep` runs without the lock and never spills
+top_domains = 20                         # diagnostics: domains with the largest list share
 
 [storage]                                # feature sets: gc keeps only the live pointer and the
                                          # compacted set (~85 GB, the next merge source)

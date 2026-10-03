@@ -1,4 +1,5 @@
 import dataclasses
+import math
 from datetime import UTC, datetime, timedelta
 
 import duckdb
@@ -8,7 +9,8 @@ import pytest
 from helpers import example_config, with_changes
 
 from idxsel.features import build_features
-from idxsel.scoring import KEY_SCALE, scored_select_sql
+from idxsel.manifest import atomic_write_json
+from idxsel.scoring import KEY_SCALE, build_domain_stats, mean_rate, scored_select_sql
 from idxsel.urlnorm import md5_number_lower
 
 AS_OF = datetime(2026, 10, 1, tzinfo=UTC)
@@ -236,3 +238,149 @@ def test_robots_filter(tmp_path, bits):
             _feature_row("https://a.com/no", robots_bits=2)]
     s = _scores(tmp_path, rows, cfg=cfg)
     assert ("https://a.com/no" in s) == (not bits)
+
+
+BATCH1 = datetime(2026, 9, 1, tzinfo=UTC)
+EARLY, LATE = datetime(2026, 8, 1, tzinfo=UTC), datetime(2026, 9, 20, tzinfo=UTC)
+
+
+def _rate_fixture(tmp_path):
+    """Domain 1: 3 pages fetched before batch 1's cutoff, 1 after; domain 2: 2 before.
+
+    Batch 1 lists a.com/1 (hittable), a.com/4 (fetched after the cutoff) and
+    a.com/9 (never crawled): only a.com/1 counts.
+    """
+    rows = [_feature_row(f"https://a.com/{i}", last_fetch_ok=EARLY) for i in (1, 2, 3)]
+    rows += [_feature_row("https://a.com/4", last_fetch_ok=LATE, inlink_count_external=7)]
+    rows += [_feature_row(f"https://b.com/{i}", domain_id=2, last_fetch_ok=EARLY,
+                          inlink_count_external=3) for i in (1, 2)]
+    _write(tmp_path / "f" / "shard=000" / "part.parquet", rows)
+    g = _golden(tmp_path)
+    pq.write_table(pa.table({
+        "batch_id": pa.array([1, 1, 1], pa.int64()),
+        "batch_created_at": pa.array([BATCH1] * 3, pa.timestamp("us", tz="UTC")),
+        "raw_url": ["https://a.com/1", "https://a.com/4", "https://a.com/9"]}),
+        g / "golden.parquet")
+    atomic_write_json(g / "meta.json", {"as_of": AS_OF, "batches_used": [1]})
+    return str(tmp_path / "f" / "shard=*" / "*.parquet"), g
+
+
+def _con():
+    con = duckdb.connect()
+    con.execute("SET TimeZone = 'UTC'")
+    return con
+
+
+def _signal_scores(cfg, glob, g, domain):
+    sql = scored_select_sql(cfg, glob, g, AS_OF, cfg.active_profile, domain)
+    return dict(_con().execute(f"SELECT url, score FROM ({sql})").fetchall())
+
+
+def test_prior_rate_counts_only_hittable_golden(tmp_path):
+    cfg = example_config()
+    glob, g = _rate_fixture(tmp_path)
+    domain = build_domain_stats(cfg, _con(), glob, g, tmp_path / "ds.parquet")
+    w = 0.5 ** (30 / 90)  # batch 1 is 30 days older than the target's as_of
+    stats = {r["domain_id"]: r for r in pq.read_table(domain.stats).to_pylist()}
+    assert stats[1]["crawled"] == 4 and stats[1]["ext_inlinks"] == 7
+    assert stats[1]["e"] == pytest.approx(3 * w) and stats[1]["g"] == pytest.approx(w)
+    assert stats[2]["e"] == pytest.approx(2 * w) and stats[2]["g"] == 0
+    assert domain.p0 == pytest.approx(0.2)
+
+
+def test_prior_rate_matches_gamma_poisson_formula(tmp_path):
+    cfg = example_config()
+    glob, g = _rate_fixture(tmp_path)
+    domain = build_domain_stats(cfg, _con(), glob, g, tmp_path / "ds.parquet")
+    w, a, p0, lift = 0.5 ** (30 / 90), 1.0, 0.2, math.log(20.0)
+
+    def expected(golden, exposure):
+        lifted = math.log((golden + a) / ((exposure + a / p0) * p0))
+        return (max(-lift, min(lift, lifted)) + lift) / (2 * lift)
+
+    s = _signal_scores(_only("prior_rate"), glob, g, domain)
+    assert s["https://a.com/2"] == pytest.approx(expected(w, 3 * w), rel=1e-12)
+    assert s["https://b.com/1"] == pytest.approx(expected(0.0, 2 * w), rel=1e-12)
+    assert s["https://a.com/2"] > 0.5 > s["https://b.com/1"]
+    # A tight lift clips both domains to the ends of the unit range.
+    s = _signal_scores(_only("prior_rate", selection__caps__prior_rate_lift=1.1), glob, g,
+                       domain)
+    assert s["https://a.com/2"] == pytest.approx(1.0) and s["https://b.com/1"] == pytest.approx(0)
+    # A large pseudo-count shrinks every domain toward the mean rate (0.5).
+    s = _signal_scores(_only("prior_rate", golden__prior_rate_pseudo_golden=1e6), glob, g,
+                       domain)
+    assert s["https://a.com/2"] == pytest.approx(0.5, abs=1e-5)
+
+
+def test_domain_stats_are_deterministic(tmp_path):
+    cfg = example_config()
+    rows = [_feature_row(f"https://d{i % 50}.com/{i}", domain_id=i % 50 + 1,
+                         last_fetch_ok=EARLY if i % 3 else LATE,
+                         inlink_count_external=i % 7) for i in range(20_000)]
+    for part in range(4):
+        _write(tmp_path / "f" / f"shard={part:03d}" / "part.parquet", rows[part::4])
+    g = _golden(tmp_path)
+    pq.write_table(pa.table({
+        "batch_id": pa.array([1] * 200, pa.int64()),
+        "batch_created_at": pa.array([BATCH1] * 200, pa.timestamp("us", tz="UTC")),
+        "raw_url": [f"https://d{i % 50}.com/{i}" for i in range(0, 2000, 10)]}),
+        g / "golden.parquet")
+    atomic_write_json(g / "meta.json", {"as_of": AS_OF, "batches_used": [1]})
+    glob = str(tmp_path / "f" / "shard=*" / "*.parquet")
+    runs = []
+    for n in (1, 2):
+        con = _con()
+        con.execute("SET threads = 4")
+        d = build_domain_stats(cfg, con, glob, g, tmp_path / f"ds{n}.parquet")
+        runs.append((d.p0, sorted(pq.read_table(d.stats).to_pylist(),
+                                  key=lambda r: r["domain_id"])))
+    assert runs[0] == runs[1]
+    assert runs[0][0] > 0
+
+
+def test_domain_ext_url_date_and_markup_flags(tmp_path):
+    cfg = example_config()
+    glob, g = _rate_fixture(tmp_path)
+    domain = build_domain_stats(cfg, _con(), glob, g, tmp_path / "ds.parquet")
+    s = _signal_scores(_only("domain_ext"), glob, g, domain)
+    assert s["https://a.com/1"] == pytest.approx(math.log1p(7) / math.log1p(1_000_000))
+    assert s["https://b.com/1"] == pytest.approx(math.log1p(6) / math.log1p(1_000_000))
+    rows = [_feature_row("https://n.com/2026/09/30/story"),
+            _feature_row("https://n.com/2026-09/story"),
+            _feature_row("https://n.com/2026/02/31/bad-date"),
+            _feature_row("https://n.com/2026/11/02/future"),
+            _feature_row("https://n.com/plain", has_json_ld=True, hreflang_count=3,
+                         title_null=True)]
+    _write(tmp_path / "u" / "shard=000" / "part.parquet", rows)
+    uglob = str(tmp_path / "u" / "shard=*" / "*.parquet")
+    s = _signal_scores(_only("url_date"), uglob, g, None)
+    assert s["https://n.com/2026/09/30/story"] == pytest.approx(math.exp(-1 / 30))
+    assert s["https://n.com/2026-09/story"] == pytest.approx(math.exp(-30 / 30))
+    assert s["https://n.com/2026/02/31/bad-date"] == 0.0
+    assert s["https://n.com/2026/11/02/future"] == pytest.approx(1.0)
+    assert s["https://n.com/plain"] == 0.0
+    for name in ("json_ld", "hreflang", "no_title"):
+        flags = _signal_scores(_only(name), uglob, g, None)
+        assert flags["https://n.com/plain"] == 1.0 and flags["https://n.com/2026-09/story"] == 0
+
+
+def test_shipped_profiles_never_join_domain_stats(tmp_path):
+    cfg = example_config()
+    glob, g = _rate_fixture(tmp_path)
+    for name, profile in cfg.selection.profiles.items():
+        sql = scored_select_sql(cfg, glob, g, AS_OF, profile)
+        assert " ds " not in sql and "ds." not in sql, name
+    with pytest.raises(ValueError, match="domain stats"):
+        scored_select_sql(cfg, glob, g, AS_OF, _only("prior_rate").active_profile)
+
+
+def test_mean_rate_is_exact_whatever_the_row_order(tmp_path):
+    # A naive float sum drops each 1.0 added to 1e16 (doubles there are 2 apart).
+    e = [1e16] + [1.0] * 1000
+    g = [3.0] + [0.5] * 1000
+    for name, order in (("fwd", 1), ("rev", -1)):
+        pq.write_table(pa.table({"e": e[::order], "g": g[::order]}), tmp_path / f"{name}.parquet")
+    p0 = mean_rate(tmp_path / "fwd.parquet")
+    assert p0 == mean_rate(tmp_path / "rev.parquet") == (3.0 + 500.0) / (1e16 + 1000.0)
+    pq.write_table(pa.table({"e": [0.0], "g": [0.0]}), tmp_path / "none.parquet")
+    assert mean_rate(tmp_path / "none.parquet") == 0.0

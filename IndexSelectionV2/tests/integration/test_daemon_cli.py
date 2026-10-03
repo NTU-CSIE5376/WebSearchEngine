@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import psycopg
+import pyarrow.parquet as pq
 import pytest
+from fixture_db import add_batch, drop_batch
 from helpers import EXAMPLE
 from test_e2e import _cli
 
@@ -298,3 +300,89 @@ def test_full_export_past_history_retention_starts_over(overlay, servers, monkey
     assert load_state(rt.layout)["in_progress"] == {}
     pipeline.gc_storage(rt)
     assert not stale.exists()
+
+
+def _measured(monkeypatch, at):
+    """The next tick plans a forward evaluation of the measurement at `at`."""
+    monkeypatch.setattr(pipeline, "plan_next_action",
+                        lambda *a, **k: Decision(Action.FORWARD_EVAL, "test", at))
+
+
+def _built(rt, monkeypatch):
+    _decide(monkeypatch, Action.EXPORT_FULL, Action.BUILD)
+    pipeline.daemon(rt, max_ticks=2)
+    return datetime.now(UTC)
+
+
+def test_daemon_forward_eval_records_no_new_batch_then_labels(overlay, servers, fresh_selectdb,
+                                                              monkeypatch):
+    rt = _runtime(overlay)
+    _cli(overlay, "init-selectdb")
+    first = _built(rt, monkeypatch)
+    _measured(monkeypatch, first)
+    pipeline.daemon(rt, max_ticks=1)
+    assert '"forward_eval.no_new_batch"' in _events(rt)  # the metric reused its batch
+    assert read_json(rt.layout.schedule_file)["forward_eval_for"] == first.isoformat()
+    assert not rt.layout.labels.exists()
+
+    live = pq.read_table(rt.layout.run_dir(rt.pointers()["run"]) / "selected.parquet")[
+        "url"].to_pylist()
+    metric_dsn = servers["crawler"].dsn(user="metric", password="metric", db="metricdb")
+    second = datetime.now(UTC)
+    add_batch(metric_dsn, 4, second, [
+        (f"kw4-{q}", ["head", "random"], [*sorted(live)[2 * q:2 * q + 2],
+                                          f"https://never.example/{q}"]) for q in range(5)])
+    runs_before = sorted(p.name for p in (rt.layout.root / "runs").iterdir())
+    try:
+        # The evaluation needs neither crawlerdb nor selectdb admin, and never re-selects.
+        monkeypatch.setattr(pipeline, "stage_export", _boom)
+        monkeypatch.setattr(pipeline, "select_into", _boom)
+        _measured(monkeypatch, datetime.now(UTC))
+        pipeline.daemon(rt, max_ticks=1)
+    finally:
+        drop_batch(metric_dsn, 4)
+    events = _events(rt)
+    assert '"forward_eval.done"' in events and '"daemon.error"' not in events
+    meta = read_json(rt.layout.labels / "4" / "meta.json")
+    assert meta["forward"] is True and meta["in_sample"] is False
+    (done,) = list((rt.layout.root / "forward_evals").iterdir())
+    summary = read_json(done / "forward_eval.json")
+    assert summary["batches"] == [4] and summary["labels"] == {"4": "written"}
+    assert summary["eval"]["batch4_head"]["indexed_exact_rate"] == pytest.approx(10 / 15)
+    assert sorted(p.name for p in (rt.layout.root / "runs").iterdir()) == runs_before
+
+
+def test_forward_eval_without_live_run_is_recorded(overlay, servers, fresh_selectdb,
+                                                   monkeypatch):
+    rt = _runtime(overlay)
+    _cli(overlay, "init-selectdb")
+    at = datetime.now(UTC)
+    _measured(monkeypatch, at)
+    pipeline.daemon(rt, max_ticks=1)
+    assert '"forward_eval.no_live_run"' in _events(rt)
+    assert read_json(rt.layout.schedule_file)["forward_eval_for"] == at.isoformat()
+
+
+def test_forward_eval_skips_when_live_changed_after_measurement(overlay, servers,
+                                                                fresh_selectdb, monkeypatch):
+    rt = _runtime(overlay)
+    _cli(overlay, "init-selectdb")
+    before = datetime.now(UTC) - timedelta(minutes=5)  # the list went live after this
+    _built(rt, monkeypatch)
+    _measured(monkeypatch, before)
+    pipeline.daemon(rt, max_ticks=1)
+    assert '"forward_eval.ambiguous_live"' in _events(rt)
+    assert not rt.layout.labels.exists()
+
+
+def test_forward_eval_failure_enters_cooldown_and_retries(overlay, servers, fresh_selectdb,
+                                                          monkeypatch):
+    rt = _runtime(overlay, "error_cooldown_s = 3600\n")
+    _cli(overlay, "init-selectdb")
+    at = _built(rt, monkeypatch)
+    monkeypatch.setattr(pipeline, "golden_into", _boom)  # metricdb is down
+    _measured(monkeypatch, at)
+    pipeline.daemon(rt, max_ticks=1)
+    sched = read_json(rt.layout.schedule_file)
+    assert "forward_eval_for" not in sched and "cooldown_until" in sched
+    assert '"daemon.error"' in _events(rt)
