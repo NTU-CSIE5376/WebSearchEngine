@@ -1,0 +1,30 @@
+# Host2 (ubuntu2): the idxsel daemon. Always run with an explicit project and file:
+#   docker compose -p idxsel_r14725023 -f compose.compute.yaml up -d --build
+# Never run `docker system/image/volume prune` on shared hosts.
+name: idxsel_r14725023
+
+services:
+  idxsel:
+    build: .
+    image: idxsel_r14725023:latest
+    command: ["--config", "/config/idxsel.example.toml", "--config", "/config/idxsel.host.toml",
+              "daemon"]
+    user: "${HOST_UID:-1014}:${HOST_GID:-1015}"
+    env_file: .env
+    volumes:
+      - ${IDXSEL_WORK_DIR:-/home/r14725023/idxsel/data}:/work
+      - ./config:/config:ro
+      - ${IDXSEL_PROBE_KEY:-/home/r14725023/.ssh/idxsel_probe}:/run/secrets/probe_key:ro
+      - ${IDXSEL_PROBE_KNOWN_HOSTS:-/home/r14725023/.ssh/known_hosts}:/run/secrets/probe_known_hosts:ro
+    mem_limit: 64g
+    memswap_limit: 64g          # no swap for us; Host2 is already swapping
+    cpus: 16
+    cpu_shares: 256             # the crawler wins under contention
+    pids_limit: 512
+    oom_score_adj: 1000         # we are killed first
+    read_only: true
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}

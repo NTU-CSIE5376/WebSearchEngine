@@ -1,0 +1,33 @@
+# Host1 (ubuntu1): OUR selectdb on :5445 (never touches PR #4's :5444).
+#   mkdir -p /home/r14725023/idxsel/selectdb-data /home/r14725023/idxsel/secrets
+#   docker compose -p idxsel_r14725023 -f compose.selectdb.yaml up -d
+# Data lives on Host1's root NVMe, not on /data (crawlerdb's disk).
+name: idxsel_r14725023
+
+services:
+  selectdb:
+    image: postgres:16
+    # Runs as our own uid so every file under /home/r14725023 stays deletable by us.
+    user: "${HOST_UID:-1014}:${HOST_GID:-1015}"
+    command: ["postgres",
+              "-c", "wal_level=minimal", "-c", "max_wal_senders=0",
+              "-c", "shared_buffers=2GB", "-c", "maintenance_work_mem=4GB",
+              "-c", "max_wal_size=16GB", "-c", "synchronous_commit=off",
+              "-c", "temp_file_limit=60GB"]
+    environment:
+      POSTGRES_DB: selectdb
+      POSTGRES_USER: idxsel_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/selectdb_admin_password
+    ports:
+      - "172.16.191.1:5445:5432"
+    volumes:
+      - ${SELECTDB_DATA:-/home/r14725023/idxsel/selectdb-data}:/var/lib/postgresql/data
+      - ${SELECTDB_ADMIN_PASSWORD_FILE:-/home/r14725023/idxsel/secrets/selectdb_admin_password}:/run/secrets/selectdb_admin_password:ro
+      - /etc/passwd:/etc/passwd:ro
+    mem_limit: 16g
+    cpus: 4
+    shm_size: 1g
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}

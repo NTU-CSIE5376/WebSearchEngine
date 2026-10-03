@@ -1,0 +1,22 @@
+# Overlay for a dry run on a laptop against local databases. Layer it on top:
+#   idxsel --config config/idxsel.example.toml --config config/idxsel.local.example.toml ...
+[run]
+work_dir = "./data"
+k = 1000
+
+[guard]
+host_meminfo_enabled = false
+work_dir_max_gb = 5
+work_dir_min_free_gb = 1
+build_reserve_gb = 1
+
+[guard.remote]
+enabled = false
+
+[schedule]
+enabled = false
+
+[duckdb]
+threads = 4
+memory_limit = "2GB"
+max_temp_directory_size = "5GB"

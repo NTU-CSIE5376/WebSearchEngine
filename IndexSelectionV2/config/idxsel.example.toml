@@ -1,0 +1,214 @@
+# Index Selection V2 — production example config.
+# Every key is required. Secrets never live here: only the NAMES of env vars.
+# Layer overrides with a second file: `idxsel --config this.toml --config local.toml ...`.
+
+[run]
+work_dir = "/work"                      # Host2: /home/r14725023/idxsel/data mounted at /work
+app_name_prefix = "idxsel_r14725023"    # every DB session is tagged with this prefix
+k = 128_000_000                         # list size required by the course
+
+[crawlerdb]
+dsn_env = "IDXSEL_CRAWLERDB_DSN"
+num_shards = 256
+url_table_fmt = "url_state_current_{:03d}"
+history_table_fmt = "url_state_history_{:03d}"
+domain_table = "domain_state"
+split_table = "shard_split_subdomain"
+connect_timeout_s = 10
+
+[crawlerdb.session]                      # libpq -c options applied to every connection
+default_transaction_read_only = "on"
+statement_timeout = "60s"
+lock_timeout = "1s"
+idle_in_transaction_session_timeout = "30s"
+max_parallel_workers_per_gather = "0"
+jit = "off"
+work_mem = "16MB"
+temp_file_limit = "0"                    # any server-side spill becomes a hard error
+
+[metricdb]
+dsn_env = "IDXSEL_METRICDB_DSN"
+connect_timeout_s = 10
+
+[metricdb.session]
+default_transaction_read_only = "on"
+statement_timeout = "120s"
+lock_timeout = "1s"
+
+[selectdb]                               # OUR OWN selectdb fork (Host1 :5445), never :5444
+admin_dsn_env = "IDXSEL_SELECTDB_ADMIN_DSN"
+reader_dsn_env = "IDXSEL_SELECTDB_READER_DSN"
+reader_role = "select"                   # matches the role the metric connects with
+reader_password_env = "IDXSEL_SELECTDB_READER_PASSWORD"
+connect_timeout_s = 10
+max_db_bytes = 100_000_000_000
+est_bytes_per_row = 260                  # table + PK, ~31 GB per 128M rows
+swap_lock_timeout = "5s"
+swap_retry_attempts = 12
+swap_retry_backoff_s = 300
+maintenance_work_mem = "4GB"
+copy_block_bytes = 8_388_608
+keep_prev = true
+
+[export]
+chunk_pages = 16_384                     # 128 MiB of heap per statement
+chunks_per_file = 32                     # resume unit: 4 GiB of heap per Parquet file
+shard_order = "ingestor_round_robin"     # spread load across ingestors (shard // 16)
+shards_per_ingestor = 16
+history_chunk_ids = 500_000
+history_overlap_ids = 50_000             # per-shard ids re-read below the watermark (late commits);
+                                         # snapshot_id is a per-shard sequence (~625k ids/day/shard)
+history_prune_slack_hours = 6
+history_row_bytes_estimate = 420         # used to pace history reads
+base_observation_slack_s = 600           # merge: history rows win if newer than base read - slack
+full_refresh_every_n_cycles = 4
+max_chunk_retries = 5
+retry_backoff_s = [5, 15, 60, 300]
+parquet_compression = "zstd"
+parquet_compression_level = 3
+
+[throttle]
+rate_mb_s_initial = 60
+rate_mb_s_min = 20
+rate_mb_s_max = 150
+increase_mb_s = 10
+increase_every_healthy_chunks = 5
+decrease_factor = 0.5
+pause_backoff_s = [60, 120, 300, 900]
+
+[guard]
+db_checks_enabled = true
+host_meminfo_enabled = true              # reads /proc/meminfo and /proc/vmstat (Linux only)
+fail_closed_on_probe_error = true
+max_datfrozenxid_age = 250_000_000
+max_wraparound_vacuum_workers = 2
+min_free_connections = 20
+foreign_long_query_s = 300
+foreign_app_name_patterns = ["indexselection_v1%"]
+db_io_wait_backends_soft = 40            # tune from the Phase 0 baseline (p90 + margin)
+db_io_wait_backends_hard = 80
+db_lwlock_wait_backends_soft = 20
+watchdog_interval_s = 1.0
+work_dir_max_gb = 500                    # checked during exports; budget formula in README
+work_dir_scan_interval_s = 60            # reuse the measured work dir size this long between chunks
+work_dir_min_free_gb = 150               # Host2 root fs floor (~629 GB free before us)
+build_reserve_gb = 170                   # a BUILD starts only with floor + this free:
+                                         # its new feature set and DuckDB spill grow here
+host_mem_available_min_gb_start = 300
+host_mem_available_min_gb_run = 200
+remote_data_min_free_gb_start = 500      # Host1 /data (crawlerdb)
+remote_data_min_free_gb_run = 450
+remote_root_min_free_gb = 450            # Host1 / (our selectdb)
+remote_io_psi_some_avg60_soft = 35.0
+remote_io_psi_some_avg60_hard = 60.0
+
+[guard.remote]                           # forced-command SSH key on Host1
+enabled = true
+command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+           "-o", "UserKnownHostsFile=/run/secrets/probe_known_hosts",
+           "-i", "/run/secrets/probe_key", "r14725023@172.16.191.1", "probe"]
+data_mount = "/data"
+root_mount = "/"
+timeout_s = 15
+interval_s = 60                          # minimum seconds between remote probes
+
+[schedule]                               # all times UTC
+enabled = true
+tick_s = 300
+measure_days = [1, 16]
+measure_time_utc = "12:00"
+blackout_daily_utc = ["02:50-04:40"]     # accounting 03:00 (history partition DROP), gc 04:00
+blackout_measure_day_utc = ["00:00-09:30"]  # PR #4 run and the metric's 08:00 count(*) scan
+swap_freeze_measure_day_utc = ["11:30-20:00"]  # random (12:00) and head (18:00) see one list
+full_export_start_h_before_measure = 55
+full_export_deadline_h_before_measure = 24
+build_start_h_before_measure = 30       # BUILD reads no crawlerdb; the 05:00 delta feeds it
+daily_delta_utc = "05:00"
+min_hours_between_deltas = 20
+delta_max_h = 2.0                        # a daily delta gives up (and resumes later) after this long
+error_cooldown_s = 1800                  # after an unexpected error the daemon waits this long
+
+[duckdb]
+threads = 16
+memory_limit = "40GB"
+max_temp_directory_size = "60GB"
+preserve_insertion_order = false
+
+[golden]
+target_batch = "next"                    # or a batch id for backtests (prior uses batches < target)
+prior_half_life_days = 90
+tldextract_offline = true                # use the bundled public-suffix snapshot
+
+[selection]
+profile = "baseline_v1"
+exact_sort_max_rows = 2_000_000
+max_dedupe_rounds = 5
+url_score_natural_source = 0             # url_score from injected rows (source != 0) is a sentinel
+pageview_source = 2                      # wiki pageview injection: url_score = 1 + pageviews / max
+emit_raw_spelling_for_past_golden = false  # list past-golden URLs in their raw golden spelling
+
+[selection.filters]
+exclude_robots_bits = []                 # 2 = disallowed; empty keeps everything crawled
+max_consecutive_fail = -1                # -1 disables the filter
+
+[selection.caps]                         # fixed caps -> deterministic [0, 1] features
+inlinks = 10_000
+ext_inlinks = 1_000
+parent_page_score = 1.0
+prior = 200
+fetch_ok_90d = 10
+url_len = 200
+fresh_tau_days = 30
+
+[selection.impute]
+parent_page_score = 0.0
+url_score = 0.0
+
+[selection.profiles.baseline_v1]         # "past golden first, then sum + 2 x prior" (21.8% on batch 18)
+tiers = ["past_golden"]
+[selection.profiles.baseline_v1.weights]
+inlinks = 1.0
+ext = 1.0
+url_score = 1.0
+prior = 2.0
+parent = 0.0
+fetch_ok = 0.0
+short = 0.0
+root = 0.0
+query = 0.0
+anchor = 0.0
+redirect = 0.0
+fresh = 0.0
+pageview = 0.0
+
+[selection.profiles.ext_tier_v1]         # candidate for the Phase 1 sweep
+tiers = ["past_golden", "external_inlink"]
+[selection.profiles.ext_tier_v1.weights]
+inlinks = 1.0
+ext = 0.0
+url_score = 0.5
+prior = 2.0
+parent = 0.5
+fetch_ok = 0.5
+short = 0.3
+root = 0.5
+query = -0.5
+anchor = 0.2
+redirect = 0.3
+fresh = 0.0
+pageview = 0.0
+
+[eval]
+batches = []                             # empty = the target batch (or the latest batch for "next")
+tags = ["head", "random"]
+lookup_chunk_size = 10_000               # same chunking as CrawlerAllMetricMeasure
+bootstrap_samples = 1000
+bootstrap_seed = 7
+live_check_sample_size = 1000            # verify-live: selected URLs looked up as the reader role
+
+[storage]                                # feature sets: gc keeps only the live pointer and the
+                                         # compacted set (~85 GB, the next merge source)
+keep_runs = 6                            # complete runs, golden sets and backtests (small)
+
+[logging]
+level = "INFO"
