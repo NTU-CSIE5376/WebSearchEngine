@@ -4,6 +4,8 @@
 `selected_urls_current` 的 schema 與 PR #4、官方 metric 的查詢相容：
 `SELECT url FROM public.selected_urls_current WHERE url = ANY(:urls)`。
 
+架構、演算法和全部參數的說明在 [`docs/DESIGN.md`](docs/DESIGN.md)。
+
 ## 資料流
 
 ```
@@ -90,7 +92,7 @@ idxsel --config config/idxsel.example.toml --config config/idxsel.host.toml <com
 - 手動的 `backtest` 在量測之後、下一次 BUILD 之前用 `target_batch = "next"` 跑，也會得到同一個數字，但它會重新 select 一次。中間如果有人手動跑過 `features` 或 `run --once`，報告會自動改標樣本內。
 - **整數 `target_batch` 的回測**一律標樣本內，因為 feature set 晚於那一批。它只能用來比較 profile 的相對好壞。
 - 量測前的 BUILD 視窗內，如果這一期還沒建好，`backtest` 會拒絕執行（回傳碼 4），避免擋住 BUILD。
-- `indexed_exact` 與官方 metric 相同：原始 golden 字串必須完全等於清單裡的一列。`indexed_canonical` 是正規化後才相等的比例，兩者差距就是拼法造成的損失；`selection.emit_raw_spelling_for_past_golden` 可以補回其中 past-golden 的部分（維持關閉，見 ARCHITECTURE_SPEC §6.10）。
+- `indexed_exact` 與官方 metric 相同：原始 golden 字串必須完全等於清單裡的一列。`indexed_canonical` 是正規化後才相等的比例，兩者差距就是拼法造成的損失；`selection.emit_raw_spelling_for_past_golden` 可以補回其中 past-golden 的部分。這個開關維持關閉：開啟後，清單存的是 golden 的原始拼法，而不是爬蟲存的正規化拼法。PR #5 合併後，metric 也會比對正規化拼法。
 - 95% 信賴區間用群集 bootstrap：整個 query 一起重抽。出現在 c 個 query 的 URL，在每個 query 裡權重 1/c，所以全樣本時等於不重複 URL 的比例。query 依 id 排序後才抽，所以結果和讀取順序無關。
 - **其他欄位：**
   - `crawled_exact`：原始字串完全等於已爬 URL 的比例。crawler 存的是正規化後的字串，所以它低於 `crawled_rate`（正規化比對），完全比對的上限是它。
@@ -201,7 +203,18 @@ crawlerdb 的 33 欄、fillfactor 80、按月分區的 history；metricdb；我�
   - select 失敗不留下 scored；gc 清掉半成品目錄；BUILD 結束時舊的 set 和 delta 已刪，run 目錄沒有 `load.csv`
   - 前瞻評估：沒有新 batch 時記 `no_new_batch`；有新 batch 時對 live run 寫出樣本外 labels，不重新 select，也不需要 crawlerdb 和 selectdb admin；沒有 live run、或量測後換過清單時跳過；metricdb 讀不到時進冷卻並重試
 
-## 部署（Phase 0 之後才做）
+## 上線階段
+
+| 階段 | 內容 | 驗收標準 |
+|---|---|---|
+| 0b | 只讀 crawlerdb 的 catalog | 256 個 shard 的欄位型別一致；取得負載基準線；**取得助教或維運同意** |
+| 0c | 小量讀取：≤ 20 GB，≤ 40 MB/s | 不產生 temp 檔；量出讀取造成的 WAL 和 dirty page；ingest 速率不受影響 |
+| 1 | 第一次全量匯出，正式產出清單 | 正好 1.28 億個已爬 URL；上線後第一次量測的前瞻數字 ≥ 19% |
+| 1b | 每日增量 | 增量版和全量版的清單重疊 ≥ 97%；低於這個值就改成每 2 期全量一次 |
+| 2 | 用前瞻 labels 訓練 LightGBM | 只用 forward labels，在 t−1 調參、在 t 報告；和規則式的成對信賴區間下界 > 0 才採用 |
+| 3 | metric 改讀 `:5445` | 把 metric cron 的 `--select_db_url` 改成 `:5445`。`measure.py` 的 reader 帳密是寫死的，所以 `init-selectdb` 設定的 reader 密碼要和它相同。回滾時把 port 改回 `:5444` |
+
+## 部署（Phase 0b、0c 通過後才做）
 
 1. Host1：`compose.selectdb.yaml` 起我們的 selectdb（:5445，資料放在 root NVMe），接著跑 `idxsel init-selectdb`。
 2. Host2：準備 `.env`（chmod 600）和 `config/idxsel.host.toml`，再用 `compose.compute.yaml` 起 daemon。
