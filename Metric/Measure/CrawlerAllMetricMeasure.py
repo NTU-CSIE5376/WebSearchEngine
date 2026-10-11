@@ -7,6 +7,13 @@ from tqdm import tqdm
 import tldextract
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from w3lib.url import canonicalize_url
+
+
+def normalize_golden_url(url: str) -> str:
+    """Convert a golden URL to the form the crawler and IndexSelection store."""
+    return canonicalize_url(url)
+
 
 class CrawlerAllMetricMeasure(Measure):
     def __init__(self, modelFactory: AppModelFactory, crawlerDB: Database, metricDB: Database, selectDB: Database, batch_id: int, tag: str):
@@ -151,8 +158,8 @@ class CrawlerAllMetricMeasure(Measure):
                 return
 
             for m_url in results:
-                url_str = m_url.url
-                
+                url_str = normalize_golden_url(m_url.url)
+
                 if url_str not in url_id_map:
                     url_id_map[url_str] = []
                 
