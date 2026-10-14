@@ -34,9 +34,9 @@ RUN echo "\
 0 * * * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 measure.py --test --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.1:5432 --measure status >> /var/log/cron.log 2>&1 \n\
 0 * * * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 migrate.py >> /var/log/cron.log 2>&1 \n\
 # 每月 1 號與 16 號 中午 12 點 (Strategy: random) \n\
-0 12 1,16 * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 measure.py --create --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.1:5432 --select_db_url 172.16.191.1:5444 --strategy random --keywordNums 50 --test --measure crawler_all >> /var/log/cron.log 2>&1 \n\
+0 12 1,16 * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 measure.py --create --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.1:5432 --select_db_url 172.16.191.1:5445 --strategy random --keywordNums 50 --test --measure crawler_all >> /var/log/cron.log 2>&1 \n\
 # 每月 1 號與 16 號 下午 6 點 (Strategy: head) \n\
-0 18 1,16 * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 measure.py --create --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.1:5432 --select_db_url 172.16.191.1:5444 --strategy head --keywordNums 50 --test --measure crawler_all >> /var/log/cron.log 2>&1 \n\
+0 18 1,16 * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 measure.py --create --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.1:5432 --select_db_url 172.16.191.1:5445 --strategy head --keywordNums 50 --test --measure crawler_all >> /var/log/cron.log 2>&1 \n\
 " > /etc/cron.d/search-engine-cron
 
 # 賦予 crontab 檔案權限並套用
