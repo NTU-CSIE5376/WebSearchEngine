@@ -68,10 +68,34 @@ class RoutingCfg:
 
 
 @dataclass(frozen=True)
+class PullCfg:
+    min_interval_s: float
+    shards: list[int]
+
+
+@dataclass(frozen=True)
+class GoldenCfg:
+    lead_h: float
+    tags: list[str]
+    exclude_batches: list[int]
+    use_pseudo: bool
+
+
+@dataclass(frozen=True)
 class DuckDbCfg:
     threads: int
     memory_limit: str
     max_temp_directory_size: str
+
+
+@dataclass(frozen=True)
+class FullCfg:
+    chunk_blocks: int
+    chunks_per_file: int
+    min_free_gb: float
+    parse_threads: int
+    connections: int
+    max_heap_mb_s: float
 
 
 @dataclass(frozen=True)
@@ -81,7 +105,10 @@ class Config:
     crawlerdb: CrawlerDbCfg
     metricdb: MetricDbCfg
     routing: RoutingCfg
+    pull: PullCfg
+    golden: GoldenCfg
     duckdb: DuckDbCfg
+    full: FullCfg
 
     @property
     def work_dir(self) -> Path:
@@ -94,6 +121,9 @@ class Config:
 
 
 _SCALARS = (int, float, str, bool)
+# crawlerdb session settings that fix the CSV text the full export parses: other
+# values fail the parse, or round url_score (extra_float_digits < 1).
+CSV_SESSION = {"datestyle": "ISO", "extra_float_digits": "1", "client_encoding": "UTF8"}
 
 
 def _deep_merge(base: dict[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
@@ -236,9 +266,28 @@ def _validate(cfg: Config) -> None:
     _validate_session("metricdb", cfg.metricdb.session, cfg.guard, need)
     need(all(0 <= s < cfg.crawlerdb.num_shards for s in cfg.routing.overrides.values()),
          "routing.overrides must map to valid shards")
+    need(cfg.pull.min_interval_s >= 0, "pull.min_interval_s must be >= 0")
+    need(all(0 <= s < cfg.crawlerdb.num_shards for s in cfg.pull.shards),
+         "pull.shards must be valid shard ids")
+    need(cfg.golden.lead_h >= 0, "golden.lead_h must be >= 0")
+    need(bool(cfg.golden.tags), "golden.tags must not be empty")
     need(cfg.duckdb.threads > 0, "duckdb.threads must be > 0")
+    _validate_full(cfg, need)
 
 
+def _validate_full(cfg: Config, need: Any) -> None:
+    f, g = cfg.full, cfg.guard
+    need(f.chunk_blocks > 0 and f.chunks_per_file > 0,
+         "full.chunk_blocks and full.chunks_per_file must be > 0")
+    # A chunk read at the worst-case speed must still finish inside its timeout.
+    need(f.chunk_blocks * 8192 <= g.min_mb_s * 1_000_000 * g.timeout_cap_s,
+         "full.chunk_blocks must be readable at guard.min_mb_s within guard.timeout_cap_s")
+    need(f.min_free_gb >= 0, "full.min_free_gb must be >= 0")
+    need(f.parse_threads > 0, "full.parse_threads must be > 0")
+    need(f.connections > 0 and f.max_heap_mb_s > 0,
+         "full.connections and full.max_heap_mb_s must be > 0")
+    need(all(cfg.crawlerdb.session.get(k) == v for k, v in CSV_SESSION.items()),
+         f"crawlerdb.session must set {CSV_SESSION} for the CSV text the full export parses")
 
 
 

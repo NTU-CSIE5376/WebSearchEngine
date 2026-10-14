@@ -29,3 +29,31 @@ def base_cfg() -> Config:
     return load_config([BASE])
 
 
+class FakeConn:
+    """Records statements; returns canned rows keyed by a substring of the SQL."""
+
+    def __init__(self, rows: dict[str, list[tuple]] | None = None, clock=None):
+        self.rows = rows or {}
+        self.clock = clock
+        self.executed: list[tuple[str, object]] = []
+        self.executed_at: list[object] = []
+
+    def cursor(self):
+        conn = self
+
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, text, params=None):
+                conn.executed.append((text, params))
+                conn.executed_at.append(conn.clock() if conn.clock else None)
+                self._rows = next((r for k, r in conn.rows.items() if k in text), [])
+
+            def fetchall(self):
+                return self._rows
+
+        return Cursor()

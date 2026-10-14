@@ -27,6 +27,13 @@ def test_base_config_loads(base_cfg):
     ("[guard]\ntimeout_cap_s = 2880\n", "hourly open gap"),
     ("[guard]\nmonth_window = ['20:00', '00:00']\n", "wrap"),
     ("[guard]\nmonth_window = ['00:00', '25:00']\n", "HH:MM"),
+    ("[full]\nchunk_blocks = 1000000\n", "readable at guard.min_mb_s"),
+    ("[full]\nparse_threads = 0\n", "full.parse_threads must be > 0"),
+    ("[full]\nconnections = 0\n", "full.connections and full.max_heap_mb_s must be > 0"),
+    ("[full]\nmax_heap_mb_s = 0.0\n", "full.connections and full.max_heap_mb_s must be > 0"),
+    # extra_float_digits = 0 would round url_score in the CSV text the full export parses.
+    ("[crawlerdb.session]\nextra_float_digits = '0'\n", "CSV text"),
+    ("[crawlerdb.session]\ndatestyle = 'SQL'\n", "CSV text"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
