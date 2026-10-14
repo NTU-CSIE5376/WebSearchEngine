@@ -179,7 +179,7 @@ Cron defaults in Dockerfile currently use:
 
 - `--metric_db_url 172.16.191.1:5433`
 - `--crawler_db_url 172.16.191.1:5432`
-- `--select_db_url 172.16.191.1:5444`
+- `--select_db_url 172.16.191.1:5445` (IndexSelectionV2)
 
 ### 5.3 Migration target URL
 
