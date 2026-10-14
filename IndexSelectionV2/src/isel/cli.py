@@ -224,6 +224,19 @@ def cmd_select_sample(cfg: Config, args: argparse.Namespace) -> Any:
     return {k: v for k, v in meta.items() if k != "files"}
 
 
+def cmd_score_full(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.score import score_full
+
+    return score_full(cfg, cfg.work_dir, Path(args.model_dir), args.k or cfg.eval.k_headline)
+
+
+def cmd_select_full(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.score import select_full
+
+    meta = select_full(cfg, cfg.work_dir, args.k or cfg.eval.k_headline)
+    return {k: v for k, v in meta.items() if k != "files"}
+
+
 def cmd_validate_manifest(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.manifest import validate_run
 
@@ -270,6 +283,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("select-sample")
     p.add_argument("--model-dir", required=True)
     p.add_argument("--k", type=int)
+    p = sub.add_parser("score-full", help="score the full export with a frozen model")
+    p.add_argument("--model-dir", required=True)
+    p.add_argument("--k", type=int)
+    p = sub.add_parser("select-full", help="write the exact top-K list")
+    p.add_argument("--k", type=int)
     p = sub.add_parser("validate-manifest")
     p.add_argument("--run-dir", required=True)
     return parser
@@ -289,6 +307,8 @@ COMMANDS = {
     "train": cmd_train,
     "forward-eval": cmd_forward_eval,
     "select-sample": cmd_select_sample,
+    "score-full": cmd_score_full,
+    "select-full": cmd_select_full,
     "validate-manifest": cmd_validate_manifest,
 }
 
