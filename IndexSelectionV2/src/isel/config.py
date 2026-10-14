@@ -162,6 +162,31 @@ class FullCfg:
 
 
 @dataclass(frozen=True)
+class SelectDbCfg:
+    admin_dsn_env: str
+    reader_dsn_env: str
+    reader_role: str
+    reader_password_env: str
+    forbidden_ports: list[int]
+    connect_timeout_s: int
+    copy_block_bytes: int
+    maintenance_work_mem: str
+    swap_lock_timeout: str
+    swap_retry_attempts: int
+    swap_retry_backoff_s: float
+    keep_prev: bool
+    max_db_bytes: int
+    est_bytes_per_row: int
+    verify_chunk: int
+
+
+@dataclass(frozen=True)
+class ScheduleCfg:
+    swap_freeze_days: list[int]
+    swap_freeze_window: list[str]
+
+
+@dataclass(frozen=True)
 class Config:
     run: RunCfg
     guard: GuardCfg
@@ -177,6 +202,8 @@ class Config:
     manifest: ManifestCfg
     duckdb: DuckDbCfg
     full: FullCfg
+    selectdb: SelectDbCfg
+    schedule: ScheduleCfg
 
     @property
     def work_dir(self) -> Path:
@@ -378,6 +405,7 @@ def _validate(cfg: Config) -> None:
          "manifest.canonical_workers and manifest.canonical_batch_rows must be > 0")
     need(cfg.duckdb.threads > 0, "duckdb.threads must be > 0")
     _validate_full(cfg, need)
+    _validate_selectdb(cfg, need)
 
 
 def _validate_full(cfg: Config, need: Any) -> None:
@@ -405,6 +433,21 @@ def _validate_full(cfg: Config, need: Any) -> None:
     need(f.kept_share_max_z >= 0, "full.kept_share_max_z must be >= 0")
 
 
+def _validate_selectdb(cfg: Config, need: Any) -> None:
+    s = cfg.selectdb
+    need(len({s.admin_dsn_env, s.reader_dsn_env, cfg.crawlerdb.dsn_env,
+              cfg.metricdb.dsn_env}) == 4,
+         "selectdb DSN env vars must differ from each other and from the read-only DBs")
+    need(bool(s.forbidden_ports), "selectdb.forbidden_ports must not be empty")
+    need(min(s.copy_block_bytes, s.swap_retry_attempts, s.max_db_bytes, s.est_bytes_per_row,
+             s.verify_chunk, s.connect_timeout_s) > 0,
+         "selectdb sizes, counts and timeouts must be > 0")
+    need(s.swap_retry_backoff_s >= 0, "selectdb.swap_retry_backoff_s must be >= 0")
+    w = cfg.schedule.swap_freeze_window
+    need(len(w) == 2 and hhmm_minutes(w[0]) < hhmm_minutes(w[1]),
+         "schedule.swap_freeze_window must be [start, end] within one day")
+    need(all(1 <= d <= 31 for d in cfg.schedule.swap_freeze_days),
+         "schedule.swap_freeze_days must be 1-31")
 
 
 def load_config(paths: Sequence[str | Path]) -> Config:

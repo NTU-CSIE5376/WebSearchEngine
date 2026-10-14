@@ -237,6 +237,53 @@ def cmd_select_full(cfg: Config, args: argparse.Namespace) -> Any:
     return {k: v for k, v in meta.items() if k != "files"}
 
 
+def _with_admin(cfg: Config, action: Any) -> Any:
+    """Runs `action(conn)` on an admin connection to our selectdb."""
+    from isel.selectdb import connect
+
+    conn = connect(cfg, cfg.selectdb.admin_dsn_env, read_only=False)
+    try:
+        return action(conn)
+    finally:
+        conn.close()
+
+
+def cmd_migrate_selectdb(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.selectdb import init_role, migrate, render_sql
+
+    if args.sql:
+        render_sql(args.stamp_baseline, sys.stdout)
+        return None
+    result = _with_admin(cfg, lambda conn: migrate(conn, args.stamp_baseline))
+    _with_admin(cfg, lambda conn: init_role(cfg, conn))
+    return {**result, "reader_role": cfg.selectdb.reader_role}
+
+
+def cmd_publish(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.publish import load_selection
+
+    return _with_admin(cfg, lambda conn: load_selection(cfg, conn, Path(args.run_dir),
+                                                         cfg.work_dir))
+
+
+def cmd_swap(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.publish import swap
+
+    return _with_admin(cfg, lambda conn: swap(cfg, conn, args.db_run_id))
+
+
+def cmd_rollback(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.publish import rollback
+
+    return _with_admin(cfg, lambda conn: rollback(cfg, conn))
+
+
+def cmd_verify_live(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.publish import verify_live
+
+    return verify_live(cfg, cfg.work_dir, args.batch)
+
+
 def cmd_validate_manifest(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.manifest import validate_run
 
@@ -288,6 +335,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--k", type=int)
     p = sub.add_parser("select-full", help="write the exact top-K list")
     p.add_argument("--k", type=int)
+    p = sub.add_parser("migrate-selectdb",
+                       help="bring selectdb to the newest schema revision; set the reader role")
+    p.add_argument("--sql", action="store_true", help="print the DDL instead of running it")
+    p.add_argument("--stamp-baseline", action="store_true",
+                   help="record revision 0001 on a selectdb made before Alembic, then upgrade")
+    p = sub.add_parser("publish", help="load a select-full run into a new selectdb table")
+    p.add_argument("--run-dir", required=True)
+    p = sub.add_parser("swap", help="make a loaded run live")
+    p.add_argument("--db-run-id", type=int, required=True)
+    sub.add_parser("rollback", help="make the previous list live again")
+    p = sub.add_parser("verify-live", help="indexed rate of a batch under the live list")
+    p.add_argument("--batch", type=int, required=True)
     p = sub.add_parser("validate-manifest")
     p.add_argument("--run-dir", required=True)
     return parser
@@ -309,6 +368,11 @@ COMMANDS = {
     "select-sample": cmd_select_sample,
     "score-full": cmd_score_full,
     "select-full": cmd_select_full,
+    "migrate-selectdb": cmd_migrate_selectdb,
+    "publish": cmd_publish,
+    "swap": cmd_swap,
+    "rollback": cmd_rollback,
+    "verify-live": cmd_verify_live,
     "validate-manifest": cmd_validate_manifest,
 }
 
