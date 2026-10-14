@@ -1,0 +1,71 @@
+# Index selection: every tunable lives here. Loading rejects unknown keys,
+# missing keys and wrong types. Host-specific values go into an overlay file
+# passed as a second --config (see config/container.toml).
+
+[run]
+work_dir = "work"
+app_name = "isel"                        # application_name prefix on every DB session
+
+[guard]                                  # checked before every crawlerdb and metricdb statement (UTC)
+month_days = [1, 16]                     # golden creation and measurement days
+month_window = ["00:00", "20:00"]
+hourly_window = [58, 10]                 # minutes; wraps past the hour. The metric hourly scan
+                                         # ran :00-:07 (2026-10-11); statements end before :58
+max_io_waiters = 15                      # active backends waiting on IO; hourly scan hits 25-37
+probes = 3                               # median of this many pg_stat_activity readings
+probe_interval_s = 1.0
+probe_ttl_s = 30.0                       # reuse a reading this fresh
+pause_s = 60.0                           # wait after a high reading
+min_mb_s = 5.0                           # assumed worst-case heap read speed
+timeout_floor_s = 120
+timeout_cap_s = 900                      # must stay below the 48-minute hourly open gap
+
+[crawlerdb]
+dsn_env = "ISEL_CRAWLERDB_DSN"           # DSNs live only in the environment
+connect_timeout_s = 10
+num_shards = 256
+url_table_fmt = "url_state_current_{:03d}"
+split_table = "shard_split_subdomain"
+
+[crawlerdb.session]                      # applied at connect; the role is a superuser
+default_transaction_read_only = "on"
+standard_conforming_strings = "on"       # the SQL gate lexes strings with this quoting
+statement_timeout = "120s"
+lock_timeout = "1s"
+idle_in_transaction_session_timeout = "60s"
+temp_file_limit = "0"                    # never spill on the full /data disk
+datestyle = "ISO"                        # these three fix the CSV text pull-full parses
+extra_float_digits = "1"                 # shortest exact float8 text
+client_encoding = "UTF8"
+max_parallel_workers_per_gather = "0"
+jit = "off"
+work_mem = "16MB"
+
+[metricdb]
+dsn_env = "ISEL_METRICDB_DSN"
+connect_timeout_s = 10
+
+[metricdb.session]
+default_transaction_read_only = "on"
+standard_conforming_strings = "on"
+statement_timeout = "120s"
+lock_timeout = "1s"
+
+[routing]                                # mirrors WebCrawler ingest.yaml domain_overrides
+tldextract_offline = true
+
+[routing.overrides]
+"wikipedia.org" = 0
+"x.com" = 32
+"youtube.com" = 64
+"reddit.com" = 96
+"instagram.com" = 128
+"espn.com" = 160
+"facebook.com" = 192
+"yahoo.com" = 224
+
+[duckdb]
+threads = 8
+memory_limit = "16GB"
+max_temp_directory_size = "50GB"
+
