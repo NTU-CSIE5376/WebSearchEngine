@@ -100,6 +100,45 @@ class DatasetCfg:
 
 
 @dataclass(frozen=True)
+class ModelCfg:
+    feature_set: str
+    num_boost_round: int
+    early_stopping_rounds: int
+    refit_on_all: bool
+    params: dict[str, int | float | str | bool]
+    logreg_c: float
+    logreg_max_iter: int
+
+    @property
+    def num_threads(self) -> int:
+        """LightGBM threads for training and prediction."""
+        return int(self.params["num_threads"])
+
+
+@dataclass(frozen=True)
+class EvalCfg:
+    test_batches: list[int]
+    k_values: list[int]
+    k_headline: int
+    fractions: list[float]
+    gain_curve_k: list[int]
+    bootstrap_samples: int
+    bootstrap_seed: int
+    baselines: list[str]
+    v2_formula: dict[str, float]
+    importance_top_n: int
+
+
+@dataclass(frozen=True)
+class ManifestCfg:
+    schema_version: int
+    index_shards: int
+    reason_top_n: int
+    canonical_workers: int
+    canonical_batch_rows: int
+
+
+@dataclass(frozen=True)
 class DuckDbCfg:
     threads: int
     memory_limit: str
@@ -131,6 +170,9 @@ class Config:
     golden: GoldenCfg
     features: FeaturesCfg
     dataset: DatasetCfg
+    model: ModelCfg
+    eval: EvalCfg
+    manifest: ManifestCfg
     duckdb: DuckDbCfg
     full: FullCfg
 
@@ -145,6 +187,12 @@ class Config:
 
 
 _SCALARS = (int, float, str, bool)
+KNOWN_BASELINES = (
+    "random", "inlinks", "ext", "domain_prior", "logreg", "v1_features",
+    "url_score", "v2_baseline_v1", "later_unlabeled",
+)
+# LightGBM 4.7 aliases of num_threads; predict would not see a thread count set this way.
+LGBM_THREAD_ALIASES = ("n_jobs", "nthread", "nthreads", "num_thread")
 # crawlerdb session settings that fix the CSV text the full export parses: other
 # values fail the parse, or round url_score (extra_float_digits < 1).
 CSV_SESSION = {"datestyle": "ISO", "extra_float_digits": "1", "client_encoding": "UTF8"}
@@ -302,6 +350,30 @@ def _validate(cfg: Config) -> None:
     need(all(v > 0 for v in cfg.features.ext_classes.values()),
          "features.ext_classes values must be > 0 (0 means no extension)")
     need(0 < cfg.dataset.neg_rate <= 1, "dataset.neg_rate must be in (0, 1]")
+    need(cfg.model.feature_set in cfg.features.sets, "model.feature_set must name a features set")
+    need(cfg.model.num_boost_round > 0, "model.num_boost_round must be > 0")
+    need(cfg.model.early_stopping_rounds > 0, "model.early_stopping_rounds must be > 0")
+    need(cfg.model.logreg_c > 0, "model.logreg_c must be > 0")
+    need(cfg.model.params.get("objective") == "binary", "model.params.objective must be 'binary'")
+    threads = cfg.model.params.get("num_threads")
+    need(isinstance(threads, int) and not isinstance(threads, bool) and threads > 0,
+         "model.params.num_threads must be an integer > 0")
+    aliases = sorted(set(cfg.model.params) & set(LGBM_THREAD_ALIASES))
+    need(not aliases, f"model.params must set num_threads, not its aliases {aliases}")
+    need(bool(cfg.eval.test_batches), "eval.test_batches must not be empty")
+    need(cfg.eval.k_headline in cfg.eval.k_values, "eval.k_headline must be in eval.k_values")
+    need(all(k > 0 for k in cfg.eval.k_values + cfg.eval.gain_curve_k), "K values must be > 0")
+    need(all(0 < f <= 1 for f in cfg.eval.fractions), "eval.fractions must be in (0, 1]")
+    need(cfg.eval.bootstrap_samples > 0, "eval.bootstrap_samples must be > 0")
+    need(cfg.eval.importance_top_n >= 0, "eval.importance_top_n must be >= 0")
+    unknown = sorted(set(cfg.eval.baselines) - set(KNOWN_BASELINES))
+    need(not unknown, f"eval.baselines has unknown names {unknown}")
+    v2_keys = {"inlinks_cap", "ext_cap", "prior_cap", "w_inlinks", "w_ext", "w_url", "w_prior"}
+    need(set(cfg.eval.v2_formula) == v2_keys, f"eval.v2_formula must have keys {sorted(v2_keys)}")
+    need(cfg.manifest.index_shards > 0, "manifest.index_shards must be > 0")
+    need(cfg.manifest.reason_top_n >= 0, "manifest.reason_top_n must be >= 0")
+    need(min(cfg.manifest.canonical_workers, cfg.manifest.canonical_batch_rows) > 0,
+         "manifest.canonical_workers and manifest.canonical_batch_rows must be > 0")
     need(cfg.duckdb.threads > 0, "duckdb.threads must be > 0")
     _validate_full(cfg, need)
 
