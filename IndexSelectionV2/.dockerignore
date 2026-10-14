@@ -1,0 +1,13 @@
+.git/
+.venv/
+.env
+.env.*
+!.env.example
+work/
+docs/
+deploy/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+.playwright-cli/
+.DS_Store
