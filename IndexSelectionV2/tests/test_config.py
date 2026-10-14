@@ -45,6 +45,9 @@ def test_base_config_loads(base_cfg):
     ("[model.params]\nnum_threads = 0\n", "num_threads must be an integer > 0"),
     ("[model.params]\nnum_threads = 2.5\n", "num_threads must be an integer > 0"),
     ("[model.params]\nn_jobs = 4\n", r"aliases \['n_jobs'\]"),
+    ("[selectdb]\nadmin_dsn_env = 'ISEL_CRAWLERDB_DSN'\n", "must differ"),
+    ("[selectdb]\nforbidden_ports = []\n", "forbidden_ports"),
+    ("[schedule]\nswap_freeze_window = ['20:00', '11:30']\n", "swap_freeze_window"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):

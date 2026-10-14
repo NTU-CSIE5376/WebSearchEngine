@@ -5,6 +5,7 @@ description = "Index selection: learn which crawled URLs belong in the 128M-URL 
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.18",
     "duckdb>=1.5",
     "lightgbm>=4.6",
     "numpy>=2.2",
@@ -12,6 +13,7 @@ dependencies = [
     "pyarrow>=21",
     "pytz>=2026.5",
     "scikit-learn>=1.7",
+    "sqlalchemy>=2.0",
     "tldextract==5.1.1",
     "w3lib>=2.5",
 ]

@@ -212,4 +212,45 @@ hash. A URL found in two shards keeps its best score. The result is a manifest r
 
 **Resume.** `score-full` writes one file per shard and skips finished shards on a rerun.
 
+## 9. selectdb contract (`schema.py`, `selectdb.py`, `publish.py`)
+
+The schema lives only in `schema.py` (SQLAlchemy Core). Alembic revisions in
+`migrations/versions/` apply it. `migrate-selectdb` applies them in one transaction and
+then runs `alembic check` against `schema.py`; any difference rolls the whole run back.
+
+| Table | Columns and constraints |
+|---|---|
+| `public.selected_urls_current` | `url` PK, `score`, `first_seen` (NULL), `run_id` FK `ON DELETE RESTRICT`, `selected_at`; the v1 columns |
+| `public.model_runs` | the v1 columns, plus `status` (loading, validated, live, retired, abandoned, rolled_back; at most one live), `activated_at`, `config_sha256`, `code_version` |
+
+**How the metric reads it.** `SELECT url FROM public.selected_urls_current WHERE url =
+ANY(:urls)`, 10,000 URLs at a time, as the hard-coded `select` role. Since
+WebSearchEngine #7, the metric canonicalizes each golden URL and looks up only that key.
+
+**Load (transaction 1).** `publish` validates the manifest, then creates
+`selected_urls_r<id>` `LIKE selected_urls_current`, runs `COPY FREEZE`, adds the PK and
+FK, runs `ANALYZE`, and checks that the row count equals K. Readers cannot see the new
+table yet. `publish` refuses a database that is not at the newest revision.
+
+**Swap (transaction 2).** Within `lock_timeout` 5 s, `swap` renames current to prev and
+the new table to current, constraints included. A reader waits milliseconds and never
+sees half a list. Swaps are refused on the 1st and 16th, 11:30–20:00 UTC, because the
+metric builds the random set at 12:00 and the head set at 18:00.
+
+**Rollback.** `rollback` exchanges current and prev.
+
+**Write guard.** Every write goes through `selectdb.connect`. It refuses ports 5432,
+5433 and 5444, and any database that holds `url_state_current_000` or `metric_url`.
+
+**Reader role.** `migrate-selectdb` creates the `select` role with the password the
+metric hard-codes. The role can only `SELECT` from `public`.
+
+**Self-check.** `verify-live --batch <b>` sends the metric's query as `select`.
+`indexed_metric_rate` equals the metric's `indexed_rate`: canonical golden URLs found ÷
+distinct canonical golden URLs.
+
+**First run on the live :5445.** That database predates Alembic. The first
+`migrate-selectdb` needs `--stamp-baseline`: it records revision 0001, then applies
+0002. Review the DDL with `--sql` first. Revision 0002 changes the list's FK from
+`CASCADE` to `RESTRICT`, so a deleted run can no longer take its list with it.
 
