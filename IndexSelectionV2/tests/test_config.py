@@ -34,6 +34,11 @@ def test_base_config_loads(base_cfg):
     # extra_float_digits = 0 would round url_score in the CSV text the full export parses.
     ("[crawlerdb.session]\nextra_float_digits = '0'\n", "CSV text"),
     ("[crawlerdb.session]\ndatestyle = 'SQL'\n", "CSV text"),
+    ("[full]\nsample_percent = 'x'\n", "expected float"),
+    ("[full]\nsample_percent = 0.00001\n", "at most 4 decimals"),
+    ("[full]\nsample_salt = 'isel'\n", "differ from dataset.neg_salt"),
+    ("[full]\nagg_share = 1.0\n", "agg_share must be in"),
+    ("[full]\nagg_salt = 'sample-v1'\n", "agg_salt must be set and differ"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
