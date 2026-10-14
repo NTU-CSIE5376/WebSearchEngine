@@ -149,6 +149,7 @@ class FullCfg:
     chunk_blocks: int
     chunks_per_file: int
     min_free_gb: float
+    tau_margin: float
     parse_threads: int
     connections: int
     max_heap_mb_s: float
@@ -156,6 +157,7 @@ class FullCfg:
     sample_salt: str
     agg_share: float
     agg_salt: str
+    kept_share_max_z: float
 
 
 @dataclass(frozen=True)
@@ -398,6 +400,8 @@ def _validate_full(cfg: Config, need: Any) -> None:
     need(0 < f.agg_share < 1, "full.agg_share must be in (0, 1)")
     need(bool(f.agg_salt) and f.agg_salt not in (f.sample_salt, cfg.dataset.neg_salt),
          "full.agg_salt must be set and differ from full.sample_salt and dataset.neg_salt")
+    need(f.tau_margin >= 0, "full.tau_margin must be >= 0")
+    need(f.kept_share_max_z >= 0, "full.kept_share_max_z must be >= 0")
 
 
 

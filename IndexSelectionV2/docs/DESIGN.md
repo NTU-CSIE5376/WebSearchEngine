@@ -194,5 +194,22 @@ selection/run=<id>/
 - Every file is written as `.tmp`, fsynced, then renamed (`io.py`).
 - `validate-manifest` checks each file's sha256 and row count. `publish` runs it first.
 
+## 8. Full scoring and exact top K (`score.py`)
+
+**τ.** The pool-half sample gives a score floor τ at sample rank
+round(K · p · (1 + `tau_margin`)). `score-full` keeps only rows with score ≥ τ, so it
+writes about 147M rows instead of 1.66B.
+
+**Checks.** `score-full` stops, and `select-full` refuses its output, when:
+
+- a sample row scores differently in the full pass than in the sample pass;
+- the kept share differs from the sample's estimate by more than `kept_share_max_z` SDs;
+- the model's sample fingerprint differs from the current sample.
+
+**Selection.** `select-full` takes the exact top K distinct URLs, ties broken by URL
+hash. A URL found in two shards keeps its best score. The result is a manifest run under
+`full/selection/`.
+
+**Resume.** `score-full` writes one file per shard and skips finished shards on a rerun.
 
 
