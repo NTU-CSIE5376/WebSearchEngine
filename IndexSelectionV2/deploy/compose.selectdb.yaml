@@ -1,0 +1,40 @@
+# Host1 (ubuntu1): OUR selectdb on :5445; V1's :5444 is never touched.
+# This is the definition of the container running since 2026-10-04 (the files in
+# ~/idxsel/deploy merged). Recreating it is not needed to publish.
+#   docker compose --env-file ~/idxsel/compose.env -f deploy/compose.selectdb.yaml up -d
+# Data lives on Host1's root NVMe, not on /data (crawlerdb's disk).
+name: ${ISEL_PROJECT:?set it in the env file (DESIGN §12.5)}
+
+services:
+  selectdb:
+    image: postgres:16
+    # Runs as our own uid so every file under our home directory stays deletable by us.
+    user: "${HOST_UID:-1014}:${HOST_GID:-1015}"
+    command: ["postgres",
+              "-c", "wal_level=minimal", "-c", "max_wal_senders=0",
+              "-c", "shared_buffers=2GB", "-c", "maintenance_work_mem=4GB",
+              "-c", "max_wal_size=16GB", "-c", "synchronous_commit=off",
+              "-c", "temp_file_limit=60GB"]
+    environment:
+      POSTGRES_DB: selectdb
+      POSTGRES_USER: idxsel_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/selectdb_admin_password
+    ports:
+      - "172.16.191.1:5445:5432"
+    volumes:
+      - ${SELECTDB_DATA:?set it in the env file (DESIGN §12.5)}:/var/lib/postgresql/data
+      - ${SELECTDB_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_admin_password:/run/secrets/selectdb_admin_password:ro
+      - /etc/passwd:/etc/passwd:ro
+    mem_limit: 16g
+    cpus: 4
+    shm_size: 1g
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.20.250.0/24
