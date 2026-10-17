@@ -7,6 +7,8 @@ with its existing query.
 
 - Design: [`docs/DESIGN.md`](docs/DESIGN.md)
 - Backtest and full-scale results: [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
+- Recrawl of the list (not deployed): [`docs/RECRAWL.md`](docs/RECRAWL.md), which links the
+  crawler-side proposal
 
 ## How the metric reads the list
 
@@ -51,7 +53,26 @@ flowchart LR
   or in each hour's :58–:10 window, when the metric scans the crawl tables.
 - It never swaps the list on the 1st and 16th between 11:30 and 20:00 UTC, so the head
   and random sets of one batch see the same list.
-- It has no scheduler and no daemon. Each command is one container run.
+- It has no scheduler. Each command is one container run, except the two opt-in recrawl
+  services below.
+- It never writes `/data/ipc`. Recrawl batches go through the crawler's API, and the
+  crawler's result files are read-only for us.
+
+## Recrawl (not deployed)
+
+The list needs page text to build an inverted index, but `crawl_result` keeps HTML for
+only 8 hours and the crawler never re-fetches a page. `recrawl.py` re-fetches the list
+through a second crawler lane that the crawler team has not built yet:
+
+| Command | Does |
+|---|---|
+| `recrawl-sync` | loads the live run into the `recrawl` schema of selectdb (one row per host and per doc) |
+| `recrawl-plan` | loop: sends up to 100 due URLs per hostname to `POST /scheduler_ingest/v1/recrawl-batches` (WebCrawler PR #84's API, proposal C10) |
+| `recrawl-archive` | loop: reads the crawler's WARC and fetch logs read-only, keeps the extracted text as Parquet under `/data/isel/text`, and updates the frontier |
+
+The two loops run only with `--profile recrawl`, and only after the crawler serves the
+recrawl lane (proposal C5, C6, C10). `tests/recrawl_fakes.py` holds a reference stub of
+the C10 API and a fake crawler; the integration tests run the whole loop against them.
 
 ## Rollout and rollback
 
@@ -72,3 +93,4 @@ flowchart LR
 | 6 | full scoring, exact top-K |
 | 7 | selectdb schema, publish, swap, rollback, verify-live |
 | 8 | container image, compose files, runbook |
+| 9 | recrawl frontier, crawler API client, text extraction (not deployed) |

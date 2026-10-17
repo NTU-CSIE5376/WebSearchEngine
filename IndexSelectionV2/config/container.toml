@@ -1,0 +1,20 @@
+# Host2 container overlay; the image passes it after config/isel.toml.
+# Sizes stay below the limits in deploy/compose.compute.yaml (128 GB, 32 CPUs).
+[run]
+work_dir = "/work"
+
+[model.params]
+num_threads = 32
+
+[manifest]
+canonical_workers = 16                   # 128M URLs at ~7 us each: ~1 min
+
+[duckdb]
+threads = 32
+memory_limit = "96GB"
+max_temp_directory_size = "100GB"
+
+[recrawl]                                # result_root is mounted read-only
+result_root = "/data/ipc/recrawl_result"
+text_root = "/data/isel/text"
+log_root = "/data/isel/log"

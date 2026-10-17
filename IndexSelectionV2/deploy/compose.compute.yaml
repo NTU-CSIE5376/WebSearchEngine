@@ -1,0 +1,90 @@
+# Host2 (ntu-sa2): isel batch jobs, one container per command. See DESIGN §12.
+#   GIT_SHA=<short sha> docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml build --build-arg GIT_SHA=<short sha> isel
+#   docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml run --rm isel pull-full --dry-run
+# Never run `docker system/image/volume prune` on the shared hosts.
+name: ${ISEL_PROJECT:?set it in the env file (DESIGN §12.5)}
+
+services:
+  isel:
+    build:
+      context: ..
+      target: runtime
+    image: ${ISEL_IMAGE:?set it in the env file (DESIGN §12.5)}:${GIT_SHA:-dev}
+    profiles: [job]                     # never started by `up`; only `run --rm`
+    entrypoint: ["isel", "--config", "/app/config/isel.toml",
+                 "--config", "/app/config/container.toml"]
+    command: ["check-config"]
+    init: true                          # forwards Ctrl-C and `docker stop` to isel
+    # The existing docker0. A project network needs a free subnet: other users take
+    # 172.20/16 and up, and Docker's next pick can hit the VPN clients (172.24/16).
+    network_mode: bridge
+    user: "1014:1015"
+    environment:                        # DSNs come from secret files, never from env values
+      ISEL_CRAWLERDB_DSN_FILE: /run/secrets/crawlerdb_dsn
+      ISEL_METRICDB_DSN_FILE: /run/secrets/metricdb_dsn
+      ISEL_SELECTDB_ADMIN_DSN_FILE: /run/secrets/selectdb_admin_dsn
+      ISEL_SELECTDB_READER_DSN_FILE: /run/secrets/selectdb_reader_dsn
+      ISEL_SELECTDB_READER_PASSWORD_FILE: /run/secrets/selectdb_reader_password
+    secrets: [crawlerdb_dsn, metricdb_dsn, selectdb_admin_dsn, selectdb_reader_dsn,
+              selectdb_reader_password]
+    volumes:
+      - ${ISEL_WORK_DIR:?set it in the env file (DESIGN §12.5)}:/work
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 128g
+    memswap_limit: 128g                 # no swap
+    cpus: 32
+    cpu_shares: 256                     # the crawler wins under contention
+    pids_limit: 512
+    oom_score_adj: 1000                 # we are killed first
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
+  # Recrawl loops (docs/RECRAWL.md). Started only after the crawler serves the
+  # recrawl-batches API and lane (crawler proposal C5, C6, C10):
+  #   docker compose ... --profile recrawl up -d recrawl-plan recrawl-archive
+  # isel never writes /data/ipc: the API writes queue files, and the crawler prunes its
+  # results, which isel reads. Run `mkdir -p /data/isel` as the isel user before `up`
+  # (/data is 1777); Docker would otherwise create the bind source as root.
+  recrawl-plan:
+    extends: {service: isel}
+    profiles: [recrawl]
+    command: ["recrawl-plan"]
+    restart: unless-stopped
+    network_mode: host                  # the gateway listens on 127.0.0.1:4000 only
+    environment:
+      ISEL_RECRAWL_API_TOKEN_FILE: /run/secrets/recrawl_api_token
+    secrets: [recrawl_api_token]
+    volumes:
+      - /data/ipc/recrawl_result:/data/ipc/recrawl_result:ro   # result_cap_gb backpressure
+      - /data/isel:/data/isel                                  # min_free_gb is measured here
+    mem_limit: 4g
+    memswap_limit: 4g
+    cpus: 2
+
+  recrawl-archive:
+    extends: {service: isel}
+    profiles: [recrawl]
+    command: ["recrawl-archive"]
+    restart: unless-stopped
+    volumes:
+      - /data/ipc/recrawl_result:/data/ipc/recrawl_result:ro
+      - /data/isel:/data/isel
+    mem_limit: 8g
+    memswap_limit: 8g
+    cpus: 8                             # archive_workers; 6.5 ms per 590 KB page each
+
+secrets:
+  crawlerdb_dsn:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/crawlerdb_dsn
+  metricdb_dsn:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/metricdb_dsn
+  selectdb_admin_dsn:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_admin_dsn
+  selectdb_reader_dsn:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_dsn
+  selectdb_reader_password:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_password
+  recrawl_api_token:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/recrawl_api_token
