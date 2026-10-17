@@ -187,6 +187,42 @@ class ScheduleCfg:
 
 
 @dataclass(frozen=True)
+class RecrawlCfg:
+    api_url: str
+    api_token_env: str
+    api_timeout_s: float
+    result_root: str
+    text_root: str
+    log_root: str
+    crawler_processes: int
+    batch_size: int
+    plan_max_batches: int
+    queue_files_per_dir: int
+    plan_interval_s: float
+    api_backoff_s: float
+    dispatch_timeout_s: int
+    sweep_rows: int
+    stale_days: int
+    retry_base_s: int
+    retry_max_s: int
+    max_attempts: int
+    robots_retry_days: int
+    host_pause_max_s: int
+    archive_interval_s: float
+    archive_workers: int
+    min_free_gb: int
+    result_cap_gb: int
+    max_body_chars: int
+    sync_chunk_rows: int
+    pace_days: float
+    pace_cycle_s: float
+    share_min: float
+    share_max: float
+    min_gap_s: float
+    report_days: list[int]
+
+
+@dataclass(frozen=True)
 class Config:
     run: RunCfg
     guard: GuardCfg
@@ -204,6 +240,7 @@ class Config:
     full: FullCfg
     selectdb: SelectDbCfg
     schedule: ScheduleCfg
+    recrawl: RecrawlCfg
 
     @property
     def work_dir(self) -> Path:
@@ -406,6 +443,35 @@ def _validate(cfg: Config) -> None:
     need(cfg.duckdb.threads > 0, "duckdb.threads must be > 0")
     _validate_full(cfg, need)
     _validate_selectdb(cfg, need)
+    _validate_recrawl(cfg, need)
+
+
+def _validate_recrawl(cfg: Config, need: Any) -> None:
+    r = cfg.recrawl
+    need(r.api_url.startswith(("http://", "https://")) and not r.api_url.endswith("/"),
+         "recrawl.api_url must be an http(s) URL without a trailing slash")
+    need(len({r.result_root, r.text_root, r.log_root}) == 3,
+         "recrawl.result_root, text_root and log_root must differ")
+    need(r.crawler_processes > 0 and cfg.crawlerdb.num_shards % r.crawler_processes == 0,
+         "recrawl.crawler_processes must divide crawlerdb.num_shards")
+    need(min(r.batch_size, r.plan_max_batches, r.queue_files_per_dir, r.dispatch_timeout_s,
+             r.sweep_rows, r.stale_days, r.retry_base_s, r.max_attempts, r.robots_retry_days,
+             r.host_pause_max_s, r.sync_chunk_rows, r.result_cap_gb, r.max_body_chars,
+             r.archive_workers) > 0,
+         "recrawl sizes, counts and intervals must be > 0")
+    need(r.batch_size <= 100, "recrawl.batch_size must be <= 100, the C10 limit")
+    need(min(r.plan_interval_s, r.archive_interval_s, r.min_gap_s, r.api_timeout_s,
+             r.api_backoff_s) > 0,
+         "recrawl.plan_interval_s, archive_interval_s, min_gap_s, api_timeout_s and "
+         "api_backoff_s must be > 0")
+    need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
+    need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
+    need(r.pace_days > 0, "recrawl.pace_days must be > 0")
+    need(r.pace_cycle_s >= r.min_gap_s, "recrawl.pace_cycle_s must be >= min_gap_s")
+    need(0 < r.share_min <= r.share_max < 1,
+         "recrawl.share_min and share_max must satisfy 0 < share_min <= share_max < 1")
+    need(bool(r.report_days) and all(d > 0 for d in r.report_days),
+         "recrawl.report_days must be non-empty and > 0")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:

@@ -284,6 +284,42 @@ def cmd_verify_live(cfg: Config, args: argparse.Namespace) -> Any:
     return verify_live(cfg, cfg.work_dir, args.batch)
 
 
+def _recrawl(cfg: Config, action: Any, read_only: bool = False) -> Any:
+    """Runs `action(conn)` as admin on a selectdb at the newest schema revision.
+
+    The reader role cannot see `recrawl`, so read-only work uses the admin role
+    in a read-only session.
+    """
+    from isel.selectdb import assert_ready, connect
+
+    conn = connect(cfg, cfg.selectdb.admin_dsn_env, read_only=read_only)
+    try:
+        assert_ready(cfg, conn)
+        return action(conn)
+    finally:
+        conn.close()
+
+
+def cmd_recrawl_sync(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import sync
+
+    return _recrawl(cfg, lambda conn: sync(cfg, conn))
+
+
+def cmd_recrawl_plan(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import capacity_report, run_planner
+
+    if args.dry_run:
+        return _recrawl(cfg, lambda conn: capacity_report(cfg, conn), read_only=True)
+    return _recrawl(cfg, lambda conn: run_planner(cfg, conn, args.once))
+
+
+def cmd_recrawl_archive(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import run_archiver
+
+    return _recrawl(cfg, lambda conn: run_archiver(cfg, conn, args.once))
+
+
 def cmd_validate_manifest(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.manifest import validate_run
 
@@ -347,6 +383,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("rollback", help="make the previous list live again")
     p = sub.add_parser("verify-live", help="indexed rate of a batch under the live list")
     p.add_argument("--batch", type=int, required=True)
+    sub.add_parser("recrawl-sync", help="load the live run into the recrawl frontier")
+    p = sub.add_parser("recrawl-plan", help="send due batches to the crawler API (loop)")
+    p.add_argument("--once", action="store_true", help="run one cycle and exit")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the per-host capacity report; send nothing")
+    p = sub.add_parser("recrawl-archive", help="apply crawler fetch logs; store page text (loop)")
+    p.add_argument("--once", action="store_true", help="run one cycle and exit")
     p = sub.add_parser("validate-manifest")
     p.add_argument("--run-dir", required=True)
     return parser
@@ -373,6 +416,9 @@ COMMANDS = {
     "swap": cmd_swap,
     "rollback": cmd_rollback,
     "verify-live": cmd_verify_live,
+    "recrawl-sync": cmd_recrawl_sync,
+    "recrawl-plan": cmd_recrawl_plan,
+    "recrawl-archive": cmd_recrawl_archive,
     "validate-manifest": cmd_validate_manifest,
 }
 

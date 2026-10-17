@@ -16,9 +16,11 @@
 
 **Non-goals**
 
-- No scheduler and no daemon. Each command is one run.
-- No writes to crawlerdb, metricdb or the v1 selectdb (`:5444`).
-- No page fetching and no index building.
+- No scheduler. Each command is one run, except the two opt-in recrawl services
+  ([`RECRAWL.md`](RECRAWL.md)).
+- No writes to crawlerdb, metricdb, the v1 selectdb (`:5444`) or `/data/ipc`.
+- No page fetching of our own and no index building yet. The recrawl asks the crawler
+  to fetch the list and keeps the extracted text; the index is only planned.
 
 ## 2. Configuration (`config.py`)
 
@@ -222,6 +224,7 @@ then runs `alembic check` against `schema.py`; any difference rolls the whole ru
 |---|---|
 | `public.selected_urls_current` | `url` PK, `score`, `first_seen` (NULL), `run_id` FK `ON DELETE RESTRICT`, `selected_at`; the v1 columns |
 | `public.model_runs` | the v1 columns, plus `status` (loading, validated, live, retired, abandoned, rolled_back; at most one live), `activated_at`, `config_sha256`, `code_version` |
+| `recrawl.host`, `recrawl.doc`, `recrawl.log`, `recrawl.batch_seq` | the recrawl frontier (revision 0003): one row per hostname and per doc, and the fetch logs already applied. See [`RECRAWL.md`](RECRAWL.md) |
 
 **How the metric reads it.** `SELECT url FROM public.selected_urls_current WHERE url =
 ANY(:urls)`, 10,000 URLs at a time, as the hard-coded `select` role. Since
@@ -243,7 +246,8 @@ metric builds the random set at 12:00 and the head set at 18:00.
 5433 and 5444, and any database that holds `url_state_current_000` or `metric_url`.
 
 **Reader role.** `migrate-selectdb` creates the `select` role with the password the
-metric hard-codes. The role can only `SELECT` from `public`.
+metric hard-codes. The role can only `SELECT` from `public`; it has no access to the
+`recrawl` schema.
 
 **Self-check.** `verify-live --batch <b>` sends the metric's query as `select`.
 `indexed_metric_rate` equals the metric's `indexed_rate`: canonical golden URLs found ÷
@@ -251,7 +255,7 @@ distinct canonical golden URLs.
 
 **First run on the live :5445.** That database predates Alembic. The first
 `migrate-selectdb` needs `--stamp-baseline`: it records revision 0001, then applies
-0002. Review the DDL with `--sql` first. Revision 0002 changes the list's FK from
+0002 and 0003. Review the DDL with `--sql` first. Revision 0002 changes the list's FK from
 `CASCADE` to `RESTRICT`, so a deleted run can no longer take its list with it.
 
 ## 10. Deployment (`Dockerfile`, `deploy/`)
@@ -275,6 +279,7 @@ distinct canonical golden URLs.
 | Setting | Reason |
 |---|---|
 | `profiles: [job]`, used with `run --rm` | one container per command; `up` starts nothing |
+| except `recrawl-plan`, `recrawl-archive` (`profiles: [recrawl]`) | long-running loops with `restart: unless-stopped`, one instance each (advisory lock). `recrawl-plan` uses `network_mode: host` to reach the gateway on `127.0.0.1:4000`; both mount `/data/ipc/recrawl_result` read-only and `/data/isel` writable |
 | `read_only: true`, `tmpfs: /tmp` | only `/work` is writable |
 | secrets as `<NAME>_FILE` | DSNs never appear in `docker inspect`, env or logs |
 | `mem_limit` 128g, `cpus` 32 | DuckDB 96 GB and LightGBM 32 threads fit below the limit |
@@ -309,6 +314,11 @@ $J migrate-selectdb --stamp-baseline         # first run on the pre-Alembic :544
 $J publish --run-dir /work/full/selection/run=<id>
 $J swap --db-run-id <n>
 $J verify-live --batch <b>
+# recrawl (docs/RECRAWL.md), only after the crawler serves the recrawl lane
+$J recrawl-sync                        # after each swap; refused in the freeze window
+$J recrawl-plan --dry-run              # per-host capacity report; sends nothing
+$D --profile recrawl up -d recrawl-plan recrawl-archive
+$D --profile recrawl stop recrawl-plan # stops sending new batches at once
 ```
 
 **Recovery**
