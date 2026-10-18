@@ -18,7 +18,8 @@
 
 - No scheduler. Each command is one run, except the two opt-in recrawl services
   ([`RECRAWL.md`](RECRAWL.md)).
-- No writes to crawlerdb, metricdb, the v1 selectdb (`:5444`) or `/data/ipc`.
+- No writes to crawlerdb, metricdb, the v1 selectdb (`:5444`) or `/data/ipc`. The
+  recrawl's results are deleted only through the crawler's API.
 - No page fetching of our own and no index building yet. The recrawl asks the crawler
   to fetch the list and keeps the extracted text; the index is only planned.
 
@@ -224,7 +225,7 @@ then runs `alembic check` against `schema.py`; any difference rolls the whole ru
 |---|---|
 | `public.selected_urls_current` | `url` PK, `score`, `first_seen` (NULL), `run_id` FK `ON DELETE RESTRICT`, `selected_at`; the v1 columns |
 | `public.model_runs` | the v1 columns, plus `status` (loading, validated, live, retired, abandoned, rolled_back; at most one live), `activated_at`, `config_sha256`, `code_version` |
-| `recrawl.host`, `recrawl.doc`, `recrawl.log`, `recrawl.batch_seq` | the recrawl frontier (revision 0003): one row per hostname and per doc, and the fetch logs already applied. See [`RECRAWL.md`](RECRAWL.md) |
+| `recrawl.host`, `recrawl.doc`, `recrawl.job`, `recrawl.batch_seq` | the recrawl frontier (revision 0003): one row per hostname, per doc and per job sent to the crawler API. See [`RECRAWL.md`](RECRAWL.md) |
 
 **How the metric reads it.** `SELECT url FROM public.selected_urls_current WHERE url =
 ANY(:urls)`, 10,000 URLs at a time, as the hard-coded `select` role. Since
@@ -279,7 +280,7 @@ distinct canonical golden URLs.
 | Setting | Reason |
 |---|---|
 | `profiles: [job]`, used with `run --rm` | one container per command; `up` starts nothing |
-| except `recrawl-plan`, `recrawl-archive` (`profiles: [recrawl]`) | long-running loops with `restart: unless-stopped`, one instance each (advisory lock). `recrawl-plan` uses `network_mode: host` to reach the gateway on `127.0.0.1:4000`; both mount `/data/ipc/recrawl_result` read-only and `/data/isel` writable |
+| except `recrawl-plan`, `recrawl-archive` (`profiles: [recrawl]`) | long-running loops with `restart: unless-stopped`, one instance each (advisory lock). `recrawl-plan` uses `network_mode: host` to reach the crawler API on `127.0.0.1:4000`; both mount `/data/manual_bulk_crawls/results` read-only and `/data/isel` writable |
 | `read_only: true`, `tmpfs: /tmp` | only `/work` is writable |
 | secrets as `<NAME>_FILE` | DSNs never appear in `docker inspect`, env or logs |
 | `mem_limit` 128g, `cpus` 32 | DuckDB 96 GB and LightGBM 32 threads fit below the limit |
@@ -314,11 +315,11 @@ $J migrate-selectdb --stamp-baseline         # first run on the pre-Alembic :544
 $J publish --run-dir /work/full/selection/run=<id>
 $J swap --db-run-id <n>
 $J verify-live --batch <b>
-# recrawl (docs/RECRAWL.md), only after the crawler serves the recrawl lane
+# recrawl (docs/RECRAWL.md), only after WebCrawler#84 is merged and deployed
 $J recrawl-sync                        # after each swap; refused in the freeze window
 $J recrawl-plan --dry-run              # per-host capacity report; sends nothing
 $D --profile recrawl up -d recrawl-plan recrawl-archive
-$D --profile recrawl stop recrawl-plan # stops sending new batches at once
+$D --profile recrawl stop recrawl-plan # stops sending new jobs at once
 ```
 
 **Recovery**

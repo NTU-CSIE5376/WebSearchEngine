@@ -15,6 +15,6 @@ memory_limit = "96GB"
 max_temp_directory_size = "100GB"
 
 [recrawl]                                # result_root is mounted read-only
-result_root = "/data/ipc/recrawl_result"
+result_root = "/data/manual_bulk_crawls/results"
 text_root = "/data/isel/text"
 log_root = "/data/isel/log"

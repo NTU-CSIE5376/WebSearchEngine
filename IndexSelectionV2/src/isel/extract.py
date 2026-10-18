@@ -1,27 +1,20 @@
-"""Text for the inverted index: one WARC response record in, one `TextDoc` out.
+"""Text for the inverted index: one HTML page in, one `TextDoc` out.
 
-The crawler writes each WARC record as its own gzip member (proposal C6), and the
-fetch log gives the member's offset and length, so a record is read by seeking
-to it. Extraction keeps what an index needs: title, meta description, main
-content and language. Raw HTML is not kept; the WARC is short-lived staging.
+The crawler stores each page's raw bytes without its headers, so the encoding
+is detected from the bytes (or a `<meta charset>`) unless a caller declares
+one. Extraction keeps what an index needs: title, meta description, main
+content and language. Raw HTML is not kept.
 """
 
 from __future__ import annotations
 
 import codecs
-import io
 from dataclasses import dataclass
-from pathlib import Path
 
-from fastwarc.warc import ArchiveIterator, WarcRecordType
 from resiliparse.extract.html2text import extract_plain_text
 from resiliparse.parse.encoding import bytes_to_str, detect_encoding
 from resiliparse.parse.html import HTMLTree
 from resiliparse.parse.lang import detect_fast
-
-
-class ExtractError(RuntimeError):
-    """Raised when the bytes at an offset are not one WARC response record."""
 
 
 @dataclass(frozen=True)
@@ -30,26 +23,6 @@ class TextDoc:
     description: str | None
     body: str
     lang: str | None
-
-
-def read_response(path: Path, offset: int, length: int,
-                  target_uri: str) -> tuple[bytes, str | None]:
-    """Returns the HTTP payload and declared charset of the response record at `offset`.
-
-    The record must start at `offset` and be the response for `target_uri`: a
-    wrong offset would otherwise yield a neighbouring or truncated record.
-    """
-    with path.open("rb") as fh:
-        fh.seek(offset)
-        member = fh.read(length)
-    if len(member) != length:
-        raise ExtractError(f"{path.name}: {length} bytes at {offset} run past the end")
-    for rec in ArchiveIterator(io.BytesIO(member), parse_http=True):
-        if (rec.stream_pos != 0 or rec.record_type != WarcRecordType.response
-                or rec.headers.get("WARC-Target-URI") != target_uri):
-            break
-        return rec.reader.read(), rec.http_charset
-    raise ExtractError(f"{path.name}: no response record for {target_uri} at {offset}")
 
 
 def _encoding(payload: bytes, declared: str | None) -> str:

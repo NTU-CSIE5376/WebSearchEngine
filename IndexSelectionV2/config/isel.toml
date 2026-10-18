@@ -237,39 +237,36 @@ swap_freeze_days = [1, 16]
 swap_freeze_window = ["11:30", "20:00"]  # random set at 12:00, head set at 18:00 UTC
 
 [recrawl]                                # recrawl frontier in selectdb `recrawl`; docs/RECRAWL.md
-api_url = "http://127.0.0.1:4000/scheduler_ingest"   # crawler API (proposal C10), via the gateway
-api_token_env = "ISEL_RECRAWL_API_TOKEN" # bearer token for the recrawl-batches routes
+api_url = "http://127.0.0.1:4000"        # crawler API (WebCrawler PR #84), host network only
 api_timeout_s = 10.0
-result_root = "work/recrawl/result"      # crawler_NN/<base>.{warc.gz,jsonl}; read-only for isel
-text_root = "work/recrawl/text"          # permanent extracted text, fetch_date=YYYYMMDD/crawler_NN/
-log_root = "work/recrawl/log"            # permanent gzipped fetch logs, YYYYMMDD/crawler_NN/
-crawler_processes = 16                   # crawler processes; a host goes to shard // (256 / 16)
-batch_size = 100                         # URLs per batch, as the offerer's per_domain_url_cap
-plan_max_batches = 1000                  # batches sent per plan cycle
-queue_files_per_dir = 384                # C10 answers 429 above this many batches per process
+result_root = "work/recrawl/result"      # the API's results dir, {job_id}/NNNNN.{json,html}; read-only
+text_root = "work/recrawl/text"          # permanent extracted text, fetch_date=YYYYMMDD/job-*.parquet
+log_root = "work/recrawl/log"            # permanent per-URL results, YYYYMMDD/job-*.jsonl.gz
+job_size = 3000                          # URLs per job; the API takes up to 10000. A job is
+                                         # published only when all its URLs finish
+host_docs_per_job = 120                  # docs per host and job: 600 s at min_gap_s
+max_jobs_inflight = 48                   # open jobs; each crawler process holds up to 64
+plan_max_jobs = 8                        # jobs claimed per plan cycle
 plan_interval_s = 30.0
-api_backoff_s = 300.0                    # no new batches after the API refused the whole cycle
-dispatch_timeout_s = 28800               # after the crawler takes a batch: 100 URLs at a 60 s
-                                         # Crawl-delay and share_min 0.25 take 24000 s
+api_backoff_s = 300.0                    # no new jobs after the API refused a whole job
+claim_timeout_s = 600                    # a job whose POST got no answer is lost after this
+job_check_s = 21600                      # status query of a job without results, at most this often
+result_ttl_days = 3                      # the job's ttl_days: the API stops it and deletes its
+                                         # results this long after the POST; isel deletes sooner
+max_resend = 20                          # 400 "at index N" drops one URL and sends again
 sweep_rows = 100000                      # fetched docs made due again per plan cycle
 stale_days = 30                          # uniform revisit interval
 retry_base_s = 600                       # failed doc: retry_base_s * 2^attempts
 retry_max_s = 86400
 max_attempts = 5                         # then wait stale_days instead of retry_max_s
-robots_retry_days = 30                   # a robots.txt disallow is asked again after this
-host_pause_max_s = 86400                 # cap on a 429/503 Retry-After pause
+robots_retry_days = 30                   # a robots.txt refusal is asked again after this
+host_pause_max_s = 86400                 # cap on a 429/503 pause
 archive_interval_s = 60.0
 archive_workers = 8                      # text extraction: 6.5 ms per 590 KB page each
-min_free_gb = 800                        # no new batches below this free space under text_root;
+min_free_gb = 800                        # no new jobs below this free space under text_root;
                                          # Host2 /data has ~2 TB free while the crawler runs
-result_cap_gb = 1000                     # no new batches while recrawl_result holds more than this
 max_body_chars = 200000                  # extracted body text kept per page
 sync_chunk_rows = 1000000                # docs per recrawl-sync transaction
-# Pacing: each batch asks the crawler for the share of its host's requests that
-# finishes the host's due docs within pace_days of the oldest one (proposal C9).
-pace_days = 14.0
-pace_cycle_s = 6.7                       # seconds per request on a host: max(gap, latency)
-share_min = 0.25                         # a 100-URL batch at pace_cycle_s then takes ~45 min
-share_max = 0.75                         # the normal lane keeps at least 25 % of a busy host
-min_gap_s = 5.0                          # 0.2 qps per hostname; capacity report only
+min_gap_s = 5.0                          # 0.2 qps per hostname: a host gets its next job no
+                                         # sooner than docs * min_gap_s after the last one
 report_days = [1, 7, 14, 28]             # capacity report horizons
