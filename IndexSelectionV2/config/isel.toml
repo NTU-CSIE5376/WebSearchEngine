@@ -64,8 +64,27 @@ tldextract_offline = true
 "facebook.com" = 192
 "yahoo.com" = 224
 
+[pull]
+min_interval_s = 0.5                     # minimum gap between crawlerdb statements
+shards = []                              # empty = all shards
+
+[golden]
+lead_h = 30.0                            # as_of = batch created_at - lead_h
+tags = ["head", "random"]
+exclude_batches = []
+use_pseudo = false                       # pseudo golden is a research overlay
+
 [duckdb]
 threads = 8
 memory_limit = "16GB"
 max_temp_directory_size = "50GB"
+
+[full]                                   # full crawled pool: export, score, exact top-K
+chunk_blocks = 65536                     # heap blocks per COPY (512 MiB); its timeout is the 120 s floor
+chunks_per_file = 16                     # COPY chunks per Parquet file (8 GiB of heap), the resume unit
+min_free_gb = 150.0                      # stop exporting below this much free work_dir disk
+parse_threads = 8                        # pyarrow threads that parse the CSV COPY output
+connections = 4                          # crawlerdb sessions, one backend core each (Host1: 144)
+max_heap_mb_s = 2000.0                   # heap read cap for all sessions together; the hourly
+                                         # metric scan reads 7-8 GB/s with await < 1 ms
 

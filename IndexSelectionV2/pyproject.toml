@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "duckdb>=1.5",
+    "psycopg[binary]>=3.3",
     "pyarrow>=21",
     "pytz>=2026.5",
     "tldextract==5.1.1",
