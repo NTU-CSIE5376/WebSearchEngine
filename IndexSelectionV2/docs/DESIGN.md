@@ -129,6 +129,70 @@ sample.
 no fixed order, and LightGBM bins 0 apart from ±4·10⁻¹⁶, so DOUBLE sums would train a
 different model on every run.
 
+## 6. Model and evaluation (`model.py`, `backtest.py`, `evaluate.py`)
+
+**Training data for batch b**
+
+- Positives: rows of `pool_b` whose URL equals a golden(b) spelling.
+- Negatives: other pool-half sample rows in `pool_b`, sampled at `dataset.neg_rate`.
+- Head and random positives get equal total weight.
+- The model estimates P(url ∈ golden(b) | features at `as_of_b`).
+
+**Training**
+
+- The train frame is sorted by (url, shard), because LightGBM bagging samples by row
+  position.
+- Early stopping looks only at the last official training batch. With
+  `refit_on_all = true`, the model is refit on all training batches with the best
+  round count.
+- A test batch never takes part in tuning.
+
+**Recall at K.** The sample rate is p, so population rank K sits near sample rank
+round(K · p). A golden row at or above that boundary counts as selected. With p = 1 this
+is the exact top K.
+
+**Rates**
+
+- `indexed_exact_rate`: raw-string match. It is the backtest headline, kept comparable
+  with earlier runs.
+- `indexed_canonical_rate`: the raw or the canonical spelling is listed.
+- `crawled_*_rate`: the share that was crawled by `as_of`, an upper bound.
+
+**Confidence intervals.** A bootstrap resamples queries. A URL in c queries weighs 1/c
+in each. Each scorer is compared with the reference model as a paired difference.
+
+**Adoption rule (fixed in advance).** Tune on batch t − 1 and report on t. Adopt a
+change only when its paired 95 % CI against the strongest baseline is above 0.
+
+**Baselines:** `random`, `inlinks`, `ext`, `domain_prior`, `logreg`, `v1_features`
+(the v1 feature set retrained), and, in forward evaluation only, `url_score` and the
+V2 rule formula.
+
+**Frozen model.** `train` writes `models/<id>/` with the model, its SHA-256 and a
+`sample_fingerprint` (method, percent, salt, export start). `forward-eval` and
+`score-full` refuse a model whose fingerprint differs from the current sample.
+
+## 7. Output contract (`manifest.py`)
+
+```
+selection/run=<id>/
+  manifest/index_shard=NN.parquet   # one row per URL
+  deltas/added.parquet              # doc_ids not in the parent run
+  deltas/removed.parquet            # parent doc_ids no longer selected
+  _MANIFEST.json                    # written last: parent, rows, sha256 per file
+```
+
+| Column | Meaning |
+|---|---|
+| `doc_id` | low 64 bits of MD5 of the canonical URL; stable across runs |
+| `url` | the spelling the metric matches (the crawler's spelling) |
+| `canonical_url` | `canonicalize(url)`; spellings of one page share a `doc_id` |
+| `host`, `domain_id`, `crawl_shard` | where the crawler keeps the page |
+| `index_shard` | `doc_id mod index_shards`, for a future indexer |
+| `score`, `rank`, `reason` | model score, rank (score desc, URL hash asc), top feature contributions |
+
+- Every file is written as `.tmp`, fsynced, then renamed (`io.py`).
+- `validate-manifest` checks each file's sha256 and row count. `publish` runs it first.
 
 
 

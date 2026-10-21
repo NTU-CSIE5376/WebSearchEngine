@@ -15,6 +15,7 @@ def _overlay(tmp_path: Path, text: str) -> list[Path]:
 
 
 def test_base_config_loads(base_cfg):
+    assert base_cfg.eval.k_headline == 128_000_000
     assert len(base_cfg.sha256()) == 64
 
 
@@ -39,6 +40,11 @@ def test_base_config_loads(base_cfg):
     ("[full]\nsample_salt = 'isel'\n", "differ from dataset.neg_salt"),
     ("[full]\nagg_share = 1.0\n", "agg_share must be in"),
     ("[full]\nagg_salt = 'sample-v1'\n", "agg_salt must be set and differ"),
+    ("[eval]\nk_headline = 5\n", "k_headline"),
+    # num_threads = 0 lets OpenMP start one thread per host CPU, past the container quota.
+    ("[model.params]\nnum_threads = 0\n", "num_threads must be an integer > 0"),
+    ("[model.params]\nnum_threads = 2.5\n", "num_threads must be an integer > 0"),
+    ("[model.params]\nn_jobs = 4\n", r"aliases \['n_jobs'\]"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
@@ -53,3 +59,9 @@ def test_config_rejects_missing_key(tmp_path):
         load_config([path])
 
 
+def test_config_needs_the_lightgbm_thread_count(tmp_path):
+    text = BASE.read_text().replace("\nnum_threads = 8\n", "\n")
+    path = tmp_path / "full.toml"
+    path.write_text(text)
+    with pytest.raises(ConfigError, match="num_threads must be an integer > 0"):
+        load_config([path])
