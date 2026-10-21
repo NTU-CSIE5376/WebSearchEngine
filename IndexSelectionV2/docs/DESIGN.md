@@ -254,3 +254,65 @@ distinct canonical golden URLs.
 0002. Review the DDL with `--sql` first. Revision 0002 changes the list's FK from
 `CASCADE` to `RESTRICT`, so a deleted run can no longer take its list with it.
 
+## 10. Deployment (`Dockerfile`, `deploy/`)
+
+| Part | Host | Why |
+|---|---|---|
+| isel jobs (`deploy/compose.compute.yaml`) | Host2 | free RAM and disk; reads Host1's databases over the LAN |
+| selectdb `:5445` (`deploy/compose.selectdb.yaml`) | Host1 | data on the root NVMe, not on crawlerdb's `/data` |
+
+**Image**
+
+- Stages: `uv` → `builder` (`uv sync --locked --no-dev`) → `test` (pytest with
+  `--network=none`) → `runtime`.
+- Base images are pinned by digest. `libgomp1` is installed for LightGBM.
+- `USER 1014:1015` matches the host account, so files in the work dir belong to it.
+- `--build-arg GIT_SHA=<sha>` becomes `ISEL_CODE_VERSION`; models, runs and
+  `model_runs.code_version` record it.
+
+**Compose**
+
+| Setting | Reason |
+|---|---|
+| `profiles: [job]`, used with `run --rm` | one container per command; `up` starts nothing |
+| `read_only: true`, `tmpfs: /tmp` | only `/work` is writable |
+| secrets as `<NAME>_FILE` | DSNs never appear in `docker inspect`, env or logs |
+| `mem_limit` 128g, `cpus` 32 | DuckDB 96 GB and LightGBM 32 threads fit below the limit |
+| `cpu_shares: 256`, `oom_score_adj: 1000` | the crawler wins any contention; we are killed first |
+| `network_mode: bridge` | jobs only connect out to Host1 |
+
+The env file `~/isel/compose.env` (not in the repo) sets `ISEL_PROJECT`, `ISEL_IMAGE`,
+`ISEL_WORK_DIR` and `ISEL_SECRETS`.
+
+## 11. Runbook
+
+Each step below needs the owner's approval. `pull-full` also needs the TA's approval.
+
+```bash
+D="docker compose --env-file $HOME/isel/compose.env -f deploy/compose.compute.yaml"
+GIT_SHA=$SHA $D build --build-arg GIT_SHA=$SHA isel
+J="$D run --rm isel"
+$J check-config
+$J pull-golden
+$J pull-dims
+$J pull-full --dry-run                 # catalog only: heap bytes, chunks, free disk
+$J pull-full                           # rerun until shards_missing = 0
+$J derive-sample
+$J derive-positives
+$J build-dataset
+$J backtest --feature-sets full --baselines random,v1_features,domain_prior
+$J train                               # freeze before the batch's as_of
+$J score-full --model-dir /work/models/<id>
+$J select-full
+$J migrate-selectdb --sql --stamp-baseline   # review the DDL
+$J migrate-selectdb --stamp-baseline         # first run on the pre-Alembic :5445 only
+$J publish --run-dir /work/full/selection/run=<id>
+$J swap --db-run-id <n>
+$J verify-live --batch <b>
+```
+
+**Recovery**
+
+- A bad list: `$J rollback` restores the previous list at once.
+- The metric back on v1: the TA sets `--select_db_url` back to `:5444`.
+- Every command resumes: rerun it after an interruption.
