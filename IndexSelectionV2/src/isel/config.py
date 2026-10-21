@@ -78,7 +78,6 @@ class GoldenCfg:
     lead_h: float
     tags: list[str]
     exclude_batches: list[int]
-    use_pseudo: bool
 
 
 @dataclass(frozen=True)

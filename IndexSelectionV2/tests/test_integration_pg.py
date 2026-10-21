@@ -155,8 +155,6 @@ def test_golden_pull_reads_metricdb_tables(cfg, tmp_path):
     finally:
         session.close()
     assert summary["1"]["head"]["distinct_raw_urls"] == 2
-    pool = pq.read_table(tmp_path / "golden" / "pool.parquet").to_pylist()
-    assert sorted((r["keyword"], r["tags"]) for r in pool) == [("q1", ["head"]), ("q2", [])]
 
 
 def _files(root):

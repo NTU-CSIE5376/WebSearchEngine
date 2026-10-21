@@ -72,7 +72,6 @@ shards = []                              # empty = all shards
 lead_h = 30.0                            # as_of = batch created_at - lead_h
 tags = ["head", "random"]
 exclude_batches = []
-use_pseudo = false                       # pseudo golden is a research overlay
 
 [duckdb]
 threads = 8
