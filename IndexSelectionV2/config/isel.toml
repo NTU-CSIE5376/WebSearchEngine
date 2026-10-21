@@ -202,6 +202,7 @@ max_temp_directory_size = "50GB"
 chunk_blocks = 65536                     # heap blocks per COPY (512 MiB); its timeout is the 120 s floor
 chunks_per_file = 16                     # COPY chunks per Parquet file (8 GiB of heap), the resume unit
 min_free_gb = 150.0                      # stop exporting below this much free work_dir disk
+tau_margin = 0.15                        # score floor = sample score at rank round(K·p·(1 + margin))
 parse_threads = 8                        # pyarrow threads that parse the CSV COPY output
 connections = 4                          # crawlerdb sessions, one backend core each (Host1: 144)
 max_heap_mb_s = 2000.0                   # heap read cap for all sessions together; the hourly
@@ -211,4 +212,6 @@ sample_salt = "sample-v1"                # changing it draws a different sample
 agg_share = 0.5                          # share of the sample that only feeds domain statistics;
                                          # the rest gives negatives, the eval pool and tau
 agg_salt = "agg-v1"                      # splits the sample into those two halves
+kept_share_max_z = 6.0                   # score-full stops when its kept rows differ from
+                                         # the sample's estimate by more than this many SDs
 
