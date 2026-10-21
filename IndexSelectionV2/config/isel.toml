@@ -215,3 +215,23 @@ agg_salt = "agg-v1"                      # splits the sample into those two halv
 kept_share_max_z = 6.0                   # score-full stops when its kept rows differ from
                                          # the sample's estimate by more than this many SDs
 
+[selectdb]                               # OUR selectdb (:5445), the only database isel writes
+admin_dsn_env = "ISEL_SELECTDB_ADMIN_DSN"
+reader_dsn_env = "ISEL_SELECTDB_READER_DSN"        # the role the official metric connects as
+reader_role = "select"                   # WebSearchEngine measure.py hardcodes this user
+reader_password_env = "ISEL_SELECTDB_READER_PASSWORD"   # only init-selectdb needs it
+forbidden_ports = [5432, 5433, 5444]     # crawlerdb, metricdb, V1 selectdb
+connect_timeout_s = 10
+copy_block_bytes = 8388608
+maintenance_work_mem = "4GB"             # primary key build on 128M URLs
+swap_lock_timeout = "5s"                 # readers wait at most this long for a swap
+swap_retry_attempts = 5
+swap_retry_backoff_s = 30.0
+keep_prev = true                         # keep the previous list for rollback
+max_db_bytes = 200000000000              # refuse a load that would grow selectdb past this
+est_bytes_per_row = 230                  # heap + primary key per selected URL
+verify_chunk = 10000                     # URLs per lookup, as in the official metric
+
+[schedule]                               # the metric reads the list right after creating a batch
+swap_freeze_days = [1, 16]
+swap_freeze_window = ["11:30", "20:00"]  # random set at 12:00, head set at 18:00 UTC
