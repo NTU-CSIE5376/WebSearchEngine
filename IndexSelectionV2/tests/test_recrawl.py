@@ -130,7 +130,8 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
         (("job_size = 3000 ", "job_size = 10001 "), "max_urls"),
         (("host_docs_per_job = 120 ", "host_docs_per_job = 3001 "), "host_docs_per_job"),
         (("claim_timeout_s = 600 ", "claim_timeout_s = 5 "), "claim_timeout_s"),
-        (("job_check_s = 21600 ", "job_check_s = 259200 "), "job_check_s"),
+        (("status_poll_s = 60 ", "status_poll_s = 259200 "), "status_poll_s"),
+        (("status_poll_s = 60 ", "status_poll_s = -1 "), "status_poll_s"),
         (("result_ttl_days = 3 ", "result_ttl_days = 0 "), "result_ttl_days"),
         (("result_ttl_days = 3 ", "result_ttl_days = 61 "), "result_ttl_days"),
         (("archive_workers = 8", "archive_workers = 0"), "must be > 0"),
@@ -142,6 +143,7 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
         with pytest.raises(ConfigError, match=message):
             load_config([path])
     assert replace(base_cfg, "recrawl", job_size=1).recrawl.job_size == 1
+    assert replace(base_cfg, "recrawl", status_poll_s=0).recrawl.status_poll_s == 0
 
 
 @pytest.fixture
@@ -158,12 +160,13 @@ def test_the_api_client_reads_every_documented_answer(stub):
     pending = json.loads((stub.pending / f"{reply.job_id}.json").read_text())
     assert pending["urls"] == [URL, "https://a.example/q?a=1&b=2"]  # canonical, deduplicated
     assert pending["ttl_days"] == 3
-    assert api.status(reply.job_id) == "pending"
-    FakeCrawler(stub, {URL: Page(body=b"<p>x</p>")}).take(datetime.now(UTC))
-    assert api.status(reply.job_id) == "completed"
-    assert api.status("0" * 32) == "missing"
+    assert api.status(reply.job_id) == ("pending", None)
+    done = datetime.now(UTC)
+    FakeCrawler(stub, {URL: Page(body=b"<p>x</p>")}).take(done)
+    assert api.status(reply.job_id) == ("completed", done.isoformat())
+    assert api.status("0" * 32) == ("missing", None)
     stub.status_codes["1" * 32] = 503
-    assert api.status("1" * 32) is None
+    assert api.status("1" * 32) == (None, None)
     assert api.submit([URL, "http://localhost/"], 3) == Reply(
         400, error="Invalid HTTP(S) URL at index 1")
     assert api.submit([URL], 61) == Reply(
@@ -171,7 +174,9 @@ def test_the_api_client_reads_every_documented_answer(stub):
     stub.forced = [(503, "Submission unavailable; no URLs accepted")]
     assert api.submit([URL], 3) == Reply(503, error="Submission unavailable; no URLs accepted")
     gone = CrawlerApi("http://127.0.0.1:9", 0.5)        # nothing listens
-    assert gone.submit([URL], 3) == Reply(None) and gone.status("0" * 32) is None
+    assert gone.submit([URL], 3) == Reply(None)
+    with pytest.raises(OSError):
+        gone.status("0" * 32)
     assert gone.delete("0" * 32) is False
 
 
@@ -185,5 +190,5 @@ def test_the_api_client_deletes_and_sees_expired_jobs(stub):
     assert api.delete(done) is True                     # 404: nothing left to delete
     now = datetime.now(UTC)
     stub.clock = lambda: now + timedelta(days=3)
-    assert api.status(live) == "missing"                # past its TTL
+    assert api.status(live) == ("missing", None)        # past its TTL
     assert stub.collect_expired() == 1 and stub.jobs() == []

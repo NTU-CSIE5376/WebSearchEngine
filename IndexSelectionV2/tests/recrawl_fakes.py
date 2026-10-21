@@ -1,22 +1,29 @@
-"""Stand-ins for the crawler side of the recrawl: WebCrawler PR #84's job API and worker.
+"""Stand-ins for the crawler side of the recrawl: WebCrawler PR #84's job API and workers.
 
 `ApiStub` serves `POST /v1/manual-bulk-crawls` and `GET` / `DELETE .../{job_id}`
-as PR #84 at 4dce38f does: it canonicalizes each URL with w3lib, drops later
-duplicates, and writes one pending file per job that expires `ttl_days` after
-the POST. An expired job answers 404 and is removed by `collect_expired`.
-`FakeCrawler` answers pending jobs from a dict of canned pages and publishes
-each job like `ManualBulkCrawlBatch`: `{index:05d}.json` and `.html` under
-`.incomplete/{job}`, then one rename to `results/{job}`.
+as PR #84 at bd40191 does. A POST canonicalizes each URL with w3lib, drops later
+duplicates, routes each URL to one of `CRAWLERS` crawlers by hostname, and
+creates `results/{job}/request.json` with an empty `crawler_NN/` partition per
+crawler, a queue entry `pending/crawler_NN/{job}.json` per crawler, and the
+manifest `pending/{job}.json` last. The job expires `ttl_days` after the POST:
+it then answers 404 and is removed by `collect_expired`. A GET sums the
+partitions' `progress.json` like `job_status`: completed once every partition
+has a `completed_at`.
+`FakeCrawler` answers queued partitions from a dict of canned pages and writes
+them like `ManualBulkCrawlBatch`: `{index:05d}.json` and `.html`, then
+`progress.json`, and removes its queue entry.
 """
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import shutil
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,10 +50,21 @@ def canonical(url: str) -> str | None:
 
 
 DEFAULT_TTL_DAYS = 14
+CRAWLERS = 2
 
 
 def expires_at(payload: dict) -> datetime:
     return datetime.fromisoformat(payload["expires_at"])
+
+
+def crawler_of(url: str) -> int:
+    """The crawler that owns a URL's hostname, as the API's routing picks one."""
+    host = (urlsplit(url).hostname or "").encode()
+    return int(hashlib.md5(host).hexdigest(), 16) % CRAWLERS
+
+
+def partition(results: Path, job_id: str, crawler_id: int) -> Path:
+    return results / job_id / f"crawler_{crawler_id:02d}"
 
 
 class ApiStub:
@@ -76,7 +94,15 @@ class ApiStub:
         self.server.server_close()
 
     def jobs(self) -> list[str]:
+        """The jobs the API holds: one manifest each."""
         return sorted(p.stem for p in self.pending.glob("*.json"))
+
+    def manifest(self, job_id: str) -> dict:
+        return json.loads((self.pending / f"{job_id}.json").read_text())
+
+    def queued(self, job_id: str) -> list[int]:
+        """The crawlers that still have this job in their queue."""
+        return sorted(int(p.parent.name[-2:]) for p in self.pending.glob(f"crawler_*/{job_id}.json"))
 
     def _post(self, body: object) -> tuple[int, dict]:
         if self.forced:
@@ -98,11 +124,20 @@ class ApiStub:
             normalized[fixed] = None
         job_id = uuid.uuid4().hex
         created = self.clock()
+        listed = list(normalized)
+        payload = {"version": 1, "urls": listed, "max_concurrency_ratio": 0.5,
+                   "crawler_ids": [crawler_of(u) for u in listed],
+                   "result_dir": str(self.results), "created_at": created.isoformat(),
+                   "ttl_days": ttl, "expires_at": (created + timedelta(days=ttl)).isoformat()}
         with self._lock:
-            (self.pending / f"{job_id}.json").write_text(json.dumps({
-                "version": 1, "urls": list(normalized), "crawler_ids": [0] * len(normalized),
-                "result_dir": str(self.results), "created_at": created.isoformat(),
-                "ttl_days": ttl, "expires_at": (created + timedelta(days=ttl)).isoformat()}))
+            (self.results / job_id).mkdir()
+            (self.results / job_id / "request.json").write_text(json.dumps(payload))
+            for crawler_id in set(payload["crawler_ids"]):
+                partition(self.results, job_id, crawler_id).mkdir()
+                queue = self.pending / f"crawler_{crawler_id:02d}"
+                queue.mkdir(exist_ok=True)
+                (queue / f"{job_id}.json").write_text(json.dumps({"job_id": job_id}))
+            (self.pending / f"{job_id}.json").write_text(json.dumps(payload))
         self.posts.append(urls)
         self.ttls.append(ttl)
         return 200, {"job_id": job_id}
@@ -110,33 +145,44 @@ class ApiStub:
     def _status(self, job_id: str) -> tuple[int, dict]:
         if job_id in self.status_codes:
             return self.status_codes[job_id], {"error": "forced"}
-        for path in (self.results / job_id / "status.json", self.pending / f"{job_id}.json"):
-            if path.exists():
-                payload = json.loads(path.read_text())
-                if expires_at(payload) <= self.clock():
-                    break
-                return 200, {"job_id": job_id, "status": payload.get("status", "pending")}
-        return 404, {"error": "Job not found"}
+        path = self.pending / f"{job_id}.json"
+        if not path.exists() or expires_at(payload := json.loads(path.read_text())) <= self.clock():
+            return 404, {"error": "Job not found"}
+        progress = []
+        for crawler_id in sorted(set(payload["crawler_ids"])):
+            done = partition(self.results, job_id, crawler_id) / "progress.json"
+            if done.exists():
+                progress.append(json.loads(done.read_text()))
+        completed = (len(progress) == len(set(payload["crawler_ids"]))
+                     and all(p["completed_at"] for p in progress))
+        return 200, {
+            "job_id": job_id,
+            "status": "completed" if completed else ("running" if progress else "pending"),
+            "total_urls": len(payload["urls"]),
+            "completed_urls": sum(p["completed_urls"] for p in progress),
+            "created_at": payload["created_at"], "ttl_days": payload["ttl_days"],
+            "expires_at": payload["expires_at"],
+            "completed_at": max(p["completed_at"] for p in progress) if completed else None,
+            "results_url": f"/v1/manual-bulk-crawls/{job_id}/results" if completed else None}
 
     def delete(self, job_id: str) -> int:
-        """`DELETE .../{job_id}`: removes the pending file and both result dirs."""
+        """`DELETE .../{job_id}`: removes the manifest, the queue entries and the results."""
         if self.delete_codes:
             return self.delete_codes.pop(0)
         pending = self.pending / f"{job_id}.json"
-        dirs = [self.results / job_id, self.results / ".incomplete" / job_id]
-        if not pending.exists() and not any(d.exists() for d in dirs):
+        if not pending.exists() and not (self.results / job_id).exists():
             return 404
         pending.unlink(missing_ok=True)
-        for d in dirs:
-            shutil.rmtree(d, ignore_errors=True)
+        for entry in self.pending.glob(f"crawler_*/{job_id}.json"):
+            entry.unlink()
+        shutil.rmtree(self.results / job_id, ignore_errors=True)
         self.deletes.append(job_id)
         return 204
 
     def collect_expired(self) -> int:
         """The API's hourly GC: deletes every job past its `expires_at`."""
         found = {p.stem: p for p in self.pending.glob("*.json")}
-        found.update({d.name: d / "request.json" for d in self.results.glob("*")
-                      if d.name != ".incomplete"})
+        found.update({d.name: d / "request.json" for d in self.results.glob("*")})
         expired = [j for j, p in found.items()
                    if expires_at(json.loads(p.read_text())) <= self.clock()]
         for job_id in expired:
@@ -195,27 +241,32 @@ class Page:
 
 
 class FakeCrawler:
-    """Answers pending jobs from `web` and publishes them as the PR's worker does."""
+    """Answers queued partitions from `web` and writes them as the PR's workers do."""
 
     def __init__(self, stub: ApiStub, web: dict[str, Page]) -> None:
         self.stub, self.web = stub, web
 
     def take(self, now: datetime, hold: set[str] = frozenset()) -> int:
-        """Finishes every live pending job not in `hold`; returns the number of URLs fetched."""
+        """Finishes every live queued job not in `hold`; returns the number of URLs fetched."""
         fetched = 0
         for job_id in self.stub.jobs():
-            payload = json.loads((self.stub.pending / f"{job_id}.json").read_text())
-            if job_id not in hold and expires_at(payload) > self.stub.clock():
+            if job_id not in hold and expires_at(self.stub.manifest(job_id)) > self.stub.clock():
                 fetched += self.finish(job_id, now)
         return fetched
 
-    def finish(self, job_id: str, now: datetime) -> int:
-        pending = self.stub.pending / f"{job_id}.json"
-        payload = json.loads(pending.read_text())
-        staging = self.stub.results / ".incomplete" / job_id
-        staging.mkdir(parents=True)
-        (staging / "request.json").write_text(json.dumps(payload))
-        for index, url in enumerate(payload["urls"]):
+    def finish(self, job_id: str, now: datetime, crawlers: Iterable[int] | None = None) -> int:
+        """Fetches this job's part on each crawler in `crawlers` (default: all still queued)."""
+        payload = self.stub.manifest(job_id)
+        fetched = 0
+        for crawler_id in self.stub.queued(job_id) if crawlers is None else crawlers:
+            fetched += self._finish_part(job_id, payload, crawler_id, now)
+        return fetched
+
+    def _finish_part(self, job_id: str, payload: dict, crawler_id: int, now: datetime) -> int:
+        part = partition(self.stub.results, job_id, crawler_id)
+        indices = [i for i, c in enumerate(payload["crawler_ids"]) if c == crawler_id]
+        for index in indices:
+            url = payload["urls"][index]
             page = self.web.get(url, Page(status=None, error="DNSLookupError"))
             item = {"url": url, "final_url": page.final_url or url, "status_code": page.status,
                     "error": page.error, "html_file": None,
@@ -228,12 +279,10 @@ class FakeCrawler:
                     item["error"] = item["error"] or "NonHTML content-type"
                 else:
                     item["html_file"] = f"{index:05d}.html"
-                    (staging / item["html_file"]).write_bytes(page.body)
-            (staging / f"{index:05d}.json").write_text(json.dumps(item))
-        (staging / "status.json").write_text(json.dumps({
-            "job_id": job_id, "status": "completed", "total_urls": len(payload["urls"]),
-            "ttl_days": payload["ttl_days"], "expires_at": payload["expires_at"],
-            "completed_at": now.isoformat(), "result_dir": str(self.stub.results / job_id)}))
-        staging.rename(self.stub.results / job_id)
-        pending.unlink()
-        return len(payload["urls"])
+                    (part / item["html_file"]).write_bytes(page.body)
+            (part / f"{index:05d}.json").write_text(json.dumps(item))
+        (part / "progress.json").write_text(json.dumps({
+            "started_at": now.isoformat(), "completed_at": now.isoformat(),
+            "completed_urls": len(indices)}))
+        (self.stub.pending / f"crawler_{crawler_id:02d}" / f"{job_id}.json").unlink()
+        return len(indices)

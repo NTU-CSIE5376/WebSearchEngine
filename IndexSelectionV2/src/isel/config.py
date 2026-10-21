@@ -199,7 +199,7 @@ class RecrawlCfg:
     plan_interval_s: float
     api_backoff_s: float
     claim_timeout_s: int
-    job_check_s: int
+    status_poll_s: int
     result_ttl_days: int
     max_resend: int
     sweep_rows: int
@@ -449,7 +449,7 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
     need(len({r.result_root, r.text_root, r.log_root}) == 3,
          "recrawl.result_root, text_root and log_root must differ")
     need(min(r.job_size, r.host_docs_per_job, r.max_jobs_inflight, r.plan_max_jobs,
-             r.claim_timeout_s, r.job_check_s, r.sweep_rows,
+             r.claim_timeout_s, r.sweep_rows,
              r.stale_days, r.retry_base_s, r.max_attempts, r.robots_retry_days,
              r.host_pause_max_s, r.sync_chunk_rows, r.max_body_chars, r.archive_workers) > 0,
          "recrawl sizes, counts and intervals must be > 0")
@@ -464,8 +464,9 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "recrawl.claim_timeout_s must be > api_timeout_s, or a slow reply looks lost")
     need(1 <= r.result_ttl_days <= 60,
          "recrawl.result_ttl_days must be 1 to 60, the API's ttl_days range")
-    need(r.job_check_s < r.result_ttl_days * 86400,
-         "recrawl.job_check_s must be shorter than result_ttl_days")
+    need(0 <= r.status_poll_s < r.result_ttl_days * 86400,
+         "recrawl.status_poll_s must be >= 0 (every plan cycle) and shorter than "
+         "result_ttl_days")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
     need(bool(r.report_days) and all(d > 0 for d in r.report_days),

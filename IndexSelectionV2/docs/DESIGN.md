@@ -315,7 +315,7 @@ $J migrate-selectdb --stamp-baseline         # first run on the pre-Alembic :544
 $J publish --run-dir /work/full/selection/run=<id>
 $J swap --db-run-id <n>
 $J verify-live --batch <b>
-# recrawl (docs/RECRAWL.md), only after WebCrawler#84 is merged and deployed
+# recrawl (docs/RECRAWL.md), only after WebCrawler#84 (bd40191 or later) is merged and deployed
 $J recrawl-sync                        # after each swap; refused in the freeze window
 $J recrawl-plan --dry-run              # per-host capacity report; sends nothing
 $D --profile recrawl up -d recrawl-plan recrawl-archive

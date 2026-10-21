@@ -82,18 +82,20 @@ def upgrade() -> None:
         sa.Column("claimed_at", TSTZ, nullable=False),
         sa.Column("submitted_at", TSTZ),
         sa.Column("checked_at", TSTZ),
+        sa.Column("completed_at", TSTZ),
         sa.Column("finished_at", TSTZ),
         sa.Column("deleted_at", TSTZ),
         sa.Column("records", sa.Integer),
         sa.Column("error", sa.Text),
         sa.PrimaryKeyConstraint("batch_id", name="job_pkey"),
         sa.UniqueConstraint("job_id", name="job_job_id_key"),
-        sa.CheckConstraint("state IN ('claimed', 'submitted', 'applied', 'lost', 'error')",
-                           name="job_state_check"),
+        sa.CheckConstraint("state IN ('claimed', 'submitted', 'completed', 'applied', 'lost', "
+                           "'error')", name="job_state_check"),
         schema="recrawl",
     )
     op.create_index("job_open", "job", ["state"], schema="recrawl",
-                    postgresql_where=sa.text("state IN ('claimed', 'submitted', 'error')"))
+                    postgresql_where=sa.text(
+                        "state IN ('claimed', 'submitted', 'completed', 'error')"))
     op.create_index("job_undeleted", "job", ["batch_id"], schema="recrawl",
                     postgresql_where=sa.text("state = 'applied' AND deleted_at IS NULL"))
 

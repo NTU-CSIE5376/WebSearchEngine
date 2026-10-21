@@ -12,6 +12,7 @@ one row per page ever selected, keyed by `doc_id` as a signed BIGINT. A doc is
 on the live list while `rank` is set; `fetched` docs come due again through
 `doc_stale`. `job` is one manual-bulk-crawl job at the crawler API (WebCrawler
 PR #84): the docs it carries, in the order their URLs were sent, and how far it got.
+A job is `completed` once the API's status says so; the archive then applies it.
 An applied job's results are deleted at the API; `deleted_at` records that.
 
 Only the live list table is defined here. `publish` creates each run's table
@@ -29,9 +30,9 @@ RUN_STATUSES = ("loading", "validated", "live", "retired", "abandoned", "rolled_
 DOC_STATES = ("pending", "dispatched", "fetched", "failed", "gone")
 # Doc states the planner may hand out again once `due_at` has passed.
 DUE_STATES = ("pending", "failed")
-JOB_STATES = ("claimed", "submitted", "applied", "lost", "error")
+JOB_STATES = ("claimed", "submitted", "completed", "applied", "lost", "error")
 # Jobs whose docs stay `dispatched`; an `error` job waits for a fix or for its results to expire.
-OPEN_JOB_STATES = ("claimed", "submitted", "error")
+OPEN_JOB_STATES = ("claimed", "submitted", "completed", "error")
 LIST_TABLE = "selected_urls_current"
 RECRAWL_SCHEMA = "recrawl"
 
@@ -145,6 +146,7 @@ recrawl_job = sa.Table(
     _tstz("claimed_at", nullable=False),
     _tstz("submitted_at"),
     _tstz("checked_at"),                            # last status query
+    _tstz("completed_at"),                          # the API's completed_at
     _tstz("finished_at"),                           # applied or lost
     _tstz("deleted_at"),                            # results deleted at the API
     sa.Column("records", sa.Integer),               # result records applied
