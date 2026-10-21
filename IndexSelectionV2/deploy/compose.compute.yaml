@@ -41,6 +41,39 @@ services:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
 
+  # Recrawl loops (docs/RECRAWL.md). Started only after the crawler serves the
+  # manual-bulk-crawl API of WebCrawler PR #84 at bd40191 or later: isel relies on its
+  # ttl_days and DELETE, or /data fills up, and reads its per-crawler result partitions:
+  #   docker compose ... --profile recrawl up -d recrawl-plan recrawl-archive
+  # isel never writes /data/manual_bulk_crawls: it POSTs jobs, reads finished results and
+  # DELETEs them through the API once their text is stored.
+  # Run `mkdir -p /data/isel` as the isel user before `up` (/data is 1777); Docker would
+  # otherwise create the bind source as root.
+  recrawl-plan:
+    extends: {service: isel}
+    profiles: [recrawl]
+    command: ["recrawl-plan"]
+    restart: unless-stopped
+    network_mode: host                  # the API listens on 127.0.0.1:4000 only
+    volumes:
+      - /data/manual_bulk_crawls/results:/data/manual_bulk_crawls/results:ro  # job status
+      - /data/isel:/data/isel                                  # min_free_gb is measured here
+    mem_limit: 4g
+    memswap_limit: 4g
+    cpus: 2
+
+  recrawl-archive:
+    extends: {service: isel}
+    profiles: [recrawl]
+    command: ["recrawl-archive"]
+    restart: unless-stopped
+    volumes:
+      - /data/manual_bulk_crawls/results:/data/manual_bulk_crawls/results:ro
+      - /data/isel:/data/isel
+    mem_limit: 8g
+    memswap_limit: 8g
+    cpus: 8                             # archive_workers; 6.5 ms per 590 KB page each
+
 secrets:
   crawlerdb_dsn:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/crawlerdb_dsn

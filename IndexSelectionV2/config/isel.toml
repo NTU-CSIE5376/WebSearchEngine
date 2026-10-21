@@ -235,3 +235,40 @@ verify_chunk = 10000                     # URLs per lookup, as in the official m
 [schedule]                               # the metric reads the list right after creating a batch
 swap_freeze_days = [1, 16]
 swap_freeze_window = ["11:30", "20:00"]  # random set at 12:00, head set at 18:00 UTC
+
+[recrawl]                                # recrawl frontier in selectdb `recrawl`; docs/RECRAWL.md
+api_url = "http://127.0.0.1:4000"        # crawler API (WebCrawler PR #84), host network only
+api_timeout_s = 10.0
+result_root = "work/recrawl/result"      # the API's results dir: {job_id}/request.json and
+                                         # {job_id}/crawler_NN/NNNNN.{json,html}; read-only
+text_root = "work/recrawl/text"          # permanent extracted text, fetch_date=YYYYMMDD/job-*.parquet
+log_root = "work/recrawl/log"            # permanent per-URL results, YYYYMMDD/job-*.jsonl.gz
+job_size = 3000                          # URLs per job; the API takes up to 10000. A job
+                                         # completes only when all its URLs finish
+host_docs_per_job = 120                  # docs per host and job: 600 s at min_gap_s
+max_jobs_inflight = 48                   # jobs at the crawler (each process holds up to 64);
+                                         # also the most completed jobs left to the archive
+plan_max_jobs = 8                        # jobs claimed per plan cycle
+plan_interval_s = 30.0
+api_backoff_s = 300.0                    # no new jobs after the API refused a whole job
+claim_timeout_s = 600                    # a job whose POST got no answer is lost after this
+status_poll_s = 60                       # status query of each unapplied job, at most this often
+result_ttl_days = 3                      # the job's ttl_days: the API stops it and deletes its
+                                         # results this long after the POST; isel deletes sooner
+max_resend = 20                          # 400 "at index N" drops one URL and sends again
+sweep_rows = 100000                      # fetched docs made due again per plan cycle
+stale_days = 30                          # uniform revisit interval
+retry_base_s = 600                       # failed doc: retry_base_s * 2^attempts
+retry_max_s = 86400
+max_attempts = 5                         # then wait stale_days instead of retry_max_s
+robots_retry_days = 30                   # a robots.txt refusal is asked again after this
+host_pause_max_s = 86400                 # cap on a 429/503 pause
+archive_interval_s = 60.0
+archive_workers = 8                      # text extraction: 6.5 ms per 590 KB page each
+min_free_gb = 800                        # no new jobs below this free space under text_root;
+                                         # Host2 /data has ~2 TB free while the crawler runs
+max_body_chars = 200000                  # extracted body text kept per page
+sync_chunk_rows = 1000000                # docs per recrawl-sync transaction
+min_gap_s = 5.0                          # 0.2 qps per hostname: a host gets its next job no
+                                         # sooner than docs * min_gap_s after the last one
+report_days = [1, 7, 14, 28]             # capacity report horizons

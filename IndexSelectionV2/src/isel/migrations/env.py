@@ -11,7 +11,7 @@ from alembic import context
 
 from isel.schema import metadata
 
-SCHEMAS = (None, "public")   # None is the default schema during reflection
+SCHEMAS = (None, "public", "recrawl")   # None is the default schema during reflection
 
 
 def include_name(name: str | None, type_: str, parent_names: dict) -> bool:

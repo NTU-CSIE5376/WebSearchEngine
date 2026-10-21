@@ -12,6 +12,7 @@ dependencies = [
     "psycopg[binary]>=3.3",
     "pyarrow>=21",
     "pytz>=2026.5",
+    "resiliparse>=1.0.9",
     "scikit-learn>=1.7",
     "sqlalchemy>=2.0",
     "tldextract==5.1.1",

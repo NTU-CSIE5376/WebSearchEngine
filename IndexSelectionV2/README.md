@@ -7,6 +7,7 @@ with its existing query.
 
 - Design: [`docs/DESIGN.md`](docs/DESIGN.md)
 - Backtest and full-scale results: [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
+- Recrawl of the list (not deployed): [`docs/RECRAWL.md`](docs/RECRAWL.md)
 
 ## How the metric reads the list
 
@@ -51,7 +52,28 @@ flowchart LR
   or in each hour's :58–:10 window, when the metric scans the crawl tables.
 - It never swaps the list on the 1st and 16th between 11:30 and 20:00 UTC, so the head
   and random sets of one batch see the same list.
-- It has no scheduler and no daemon. Each command is one container run.
+- It has no scheduler. Each command is one container run, except the two opt-in recrawl
+  services below.
+- It never writes `/data/ipc` or `/data/manual_bulk_crawls`. Recrawl jobs go through the
+  crawler's API, the crawler's result files are read-only for us, and we delete them
+  through the same API.
+
+## Recrawl (not deployed)
+
+The list needs page text to build an inverted index, but `crawl_result` keeps HTML for
+only 8 hours and the crawler never re-fetches a page. `recrawl.py` re-fetches the list
+through the manual bulk crawl API of NTU-CSIE5376/WebCrawler#84 (`bd40191`):
+
+| Command | Does |
+|---|---|
+| `recrawl-sync` | loads the live run into the `recrawl` schema of selectdb (one row per host and per doc) |
+| `recrawl-plan` | loop: packs due docs of the best-ranked hosts into jobs of up to 3,000 URLs (at most 120 per hostname) and sends them to `POST /v1/manual-bulk-crawls` with `ttl_days: 3`; polls each job's status with `GET` until it is `completed`; deletes each applied job with `DELETE` |
+| `recrawl-archive` | loop: reads each completed `results/{job_id}/` read-only, one `crawler_NN/` partition per crawler, keeps the extracted text as Parquet under `/data/isel/text`, and updates the frontier |
+
+The two loops run only with `--profile recrawl`, and only after WebCrawler#84 is merged
+and deployed. `tests/recrawl_fakes.py` holds a stub of that API and a fake crawler that
+writes per-crawler partitions the way #84 does; the integration tests run the whole loop
+against them.
 
 ## Rollout and rollback
 
@@ -72,3 +94,4 @@ flowchart LR
 | 6 | full scoring, exact top-K |
 | 7 | selectdb schema, publish, swap, rollback, verify-live |
 | 8 | container image, compose files, runbook |
+| 9 | recrawl frontier, crawler API client, text extraction (not deployed) |
