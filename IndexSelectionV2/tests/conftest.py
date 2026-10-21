@@ -19,6 +19,7 @@ def replace(cfg: Config, section: str, **values) -> Config:
 def small_cfg(work_dir: Path) -> Config:
     cfg = load_config([BASE])
     cfg = replace(cfg, "run", work_dir=str(work_dir))
+    cfg = replace(cfg, "dataset", neg_rate=0.5, first_label_batch=2)
     cfg = replace(cfg, "duckdb", threads=2, memory_limit="2GB",
                   max_temp_directory_size="2GB")
     return cfg

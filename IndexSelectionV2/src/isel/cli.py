@@ -9,9 +9,13 @@ import argparse
 import json
 import logging
 import sys
+from collections import Counter
 from typing import Any
 
+import pyarrow.parquet as pq
+
 from isel.config import Config, ConfigError, load_config
+from isel.io import atomic_write_json, open_duckdb, sql_str
 
 
 def _ids(text: str | None) -> list[int] | None:
@@ -27,6 +31,17 @@ def _ids(text: str | None) -> list[int] | None:
 
 def _print(obj: Any) -> None:
     print(json.dumps(obj, indent=2, sort_keys=True, default=str))
+
+
+def _router(cfg: Config):
+    from isel.urlnorm import DomainKeyer, ShardRouter
+
+    split = cfg.work_dir / "dims" / "split_hosts.parquet"
+    if not split.exists():
+        raise SystemExit("dims/split_hosts.parquet is missing; run pull-dims first")
+    hosts = pq.read_table(split, columns=["host"]).column("host").to_pylist()
+    keyer = DomainKeyer(hosts, offline=cfg.routing.tldextract_offline)
+    return ShardRouter(keyer, cfg.crawlerdb.num_shards, cfg.routing.overrides)
 
 
 def cmd_pull_golden(cfg: Config, args: argparse.Namespace) -> Any:
@@ -80,8 +95,82 @@ def cmd_pull_full(cfg: Config, args: argparse.Namespace) -> Any:
             session.close()
 
 
+def cmd_validate_routing(cfg: Config, args: argparse.Namespace) -> Any:
+    """Row-weighted share of sample rows whose shard the router predicts."""
+    from isel.urlnorm import HOST_RE
+
+    router = _router(cfg)
+    con = open_duckdb(cfg, cfg.work_dir / "duckdb_tmp")
+    glob = sql_str(str(cfg.work_dir / "sample" / "shard=*.parquet"))
+    pairs = con.execute(
+        f"SELECT lower(regexp_extract(url, {sql_str(HOST_RE)}, 1)) AS host, shard, count(*) "
+        f"FROM read_parquet({glob}) GROUP BY ALL").fetchall()
+    total = primary = candidate = 0
+    misses: Counter[str] = Counter()
+    for host, shard, n in pairs:
+        url = f"https://{host}/"
+        total += n
+        if router.shard_for_key(router.keyer.key_for_host(host)) == shard:
+            primary += n
+        if shard in router.candidate_shards(url):
+            candidate += n
+        else:
+            misses[host] += n
+    return {"rows": total, "primary_rate": primary / total if total else None,
+            "candidate_rate": candidate / total if total else None,
+            "top_misses": misses.most_common(20)}
+
+
+def cmd_build_dataset(cfg: Config, args: argparse.Namespace) -> Any:
+    """Writes per-batch pool sizes, label counts, label audit and history flags.
+
+    `canonical_only_positives` are positives whose crawler URL matches only the
+    canonical spelling; the official metric compares the raw spelling, so it can
+    never count them as indexed.
+    """
+    from isel.features import open_store
+
+    store = open_store(cfg, cfg.work_dir)
+    summary = {}
+    for b in store.batches:
+        (positives, head, rand, canonical_only) = store.con.execute(
+            f"SELECT count(*), count(*) FILTER (WHERE l.in_head), "
+            f"count(*) FILTER (WHERE l.in_random), count(*) FILTER (WHERE r.url IS NULL) "
+            f"FROM crawl c JOIN label_urls l ON l.url = c.url AND l.batch_id = {b.batch_id} "
+            f"LEFT JOIN (SELECT DISTINCT raw_url AS url FROM gold "
+            f"WHERE batch_id = {b.batch_id}) r ON r.url = c.url "
+            f"WHERE c.last_fetch_ok < '{b.as_of.isoformat()}'::TIMESTAMPTZ").fetchone()
+        (golden_urls,) = store.con.execute(
+            f"SELECT count(DISTINCT raw_url) FROM gold WHERE batch_id = {b.batch_id}").fetchone()
+        summary[str(b.batch_id)] = {
+            "created_at": b.created_at, "as_of": b.as_of, "golden_urls": golden_urls,
+            "pool_rows_est": store.pool_size(b.batch_id) / store.rate,
+            "positive_rows": positives, "head_rows": head, "random_rows": rand,
+            "canonical_only_positives": canonical_only,
+            "has_history": store.has_history(b.batch_id),
+            **store.label_audit(b.batch_id),
+        }
+    atomic_write_json(cfg.work_dir / "datasets" / "summary.json", summary)
+    return summary
+
+
+def cmd_derive_sample(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.derive import derive_sample
+
+    return derive_sample(cfg, cfg.work_dir)
+
+
+def cmd_derive_positives(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.derive import derive_positives
+
+    return derive_positives(cfg, cfg.work_dir, _ids(args.batches))
+
+
 def cmd_check_config(cfg: Config, args: argparse.Namespace) -> Any:
     out: dict[str, Any] = {"config_sha256": cfg.sha256()}
+    from isel.features import resolve_set
+
+    out["feature_sets"] = {n: len(resolve_set(cfg, n)) for n in cfg.features.sets}
     return out
 
 
@@ -96,6 +185,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pull-full", help="export every crawled row in ctid block ranges")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--shards")
+    sub.add_parser("derive-sample", help="hash-sample the full export into sample/")
+    p = sub.add_parser("derive-positives", help="golden URLs' rows from the full export")
+    p.add_argument("--batches")
+    sub.add_parser("validate-routing")
+    sub.add_parser("build-dataset")
     return parser
 
 
@@ -104,6 +198,10 @@ COMMANDS = {
     "pull-golden": cmd_pull_golden,
     "pull-dims": cmd_pull_dims,
     "pull-full": cmd_pull_full,
+    "derive-sample": cmd_derive_sample,
+    "derive-positives": cmd_derive_positives,
+    "validate-routing": cmd_validate_routing,
+    "build-dataset": cmd_build_dataset,
 }
 
 

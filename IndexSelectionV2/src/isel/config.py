@@ -81,6 +81,24 @@ class GoldenCfg:
 
 
 @dataclass(frozen=True)
+class FeaturesCfg:
+    half_life_days: float
+    eb_pseudo_hits: float
+    url_len_cap: int
+    path_markers: list[str]
+    ext_classes: dict[str, int]
+    date_regex: str
+    sets: dict[str, list[str]]
+
+
+@dataclass(frozen=True)
+class DatasetCfg:
+    neg_rate: float
+    neg_salt: str
+    first_label_batch: int
+
+
+@dataclass(frozen=True)
 class DuckDbCfg:
     threads: int
     memory_limit: str
@@ -95,6 +113,10 @@ class FullCfg:
     parse_threads: int
     connections: int
     max_heap_mb_s: float
+    sample_percent: float
+    sample_salt: str
+    agg_share: float
+    agg_salt: str
 
 
 @dataclass(frozen=True)
@@ -106,6 +128,8 @@ class Config:
     routing: RoutingCfg
     pull: PullCfg
     golden: GoldenCfg
+    features: FeaturesCfg
+    dataset: DatasetCfg
     duckdb: DuckDbCfg
     full: FullCfg
 
@@ -270,6 +294,13 @@ def _validate(cfg: Config) -> None:
          "pull.shards must be valid shard ids")
     need(cfg.golden.lead_h >= 0, "golden.lead_h must be >= 0")
     need(bool(cfg.golden.tags), "golden.tags must not be empty")
+    need(cfg.features.half_life_days > 0, "features.half_life_days must be > 0")
+    need(cfg.features.eb_pseudo_hits > 0, "features.eb_pseudo_hits must be > 0")
+    need(cfg.features.url_len_cap > 0, "features.url_len_cap must be > 0")
+    need(bool(cfg.features.sets), "features.sets must not be empty")
+    need(all(v > 0 for v in cfg.features.ext_classes.values()),
+         "features.ext_classes values must be > 0 (0 means no extension)")
+    need(0 < cfg.dataset.neg_rate <= 1, "dataset.neg_rate must be in (0, 1]")
     need(cfg.duckdb.threads > 0, "duckdb.threads must be > 0")
     _validate_full(cfg, need)
 
@@ -287,6 +318,14 @@ def _validate_full(cfg: Config, need: Any) -> None:
          "full.connections and full.max_heap_mb_s must be > 0")
     need(all(cfg.crawlerdb.session.get(k) == v for k, v in CSV_SESSION.items()),
          f"crawlerdb.session must set {CSV_SESSION} for the CSV text the full export parses")
+    need(0 < f.sample_percent <= 100
+         and abs(f.sample_percent * 1e4 - round(f.sample_percent * 1e4)) < 1e-9,
+         "full.sample_percent must be in (0, 100] with at most 4 decimals")
+    need(bool(f.sample_salt) and f.sample_salt != cfg.dataset.neg_salt,
+         "full.sample_salt must be set and differ from dataset.neg_salt")
+    need(0 < f.agg_share < 1, "full.agg_share must be in (0, 1)")
+    need(bool(f.agg_salt) and f.agg_salt not in (f.sample_salt, cfg.dataset.neg_salt),
+         "full.agg_salt must be set and differ from full.sample_salt and dataset.neg_salt")
 
 
 
