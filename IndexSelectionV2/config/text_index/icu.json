@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "codec": "best_compression",
+    "analysis": {
+      "analyzer": {
+        "text": {"type": "custom", "tokenizer": "icu_tokenizer", "filter": ["icu_folding"]}
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "_source": {"excludes": ["body", "doc_id"]},
+    "properties": {
+      "doc_id": {"type": "unsigned_long", "index": false},
+      "url": {"type": "keyword", "index": false, "doc_values": false},
+      "lang": {"type": "keyword"},
+      "title": {"type": "text", "analyzer": "text"},
+      "description": {"type": "text", "analyzer": "text"},
+      "body": {"type": "text", "analyzer": "text"}
+    }
+  }
+}

@@ -48,6 +48,15 @@ def test_base_config_loads(base_cfg):
     ("[selectdb]\nadmin_dsn_env = 'ISEL_CRAWLERDB_DSN'\n", "must differ"),
     ("[selectdb]\nforbidden_ports = []\n", "forbidden_ports"),
     ("[schedule]\nswap_freeze_window = ['20:00', '11:30']\n", "swap_freeze_window"),
+    ("[text_index]\nurl = 'http://127.0.0.1:9200/'\n", "without a trailing slash"),
+    ("[text_index]\nalias = 'Isel-Text'\n", "alias must be lowercase"),
+    ("[text_index]\nquery_type = 'query_string'\n", "query_type must be one of"),
+    ("[text_index]\nfields = ['title^x']\n", "weight > 0"),
+    ("[text_index]\nfields = []\n", "must be non-empty"),
+    # Lucene's CombinedFieldQuery rejects a field weight below 1.
+    ("[text_index]\nfields = ['title', 'body^0.5']\n", "weights must be >= 1"),
+    ("[text_index]\nbulk_bytes = 0\n", "text_index sizes and counts must be > 0"),
+    ("[text_index]\nretries = -1\n", "retries, backoff_s and warmup_queries"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
