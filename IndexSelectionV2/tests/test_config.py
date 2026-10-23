@@ -54,7 +54,8 @@ def test_base_config_loads(base_cfg):
     ("[text_index]\nfields = ['title^x']\n", "weight > 0"),
     ("[text_index]\nfields = []\n", "must be non-empty"),
     # Lucene's CombinedFieldQuery rejects a field weight below 1.
-    ("[text_index]\nfields = ['title', 'body^0.5']\n", "weights must be >= 1"),
+    ("[text_index]\nquery_type = 'combined_fields'\nfields = ['title', 'body^0.5']\n",
+     "weights must be >= 1"),
     ("[text_index]\nbulk_bytes = 0\n", "text_index sizes and counts must be > 0"),
     ("[text_index]\nretries = -1\n", "retries, backoff_s and warmup_queries"),
 ])

@@ -280,8 +280,9 @@ alias = "isel-text"                      # searches go through the alias; each b
                                          # physical index isel-text-<utc id>, swapped in at once
 settings_file = "config/text_index/icu.json"   # index settings and mappings
 shards = 1                               # primary shards of a new index; host-specific
-query_type = "combined_fields"           # BM25F over the fields; or most_fields, best_fields
-fields = ["title^2", "description", "body"]    # untuned; combined_fields needs weights >= 1
+query_type = "best_fields"               # the best field's BM25; or most_fields, combined_fields
+fields = ["title^2", "description", "body", "url.text"]   # tuned on golden batch 20;
+                                         # combined_fields needs one analyzer and weights >= 1
 k = 10                                   # hits per query: the metric's top 10
 read_batch_rows = 10000                  # text rows per Arrow batch read for the bulk load
 bulk_bytes = 8388608                     # per _bulk request; OpenSearch suggests 5-15 MiB

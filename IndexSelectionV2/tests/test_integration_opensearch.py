@@ -84,8 +84,8 @@ def _text(docs, fetched_at: datetime) -> pa.Table:
         for u, lang, title, desc, body in docs], schema=TEXT_SCHEMA)
 
 
-def _tokens(client: OpenSearch, index: str, text: str) -> list[str]:
-    reply = client.call("POST", f"/{index}/_analyze", {"analyzer": "text", "text": text})
+def _tokens(client: OpenSearch, index: str, text: str, analyzer: str = "text") -> list[str]:
+    reply = client.call("POST", f"/{index}/_analyze", {"analyzer": analyzer, "text": text})
     return [t["token"] for t in reply["tokens"]]
 
 
@@ -115,11 +115,16 @@ def test_build_search_and_eval(node, tmp_path):
     # "प्रधान" is indexed as "परधान", the same on the query side.
     assert _tokens(client, index, "प्रधान") == ["परधान"]
     assert _tokens(client, index, "Müller") == ["muller"]
+    # Percent escapes vanish whole, so an encoded path leaves no hex fragments.
+    assert _tokens(client, index, "https://ja.example.org/wiki/%E6%9D%B1%E4%BA%AC_2020-Games",
+                   "url") == ["https", "ja", "example", "org", "wiki", "2020", "games"]
 
     t = cfg.text_index
     for url, _, title, _, _ in DOCS:
         ids, _ = search(client, t, title)
         assert ids[0] == str(md5_number_lower(canonicalize(url))), title
+    ids, _ = search(client, t, "olympics")      # only in the URL; the text says "Olympic"
+    assert ids == [str(md5_number_lower(canonicalize(DOCS[0][0])))]
     ids, _ = search(client, t, TWINS[0][2])     # equal scores: the doc id breaks the tie
     assert ids == [str(i) for i in twin_ids]
 
