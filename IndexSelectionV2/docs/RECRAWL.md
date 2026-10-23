@@ -303,8 +303,8 @@ engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
 |---|---|
 | `_id` | the doc id; a hit matches a golden URL only by it, so ranked ≤ indexed. A golden URL that redirects is on the list under its own URL, so it still matches |
 | `doc_id` | the same id as doc values only; it breaks score ties, so every build returns the same top 10 |
-| `url` | display only |
-| `title`, `description`, `body` | full text, BM25F through `combined_fields`, one ICU analyzer |
+| `url` | displayed; its words are searchable as `url.text` |
+| `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url.text` included |
 | `lang` | stored; the trial measured what per-language analyzers would add |
 
 Not built yet, for Host2 after WebCrawler#84 is deployed:
@@ -312,8 +312,8 @@ Not built yet, for Host2 after WebCrawler#84 is deployed:
 - **Live docs only.** Index only docs on the live list (`rank IS NOT NULL`), so a
   dropped doc leaves the next build.
 - **Fallback documents.** A doc without text (`gone`, `failed`, not yet fetched) is
-  indexed by its URL tokens plus crawlerdb's title and anchor text. The full export must
-  then pull `title` and `anchor_text`.
+  indexed by its URL (`url.text`) plus crawlerdb's title and anchor text. The full
+  export must then pull `title` and `anchor_text`.
 - **Recall@10 in the metric.** The official metric hard-codes `ranked_num` to 0;
   `TypesenseRankMeasure` is a stub. `text-index-eval` measures it offline the same way;
   the official metric needs a `RankMeasure` PR.

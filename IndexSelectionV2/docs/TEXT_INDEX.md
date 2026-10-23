@@ -5,9 +5,10 @@ The text index makes the selected list searchable, so the metric's `ranked_rate`
 the design, and the local trial that backs both.
 
 Status: engine decided (OpenSearch, see [Decision](#decision)); built and measured
-locally on 2026-10-23. Not deployed. A real Recall@10 needs the list's page text,
-which arrives only after WebCrawler#84 is deployed and `recrawl-archive` runs
-(`docs/RECRAWL.md`).
+locally on 2026-10-23. The query and a URL field were then tuned on golden batch 20's
+own pages ([Golden batch 20 with its own pages](#golden-batch-20-with-its-own-pages)).
+Not deployed. A real Recall@10 needs the list's page text, which arrives only after
+WebCrawler#84 is deployed and `recrawl-archive` runs (`docs/RECRAWL.md`).
 
 ## Commands
 
@@ -24,16 +25,19 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   DuckDB pass picks each doc's newest row from (`doc_id`, `fetched_at`, file name)
   alone, so 128M page bodies are never sorted; a second pass reads only the winners.
 - **Document.** `_id` is the doc id in decimal. `url` and `lang` are stored; `title`,
-  `description` and `body` are full text, and `body` is left out of `_source`. `doc_id`
-  holds the same id as doc values only, for sorting. `config/text_index/icu.json` holds
-  the settings and mappings.
-- **Analysis.** One analyzer for every field and language: `icu_tokenizer` (Unicode word
-  breaks with dictionaries for CJK and Thai) and `icu_folding` (case, accents, width).
-  A keyword's language is unknown, so per-language analyzers would need routing; the
-  trial measures what they would add.
-- **Query.** `combined_fields` (BM25F) over `title^2`, `description` and `body`, top 10.
-  The weights are untuned: NanoMIRACL has no titles, so they wait for real golden data.
-  The keyword is never parsed as query syntax. Equal scores are ordered by `doc_id`.
+  `description` and `body` are full text, and `body` is left out of `_source`. The URL's
+  words are searchable as `url.text`. `doc_id` holds the same id as doc values only, for
+  sorting. `config/text_index/icu.json` holds the settings and mappings.
+- **Analysis.** One analyzer for every text field and language: `icu_tokenizer` (Unicode
+  word breaks with dictionaries for CJK and Thai) and `icu_folding` (case, accents,
+  width). A keyword's language is unknown, so per-language analyzers would need routing;
+  the trial measures what they would add. `url.text` uses the same two steps after a
+  character filter turns each run of punctuation and percent escapes into one space.
+- **Query.** `best_fields` over `title^2`, `description`, `body` and `url.text`, top 10:
+  a doc scores by its best-matching field. The type and weights were chosen on half of
+  golden batch 20's keywords and confirmed on the other half ([Tuning on batch
+  20](#tuning-on-batch-20)). The keyword is never parsed as query syntax. Equal scores
+  are ordered by `doc_id`.
   Lucene would order them by internal doc id, which concurrent loading assigns
   differently in every build. Anserini fixed the same problem the same way ([Lin and
   Yang, SIGIR 2019](https://arxiv.org/abs/1807.05798)).
@@ -141,7 +145,9 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
 
 | Variant | Docs | Bytes/doc | Per text byte | 128M docs |
 |---|---|---|---|---|
-| **`icu`, the chosen settings** | 44,028 | 1,791 | 0.435 | **0.23 TB** |
+| **`icu` with `url.text`, the settings now** | 44,028 | 1,840 | 0.447 | **0.24 TB** |
+| `icu` before `url.text`, the settings of the decision | 44,028 | 1,791 | 0.435 | 0.23 TB |
+| body `freqs`, with `url.text` | 44,028 | 1,003 | 0.244 | 0.13 TB |
 | `icu`, every 4th file | 10,270 | 1,841 | 0.479 | |
 | `icu`, every 2nd file | 21,978 | 1,860 | 0.453 | |
 | body without positions (`index_options: freqs`) | 44,028 | 953 | 0.232 | 0.12 TB |
@@ -154,6 +160,8 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
   sample grows (0.479, 0.453, 0.435), so this is an upper estimate.
 - **Positions** are 47 % of the index. Without them, all 1,948 batch-20 keywords return
   the same top-10 ids and scores (`c50k_freqs_rank.py`); only phrase queries need them.
+- **`url.text`** adds 55 bytes per doc (+3.1 %), measured again with and without it on
+  the same 44,028 docs (1,785 → 1,840).
 - **Other settings.** `zstd` gains nothing over `best_compression`. Keeping the body in
   `_source` adds 80 %, and skipping the lease wait adds 82 %. `doc_id` adds 8 bytes per
   doc.
@@ -169,7 +177,7 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
     06:00 UTC, 1.2 TiB (1.32 TB).
   - Text Parquet: 0.4 TB, as in `RECRAWL.md`. This sample's Parquet would take 0.22 TB.
   - HTML staging: at most ~288k pages at once, about 0.014 TB.
-- **S holds**: `icu` needs 0.23 TB.
+- **S holds**: `icu` needs 0.23 TB, and 0.24 TB with `url.text`.
 - **A rebuild needs more than one index**, which the rule did not cover. A build holds the
   serving index and the new one. Upper bound: the new index's unmerged segments still
   carry the recovery source (0.19 TB at 128M) while the merged copy is written, as at
@@ -180,6 +188,8 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
 |---|---|---|---|---|
 | `icu` | 0.23 | 0.46 | 0.46–0.88 | 0.69–1.11 |
 | body `freqs` | 0.12 | 0.24 | 0.24–0.55 | 0.37–0.68 |
+| `icu` with `url.text` | 0.24 | 0.47 | 0.47–0.90 | 0.71–1.13 |
+| body `freqs`, with `url.text` | 0.13 | 0.26 | 0.26–0.57 | 0.39–0.70 |
 
 - **The flood stage is the hard limit.** It applies to a single node and counts the
   crawler's files on `/data`. At the pre-prune low, after the text and the staging, it
@@ -188,7 +198,7 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
   bound. A build that crosses the flood stage fails and deletes its index; the serving
   index stays readable.
 
-### Golden batch 20
+### Golden batch 20 on the crawl sample
 
 - **Presence.** The 44k pages hold 3 of the 15,328 golden pairs (0.02 %, all random).
   None of the 3 is in its keyword's top 10, so Recall@10 is 0. This is expected for
@@ -214,6 +224,130 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
   `tubarões` → `tubaroes`, and `సునీల్ గవాస్కర్` → two tokens.
 - **Latency.** p50 1 ms and p95 2 ms on 44k docs, with the `doc_id` sort.
 
+### Golden batch 20 with its own pages
+
+The crawl sample holds almost no golden page, so it cannot rank one. Here the golden
+pages themselves are fetched and indexed among the crawl pages.
+
+- **Fetch.** A Mac fetched each of batch 20's 14,822 golden URLs once on 2026-10-23,
+  08:01–10:01 UTC (`golden_fetch.py`). It sent at most one request per host every 5 s
+  (0.2 qps, robots.txt included, as the recrawl rule), obeyed robots.txt, made no
+  retries, and named the course in its User-Agent. A 2xx HTML page became one
+  `TEXT_SCHEMA` row through `isel.extract`. Its `url` and `doc_id` come from the golden
+  canonical URL, so a hit matches as in `text-index-eval`.
+
+| Outcome | URLs |
+|---|---|
+| fetched | 10,345 |
+| disallowed by robots.txt | 3,628: facebook 737, instagram 694, x 304, reddit 262, imdb 216, … |
+| HTTP error | 547, of them 403: 322 |
+| network or TLS error | 264 |
+| not HTML | 38 |
+
+- **Pages.** Median text 2,196 characters; 2,263 pages have fewer than 200. YouTube's
+  1,150 pages are script shells with the title and description only (median 49).
+- **Index.** The 10,345 pages plus the 44,028 crawl pages, 54,370 docs. A golden page
+  competes with every other page, the golden pages of other keywords included.
+- **Metric.** Recall given present: found pairs / pairs whose page is in the index. The
+  fetched pages cover 10,702 of the 15,328 pairs (69.8 %; head 70.1 %, random 69.6 %).
+  The official pairs recall is this recall × that coverage.
+
+First runs (`golden_eval.py`), with the settings before tuning unless the row says
+otherwise. The interval is a paired bootstrap over keywords against the first row,
+10,000 draws:
+
+| Variant | Docs | Recall given present | head | random | nDCG@10 | Δ |
+|---|---|---|---|---|---|---|
+| `icu`, `combined_fields` (before tuning) | 54,370 | **0.769** | 0.734 | 0.801 | 0.609 | |
+| no crawl pages | 10,345 | 0.806 | 0.774 | 0.836 | 0.642 | +0.037 [+0.032, +0.043] |
+| every 4th crawl file | 20,614 | 0.798 | 0.764 | 0.830 | 0.634 | +0.028 [+0.024, +0.033] |
+| every 2nd crawl file | 32,320 | 0.785 | 0.750 | 0.817 | 0.623 | +0.016 [+0.013, +0.019] |
+| `standard` analyzer | 54,370 | 0.755 | 0.720 | 0.788 | 0.600 | −0.014 [−0.018, −0.010] |
+| `most_fields` | 54,370 | 0.780 | 0.750 | 0.808 | 0.624 | +0.011 [+0.004, +0.018] |
+| `most_fields`, English subfields on all three fields | 54,370 | 0.785 | 0.758 | 0.811 | 0.628 | +0.016 [+0.009, +0.023] |
+
+- **Size of the index.** Recall falls by 0.8 points over the first doubling of the docs
+  and by about 2 points per doubling after it. The absolute numbers hold for 54k docs,
+  not for 128M.
+- **ICU** beats `standard` here as well.
+- **English subfields** on the body make the index 1.88 times as large (3,977 bytes per
+  doc against 2,115), out of reach of the disk budget.
+- **Where `icu` misses.** By text length: 0.834 at 2,000 characters or more, 0.594
+  under 200. Of the top-10 slots, 43.8 % hold a golden page of the keyword, 23.8 % a
+  golden page of another keyword, and 32.4 % a crawl page. Typical misses: a long page
+  that repeats one keyword word (`champions league` → a club page on ESPN, not
+  uefa.com), a video page with no text, and Google results that are not the only right
+  answer (`oregon school shooting` → the Wikipedia article of that name).
+
+#### Tuning on batch 20
+
+The rule was written at 10:26 UTC, before any split numbers (`tune_rule.md`):
+
+- **Split.** A keyword is in `test` if `int(sha256(keyword), 16)` is odd, else in `dev`
+  (988 and 960 query ids with a present pair; head and random ids of one keyword stay
+  together).
+- **Selection on dev only.** Query types and title weights; then index candidates, each
+  with the best query: light stemming (`kstem`, `porter_stem`) in the analyzer,
+  English-stemmed `title` and `description` subfields, and the URL's words. An index
+  candidate may add at most 10 % bytes per doc.
+- **One comparison on test.** The final settings minus those before tuning. They are
+  adopted if the 95 % interval (paired bootstrap over keywords, 10,000 draws) is above
+  0 and no keyword script group has its interval entirely below 0.
+- **Deviation.** `best_fields` with title weights 1 and 3 were added after the dev
+  numbers showed that the title weight matters. The test half was not read until the
+  final choice.
+
+Recall given present (`tune_report.py`; Δ on all keywords is descriptive):
+
+| Index | Query | Size | dev | test | all | Δ all |
+|---|---|---|---|---|---|---|
+| `icu` | `combined_fields`, `title^2` (before tuning) | | 0.777 | 0.761 | 0.769 | |
+| `icu` | `combined_fields`, `title^3` | | 0.783 | 0.767 | 0.775 | +0.006 |
+| `icu` | `most_fields`, `title` | | 0.769 | 0.751 | 0.760 | −0.009 |
+| `icu` | `most_fields`, `title^2` | | 0.787 | 0.773 | 0.780 | +0.011 |
+| `icu` | `most_fields`, `title^3` | | 0.796 | 0.783 | 0.790 | +0.021 |
+| `icu` | `most_fields`, `title^2`, `description^0.5` | | 0.794 | 0.782 | 0.788 | +0.019 |
+| `icu` | `best_fields`, `title` | | 0.746 | 0.730 | 0.738 | −0.031 |
+| `icu` | **`best_fields`, `title^2`** | | **0.803** | 0.800 | 0.802 | +0.032 |
+| `icu` | `best_fields`, `title^3` | | 0.797 | 0.792 | 0.794 | +0.025 |
+| `kstem` | `best_fields`, `title^2` | −1.7 % | 0.803 | 0.802 | 0.802 | +0.033 |
+| `porter_stem` | `best_fields`, `title^2` | −2.9 % | 0.803 | 0.798 | 0.800 | +0.031 |
+| English `title`, `description` subfields | `best_fields`, `title^2`, `title.en^2`, `description.en` | +5.7 % | 0.803 | 0.801 | 0.802 | +0.033 |
+| **URL words** | **`best_fields`, `title^2`, `url.text`** | **+2.3 %** | **0.815** | **0.811** | **0.813** | **+0.044** |
+
+- **Dev.** `best_fields` with `title^2` wins the query step (+0.026 [+0.017, +0.036]
+  over the query before tuning). With it, stemming changes nothing (−0.001), so the
+  analyzer stays as NanoMIRACL chose it. The URL words add +0.011 [+0.008, +0.014] on
+  top, at 2.3 % more bytes per doc on these pages.
+- **Test: adopted.** +0.050 [+0.040, +0.061]. Per script: ASCII +0.058, Han +0.042,
+  Latin with diacritics +0.039, kana +0.018 [−0.009, +0.051], others +0.008
+  [0, +0.021]; no interval lies below 0.
+- **All keywords**, through `text-index-build` and `text-index-eval` with the new
+  config: recall given present 0.769 → 0.813 (head 0.734 → 0.787, random 0.801 →
+  0.836), pairs recall 0.537 → 0.568, nDCG@10 0.609 → 0.647. Zero hits stay at 1 of
+  1,948 keywords, latency at p50 1 ms and p95 2 ms.
+- **Why it works.** `best_fields` scores a doc by its best field, so a page whose title
+  states the keyword beats a long page that repeats one of its words. News and sports
+  URLs carry the slug (`dodgers-brewers`, `bills-vs-rams-highlights-week-5`), and
+  navigational keywords match the host (`uefa.com`). Most CJK and Indic URLs are percent
+  escaped and give no words, so Han, kana and the other scripts gain from the query
+  type alone.
+- **Pair changes.** 782 pairs entered the top 10 and 313 left it (`tune_breakdown.py`):
+
+| Group | Pairs | Before | After |
+|---|---|---|---|
+| text ≥ 2,000 characters | 5,556 | 0.834 | 0.863 |
+| text 200–2,000 | 2,826 | 0.785 | 0.824 |
+| text < 200 | 2,320 | 0.594 | 0.680 |
+| en.wikipedia.org | 883 | 0.818 | 0.881 |
+| www.youtube.com | 1,178 | 0.701 | 0.739 |
+| other hosts | 8,641 | 0.773 | 0.816 |
+
+- **Limits.** One batch chose and confirmed the settings, on disjoint keywords. The index
+  has 54k docs, not 128M. Sites that disallow robots are not measured. Google also
+  ranks by links and clicks, which a text index does not have. The batch was taken on
+  2026-10-16 and its pages were fetched seven days later.
+
 ## Decision
 
 **OpenSearch 3.9.0 with `config/text_index/icu.json`.** Q, S and M hold:
@@ -221,13 +355,18 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
 - **Q.** +0.010, 95 % interval [+0.001, +0.017], above −0.02. It is the same with the
   corrected weights, and with the final build code: 1,598 of 1,600 NanoMIRACL questions
   score the same, and the other two moved by a tie.
-- **S.** 0.23 TB ≤ B = 0.82 TB.
+- **S.** 0.23 TB ≤ B = 0.82 TB; 0.24 TB with the later `url.text`.
 - **M.** Host2 had 231 GiB of memory available on 2026-10-23 06:06 UTC, so a 16–31 GB heap
   fits. Swap was full (7 of 7 GiB), available memory was 268 GB on 10-22, and new DB
   benchmark containers were running.
 
 The rule did not cover rebuilds on the shared disk. They add two conditions for Host2:
 no `keep_prev`, and a build peak measured before the first full build (next section).
+
+**Query, after the engine: `best_fields` over `title^2`, `description`, `body` and
+`url.text`.** It passed the tuning rule on the test half of batch 20, +0.050 [+0.040,
++0.061] in recall given present over `combined_fields`. The text analyzer did not
+change, so the NanoMIRACL result stands.
 
 ## Found on the way
 
@@ -261,7 +400,11 @@ no `keep_prev`, and a build peak measured before the first full build (next sect
   10 s. The create-index block was still set 90 s after the watermarks were reset and
   gone at the next check, less than a minute later.
 - OpenSearch has `combined_fields` since 3.2; it needs one analyzer across the fields
-  and field weights of at least 1.
+  and field weights of at least 1. So it cannot search `url.text`, whose analyzer
+  differs.
+- In a `pattern_replace` filter, `%[0-9A-F]{2}|[^\p{L}\p{N}]+` leaves hex fragments:
+  after a `/`, the second branch also takes the `%` of the next escape, so `/%E0` keeps
+  `E0`. The filter now repeats one group of both, with `%` out of the second branch.
 
 ## Before Host2
 
@@ -272,13 +415,14 @@ no `keep_prev`, and a build peak measured before the first full build (next sect
 - Set `text_index.keep_prev = false`; rollback is a rebuild from the Parquet.
 - Build about 10M docs first and record the peak of the shard's disk use. Scaled to
   128M, it decides between `icu` and a body without positions, which ranks the same.
-- Set `text_index.shards` to about 8: 0.23 TB in shards of about 30 GiB, the top of the
+- Set `text_index.shards` to about 8: 0.24 TB in shards of about 30 GB, the top of the
   10–30 GiB range that [AWS suggests](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/bp-sharding.html)
   when search latency matters.
 - Keep the default flood stage. It stops OpenSearch before the crawler runs out of
   disk.
 - Index only live docs, add fallback documents for docs without text, and give the
   metric a `RankMeasure` (`docs/RECRAWL.md` §13).
+- Check the query on the next golden batch: batch 20 alone chose it.
 
 ## Reproduction
 
@@ -298,3 +442,10 @@ Scripts (sha256 prefix), kept outside the repo:
 | `c50k_project.py` | `25e888db0fbba035` | the 128M projection, budget B and the disk footprint |
 | `c50k_freqs_rank.py` | `bcc5ef143d9bd9fd` | top-10 agreement of the `freqs` variant and of a rebuild with the live index |
 | `golden_scripts.py` | `bff12e47735bcfb7` | zero hits and latency of a golden eval by keyword script |
+| `golden_fetch.py` | `d451da13f1b710a0` | one polite fetch of each golden URL → `TEXT_SCHEMA` Parquet and a log line per URL |
+| `golden_eval.py` | `5cc95f0ab685c09e` | the first golden runs through `textindex.build` and `evaluate_golden` |
+| `golden_analyze.py` | `2745b5285af58aaf` | paired bootstrap of the first runs; misses of `icu` by length, host and tag |
+| `tune_rule.md` | `0e2fd42b0df30b59` | the tuning rule, written before the split numbers |
+| `golden_tune.py` | `708fe18a0a34c538` | index and query candidates; one build per index, many queries |
+| `tune_report.py` | `5cf3b3f4d6182cd4` | recall given present on dev, test or all, with paired bootstrap per script |
+| `tune_breakdown.py` | `6fd4c7b0e19f20da` | pairs that entered or left the top 10, by length, host and tag |
