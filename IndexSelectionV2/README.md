@@ -8,6 +8,7 @@ with its existing query.
 - Design: [`docs/DESIGN.md`](docs/DESIGN.md)
 - Backtest and full-scale results: [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
 - Recrawl of the list (not deployed): [`docs/RECRAWL.md`](docs/RECRAWL.md)
+- Text index and its trial (not deployed): [`docs/TEXT_INDEX.md`](docs/TEXT_INDEX.md)
 
 ## How the metric reads the list
 
@@ -75,6 +76,19 @@ and deployed. `tests/recrawl_fakes.py` holds a stub of that API and a fake crawl
 writes per-crawler partitions the way #84 does; the integration tests run the whole loop
 against them.
 
+## Text index (not deployed)
+
+The recrawl text is what the metric's `ranked_rate` needs: Recall@10 of our search on
+the golden keywords. `textindex.py` indexes it in OpenSearch with ICU analysis:
+
+| Command | Does |
+|---|---|
+| `text-index-build` | loads the newest text of each doc into a new index, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call; keeps the previous index for rollback |
+| `text-index-eval --batch N` | searches each golden keyword of batch N and reports Recall@10 over (keyword, golden URL) pairs, as the metric's old rank code counted, and over distinct URLs |
+
+`deploy/compose.opensearch.yaml` runs a local node; `pytest -m opensearch` runs the
+integration test against it.
+
 ## Rollout and rollback
 
 | Step | Who | Undo |
@@ -95,3 +109,4 @@ against them.
 | 7 | selectdb schema, publish, swap, rollback, verify-live |
 | 8 | container image, compose files, runbook |
 | 9 | recrawl frontier, crawler API client, text extraction (not deployed) |
+| 10 | text index: OpenSearch build, golden Recall@10 eval, engine trial (not deployed) |
