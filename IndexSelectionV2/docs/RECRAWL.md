@@ -443,24 +443,32 @@ Known risks:
 | A per-hostname list cap from an assumed rate (241,920 at 4.8 s) | the rate is the crawler's to decide and is unknown before the crawl; it saves at most the tails of 23 hosts and costs 8 head golden URLs if they finish |
 | `download_latency` or slot delay from the API to size the cap | latency gives only the slot's ceiling (about 2 / latency), not the share and normal traffic; `fetched_at` already shows the pace that results |
 
-## 13. Inverted index (planned)
+## 13. Inverted index
 
-This round only makes sure recrawl keeps enough data to build one.
+`text-index-build` and `text-index-eval` build and measure it locally; the design, the
+engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
 
 - Source: the text Parquet only (`**/*.parquet`; skip `.parquet.tmp`). Per doc, keep the
-  latest `fetched_at`. Index only live docs (`rank IS NOT NULL`), so ranked ≤ indexed.
-- Engine: Quickwit, which keeps the index on disk instead of RAM. Typesense would need an
-  estimated 100–200 GB RAM for 128M documents. Size: ~0.2 TB compact BM25, ~1.2 TB full.
+  latest `fetched_at`.
+- Engine: OpenSearch with ICU analysis. Quickwit ranked lower on Japanese, Hindi and
+  Bengali in the trial, and Typesense keeps the whole index in RAM: about 1.1–1.65 TB for
+  128M pages of body text.
 
 | Field | Use |
 |---|---|
-| `url`, `canonical_url`, `final_url` | aliases; ~23 % of crawled golden pages are redirect sources |
-| `title`, `description`, `body` | full text, BM25 |
-| `lang` | tokenizer choice; golden keywords come from 10 regions, CJK included |
+| `_id` | the doc id; a hit matches a golden URL only by it, so ranked ≤ indexed. A golden URL that redirects is on the list under its own URL, so it still matches |
+| `doc_id` | the same id as doc values only; it breaks score ties, so every build returns the same top 10 |
+| `url` | display only |
+| `title`, `description`, `body` | full text, BM25F through `combined_fields`, one ICU analyzer |
+| `lang` | stored; the trial measured what per-language analyzers would add |
 
+Not built yet, for Host2 after WebCrawler#84 is deployed:
+
+- **Live docs only.** Index only docs on the live list (`rank IS NOT NULL`), so a
+  dropped doc leaves the next build.
 - **Fallback documents.** A doc without text (`gone`, `failed`, not yet fetched) is
   indexed by its URL tokens plus crawlerdb's title and anchor text. The full export must
-  then pull `title` and `anchor_text`. The index covers all 128M URLs from day one.
-- **Recall@10.** The official metric hard-codes `ranked_num` to 0; `TypesenseRankMeasure`
-  is a stub. So measure offline: query each batch's golden keywords and match the top
-  10 canonical URLs against golden URLs. The official metric needs a `RankMeasure` PR.
+  then pull `title` and `anchor_text`.
+- **Recall@10 in the metric.** The official metric hard-codes `ranked_num` to 0;
+  `TypesenseRankMeasure` is a stub. `text-index-eval` measures it offline the same way;
+  the official metric needs a `RankMeasure` PR.
