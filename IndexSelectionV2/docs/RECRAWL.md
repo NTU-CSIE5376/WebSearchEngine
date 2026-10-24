@@ -216,7 +216,7 @@ A loop, every 60 s. It never changes `result_root`. A spawn pool of `archive_wor
 |---|---|---|---|
 | Pending job files | one manifest per open job, plus one marker per crawler in it | Host2 `/data/manual_bulk_crawls/pending` | a marker until its crawler finishes; the manifest until DELETE or the TTL |
 | Raw HTML + per-URL JSON | 128M pages are 5–6 TB even gzipped; ≤ ~288k pages at once (48 jobs at the crawler, 48 waiting for the archive) | Host2 `/data/manual_bulk_crawls/results` | deleted by isel once applied; the 3-day TTL removes the rest |
-| Text Parquet | ~0.35–0.4 TB | Host2 `/data/isel/text` | permanent |
+| Text Parquet | ~0.35–0.4 TB per copy of the list; each `stale_days` cycle adds one until compaction exists (§13) | Host2 `/data/isel/text` | permanent |
 | Gzipped per-URL results | ~8 GB | Host2 `/data/isel/log` | permanent; selectdb has no backup |
 | `recrawl` schema | ~37 GB (not measured) | Host1 selectdb `:5445` | resident |
 
@@ -301,16 +301,22 @@ engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
 
 | Field | Use |
 |---|---|
-| `_id` | the doc id; a hit matches a golden URL only by it, so ranked ≤ indexed. A golden URL that redirects is on the list under its own URL, so it still matches |
+| `_id` | the doc id; a hit matches a golden URL only by it. A golden URL that redirects is on the list under its own URL, so it still matches |
 | `doc_id` | the same id as doc values only; it breaks score ties, so every build returns the same top 10 |
 | `url` | displayed; its words are searchable as `url.text` |
-| `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url.text` included |
+| `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url.text` included. The body has no positions (`index_options: freqs`): the query never uses them, and they were 45 % of the index |
 | `lang` | stored; the trial measured what per-language analyzers would add |
 
 Not built yet, for Host2 after WebCrawler#84 is deployed:
 
 - **Live docs only.** Index only docs on the live list (`rank IS NOT NULL`), so a
-  dropped doc leaves the next build.
+  dropped doc leaves the next build. Needed before the first list swap after the
+  recrawl has run: until then a dropped doc stays searchable, and a golden URL that is
+  no longer listed can count as ranked.
+- **Compact the text Parquet.** `recrawl-archive` appends one row per fetch and never
+  drops the older rows, so every `stale_days` cycle adds about one more copy of the
+  text (0.22–0.4 TB at 128M). Needed before the first cycle ends, 30 days after the
+  recrawl starts; the text index build reads only each doc's newest row.
 - **Fallback documents.** A doc without text (`gone`, `failed`, not yet fetched) is
   indexed by its URL (`url.text`) plus crawlerdb's title and anchor text. The full
   export must then pull `title` and `anchor_text`.
