@@ -472,6 +472,10 @@ Not built yet, for Host2 after WebCrawler#84 is deployed:
   drops the older rows, so every `stale_days` cycle adds about one more copy of the
   text (0.22–0.4 TB at 128M). Needed before the first cycle ends, 30 days after the
   recrawl starts; the text index build reads only each doc's newest row.
+- **Words of percent-escaped URLs.** Most CJK and Indic URLs are percent escaped, and
+  `url.text` drops the escapes, so those URLs give no words. Indexing the decoded URL
+  could add them. Golden batch 20 already chose the query, so this waits for batch 21
+  (11-01) to tune and test it.
 - **Fallback documents.** A doc without text (`gone`, `failed`, not yet fetched) is
   indexed by its URL (`url.text`) plus crawlerdb's title and anchor text. The full
   export must then pull `title` and `anchor_text`.
