@@ -109,6 +109,8 @@ def test_build_search_and_eval(node, tmp_path):
     assert sorted(client.call("GET", "/_alias/isel-text")) == [index]
     flat = client.call("GET", f"/{index}/_settings?flat_settings=true")[index]["settings"]
     assert flat["index.blocks.write"] == "true" and flat["index.codec"] == "best_compression"
+    fields = client.call("GET", f"/{index}/_mapping")[index]["mappings"]["properties"]
+    assert fields["body"]["index_options"] == "freqs"      # ranks the same, 45 % smaller
 
     assert len(_tokens(client, index, "東京オリンピックの開会式")) > 2
     # One token: the vowel signs stay with the word. icu_folding drops the virama, so

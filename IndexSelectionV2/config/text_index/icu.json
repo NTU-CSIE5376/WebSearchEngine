@@ -24,7 +24,7 @@
       "lang": {"type": "keyword"},
       "title": {"type": "text", "analyzer": "text"},
       "description": {"type": "text", "analyzer": "text"},
-      "body": {"type": "text", "analyzer": "text"}
+      "body": {"type": "text", "analyzer": "text", "index_options": "freqs"}
     }
   }
 }
