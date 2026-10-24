@@ -237,6 +237,9 @@ class TextIndexCfg:
     keep_prev: bool
     lookup_chunk: int
     warmup_queries: int
+    flood_free_ratio: float
+    expected_bytes_per_doc: int
+    progress_every: int
 
 
 @dataclass(frozen=True)
@@ -527,8 +530,10 @@ def _validate_text_index(cfg: Config, need: Any) -> None:
     need(min(t.timeout_s, t.lease_wait_s) > 0,
          "text_index.timeout_s and lease_wait_s must be > 0")
     need(min(t.shards, t.k, t.read_batch_rows, t.bulk_bytes, t.bulk_workers,
-             t.force_merge_segments, t.lookup_chunk) > 0,
+             t.force_merge_segments, t.lookup_chunk, t.expected_bytes_per_doc,
+             t.progress_every) > 0,
          "text_index sizes and counts must be > 0")
+    need(0 < t.flood_free_ratio < 1, "text_index.flood_free_ratio must be in (0, 1)")
     need(min(t.retries, t.backoff_s, t.warmup_queries) >= 0,
          "text_index.retries, backoff_s and warmup_queries must be >= 0")
 

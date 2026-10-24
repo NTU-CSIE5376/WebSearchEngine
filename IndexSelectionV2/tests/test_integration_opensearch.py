@@ -19,7 +19,7 @@ from conftest import ROOT, replace, small_cfg
 from isel.golden import GOLDEN_SCHEMA, golden_path
 from isel.io import write_parquet_atomic
 from isel.recrawl import TEXT_SCHEMA
-from isel.textindex import OpenSearch, build, evaluate_golden, search
+from isel.textindex import OpenSearch, build, evaluate_golden, query_body, search
 from isel.urlnorm import canonicalize, md5_number_lower
 
 pytestmark = pytest.mark.opensearch
@@ -144,8 +144,18 @@ def test_build_search_and_eval(node, tmp_path):
     assert out["all"]["presence"] == pytest.approx(5 / 6)
     assert out["random"]["recall_pairs"] == 0.0
 
-    fast = replace(cfg, "text_index", lease_wait_s=1.0)
-    second = build(fast, client, root, datetime(2026, 10, 23, 2, tzinfo=UTC))
-    third = build(fast, client, root, datetime(2026, 10, 23, 3, tzinfo=UTC))
+    second = build(cfg, client, root, datetime(2026, 10, 23, 2, tzinfo=UTC))
+    third = build(cfg, client, root, datetime(2026, 10, 23, 3, tzinfo=UTC))
     assert second["previous"] == [index] and third["deleted"] == [index]
     assert sorted(client.call("GET", "/_alias/isel-text")) == [third["index"]]
+
+    # Host2 builds 8 shards: each shard merges to one segment and drops its copies.
+    sharded = replace(cfg, "text_index", alias="isel-text-sharded", shards=3)
+    multi = build(sharded, client, root, datetime(2026, 10, 23, 4, tzinfo=UTC))
+    assert multi["docs"] == first["docs"] and multi["segments"] == 3
+    assert multi["recovery_source_pruned"] is True
+    # With global term statistics the twins tie across shards, and the unsigned_long sort
+    # still puts the two ids above 2^63 after the two below.
+    reply = client.call("POST", "/isel-text-sharded/_search?search_type=dfs_query_then_fetch",
+                        query_body(sharded.text_index, TWINS[0][2]))
+    assert [h["_id"] for h in reply["hits"]["hits"]] == [str(i) for i in twin_ids]

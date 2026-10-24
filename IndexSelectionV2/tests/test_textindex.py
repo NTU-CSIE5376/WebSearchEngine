@@ -219,7 +219,8 @@ def test_evaluate_golden_counts_pairs_by_doc_id(cfg, stub, tmp_path):
     ]
     write_parquet_atomic(pa.Table.from_pylist(golden, schema=GOLDEN_SCHEMA),
                          golden_path(cfg.work_dir))
-    stub.indices["isel-text-x"] = {"docs": {ids[0]: {}, ids[1]: {}}, "body": None,
+    spec = json.loads((ROOT / "config/text_index/icu.json").read_text())
+    stub.indices["isel-text-x"] = {"docs": {ids[0]: {}, ids[1]: {}}, "body": spec,
                                    "settings": {}}
     stub.aliases["isel-text"] = {"isel-text-x"}
     stub.hits = {"alpha": [ids[1], "999"], "beta": []}
@@ -230,3 +231,150 @@ def test_evaluate_golden_counts_pairs_by_doc_id(cfg, stub, tmp_path):
     assert out["head"]["recall_pairs"] == pytest.approx(1 / 2)
     assert out["random"]["zero_hit_rate"] == 1.0
     assert out["index"] == ["isel-text-x"]
+
+
+def test_bulk_resends_items_refused_with_503(stub):
+    stub.indices["i"] = {"docs": {}, "body": None, "settings": {}}
+    payload = b'{"index":{"_id":"1"}}\n{"url":"u"}\n'
+    stub.item_status = [503]
+    assert _client(stub).bulk("i", payload) == 1
+    assert len(stub.paths("POST")) == 2
+
+
+def test_lost_replies_to_idempotent_requests_are_resent(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1), _row(2)])
+    stub.drop = ["/_bulk", "/_tasks/", "/_count", "/_stats"]
+    out = build(cfg, _client(stub), root)
+    assert out["docs"] == 2 and stub.aliases["isel-text"] == {out["index"]}
+    assert stub.drop == []
+
+
+def test_a_lost_swap_reply_keeps_the_aliased_index(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    client = _client(stub)
+    first = build(cfg, client, root, datetime(2026, 10, 23, 1, tzinfo=UTC))
+    stub.drop = ["/_aliases"]
+    second = build(cfg, client, root, datetime(2026, 10, 23, 2, tzinfo=UTC))
+    assert stub.aliases["isel-text"] == {second["index"]}
+    assert set(stub.indices) == {first["index"], second["index"]}
+
+
+def test_a_refused_swap_drops_the_new_index(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    client = _client(stub)
+    first = build(cfg, client, root, datetime(2026, 10, 23, 1, tzinfo=UTC))
+    stub.fail = ["/_aliases"]
+    with pytest.raises(TextIndexError, match="HTTP 500"):
+        build(cfg, client, root, datetime(2026, 10, 23, 2, tzinfo=UTC))
+    assert stub.aliases["isel-text"] == {first["index"]} and set(stub.indices) == {first["index"]}
+
+
+def test_build_stops_before_the_merge_when_the_leases_lag(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    stub.lease_lag = 1
+    with pytest.raises(TextIndexError, match="retention leases"):
+        build(replace(cfg, "text_index", lease_wait_s=0.05), _client(stub), root)
+    assert stub.indices == {}
+    assert not any("_forcemerge" in p for p in stub.paths("POST"))
+
+
+def test_build_refuses_to_load_past_the_flood_stage(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1), _row(2)])
+    stub.fs = {"total_in_bytes": 100_000, "available_in_bytes": 8_000}
+    cfg = replace(cfg, "text_index", expected_bytes_per_doc=1_000)   # needs 4,000
+    with pytest.raises(TextIndexError, match="flood stage"):
+        build(cfg, _client(stub), root)
+    assert stub.paths("PUT") == []
+
+
+def test_build_refuses_a_merge_past_the_flood_stage(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    # The load needs 2 bytes, the merge as much as the store holds (1,000 in the stub).
+    stub.fs = {"total_in_bytes": 100_000, "available_in_bytes": 5_900}
+    cfg = replace(cfg, "text_index", expected_bytes_per_doc=1)
+    with pytest.raises(TextIndexError, match=r"merging isel-text-\S+ needs 1000 bytes"):
+        build(cfg, _client(stub), root)
+    assert stub.indices == {}
+    assert not any("_forcemerge" in p for p in stub.paths("POST"))
+
+
+def test_every_merge_poll_refreshes(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    stub.merge_polls = 2
+    out = build(cfg, _client(stub), root)
+    calls = [p for _, p, _ in stub.requests]
+    merge = next(n for n, p in enumerate(calls) if "_forcemerge" in p)
+    assert calls[merge + 1:merge + 7] == ["/_tasks/node:1", f"/{out['index']}/_refresh"] * 3
+
+
+def test_build_keeps_a_newer_index_another_build_is_loading(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    newer = "isel-text-20991231t000000000000z"
+    stub.indices[newer] = {"docs": {}, "body": None, "settings": {}}
+    out = build(replace(cfg, "text_index", keep_prev=False), _client(stub), root)
+    assert set(stub.indices) == {out["index"], newer} and out["deleted"] == []
+
+
+def test_build_drops_a_killed_build_before_it_loads(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    stray = "isel-text-20261001t000000000000z"
+    stub.indices[stray] = {"docs": {}, "body": None, "settings": {}}
+    out = build(cfg, _client(stub), root, datetime(2026, 10, 23, 1, tzinfo=UTC))
+    calls = [(m, p) for m, p, _ in stub.requests]
+    assert calls.index(("DELETE", f"/{stray}")) < calls.index(("PUT", f"/{out['index']}"))
+    assert out["strays"] == [stray] and set(stub.indices) == {out["index"]}
+
+
+def test_a_second_build_waits_for_no_lock(cfg, stub, tmp_path):
+    import fcntl
+
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    lock = cfg.work_dir / "text_index" / "build.lock"
+    lock.parent.mkdir(parents=True)
+    with lock.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(TextIndexError, match="another text-index-build"):
+            build(cfg, _client(stub), root)
+    assert stub.paths("PUT") == []
+
+
+def test_build_and_eval_reject_a_field_the_index_lacks(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    bad = replace(cfg, "text_index", fields=["titel^2", "body"])
+    with pytest.raises(TextIndexError, match="titel is not a text field"):
+        build(bad, _client(stub), root)
+    build(cfg, _client(stub), root)
+    with pytest.raises(TextIndexError, match="titel is not a text field"):
+        evaluate_golden(bad, _client(stub), 20)
+    with pytest.raises(TextIndexError, match="one analyzer"):
+        build(replace(cfg, "text_index", query_type="combined_fields",
+                      fields=["title", "url.text"]), _client(stub), root)
+
+
+def test_a_failed_shard_fails_the_eval(cfg, stub, tmp_path):
+    url = "https://a.example/"
+    golden = [{"batch_id": 20, "batch_created_at": NEW, "query_id": 1, "keyword": "alpha",
+               "frequency": 1, "tags": ["head"], "rank": 1, "raw_url": url,
+               "canonical_url": url, "host": "a.example"}]
+    write_parquet_atomic(pa.Table.from_pylist(golden, schema=GOLDEN_SCHEMA),
+                         golden_path(cfg.work_dir))
+    spec = json.loads((ROOT / "config/text_index/icu.json").read_text())
+    stub.indices["isel-text-x"] = {"docs": {str(md5_number_lower(url)): {}}, "body": spec,
+                                   "settings": {}}
+    stub.aliases["isel-text"] = {"isel-text-x"}
+    stub.hits = {"alpha": [str(md5_number_lower(url))]}
+    # A partial search would answer 200 with no hits, a recall of 0 and no error.
+    stub.failed_shards = 1
+    with pytest.raises(TextIndexError, match="HTTP 503"):
+        evaluate_golden(cfg, _client(stub), 20)
