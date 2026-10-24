@@ -50,7 +50,12 @@ def test_summarize():
     assert out["took_ms_p50"] == 3.0
     lo, hi = out["recall_pairs_ci95"]
     assert 0 <= lo <= out["recall_pairs"] <= hi <= 1
-    assert summarize(JUDGED, RANKED, {}, {"a"}, 10, 200, 7)["recall_pairs_ci95"] == [lo, hi]
+    again = summarize(JUDGED, RANKED, {}, {"a"}, 10, 200, 7)
+    assert again["recall_pairs_ci95"] == [lo, hi]
+    # The distinct-URL interval resamples queries; a URL shared by c queries weighs 1/c.
+    ulo, uhi = out["recall_unique_ci95"]
+    assert 0 <= ulo <= out["recall_unique"] == 0.5 <= uhi <= 1
+    assert again["recall_unique_ci95"] == [ulo, uhi]
 
 
 def test_summarize_with_nothing_present():

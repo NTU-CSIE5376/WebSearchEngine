@@ -67,6 +67,10 @@ def summarize(judged: Mapping[Hashable, set[str]], ranked: Mapping[Hashable, lis
     hit, total = recall_pairs(judged, hits)
     in_index, _ = presence(judged, present)
     lo, hi = _pair_interval(judged, hits, samples, seed) if judged else (0.0, 0.0)
+    # Distinct URLs, as the coverage table counts them: a URL shared by c queries weighs
+    # 1/c in each, so the full sample gives `unique_recall` itself.
+    ulo, uhi = (bootstrap(judged, set().union(*hits.values()), samples, seed)
+                if judged else (0.0, 0.0))
     took = [took_ms[q] for q in judged if q in took_ms]
     return {
         "queries": len(judged),
@@ -74,6 +78,7 @@ def summarize(judged: Mapping[Hashable, set[str]], ranked: Mapping[Hashable, lis
         "recall_pairs": hit / total if total else 0.0,
         "recall_pairs_ci95": [lo, hi],
         "recall_unique": unique_recall(judged, hits),
+        "recall_unique_ci95": [ulo, uhi],
         "presence": in_index / total if total else 0.0,
         "recall_given_present": hit / in_index if in_index else None,
         "ndcg": (sum(ndcg_at_k(ranked.get(q, []), judged[q], k) for q in judged) / len(judged)
