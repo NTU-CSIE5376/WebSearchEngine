@@ -8,7 +8,11 @@ Status: engine decided (OpenSearch, see [Decision](#decision)); built and measur
 locally on 2026-10-23. The query and a URL field were then tuned on golden batch 20's
 own pages ([Golden batch 20 with its own pages](#golden-batch-20-with-its-own-pages)).
 Not deployed. A real Recall@10 needs the list's page text, which arrives only after
-WebCrawler#84 is deployed and `recrawl-archive` runs (`docs/RECRAWL.md`).
+WebCrawler#84 is deployed and `recrawl-archive` runs (`docs/RECRAWL.md`). A review the
+same evening indexed the body without positions, fixed the build's disk peak and its
+failure handling, added the Host2 services, and measured batch 20 as the official
+metric would count it ([Golden batch 20 as the official metric counts
+it](#golden-batch-20-as-the-official-metric-counts-it)).
 
 ## Commands
 
@@ -25,9 +29,11 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   DuckDB pass picks each doc's newest row from (`doc_id`, `fetched_at`, file name)
   alone, so 128M page bodies are never sorted; a second pass reads only the winners.
 - **Document.** `_id` is the doc id in decimal. `url` and `lang` are stored; `title`,
-  `description` and `body` are full text, and `body` is left out of `_source`. The URL's
-  words are searchable as `url.text`. `doc_id` holds the same id as doc values only, for
-  sorting. `config/text_index/icu.json` holds the settings and mappings.
+  `description` and `body` are full text, and `body` is left out of `_source`. The body
+  is indexed without positions (`index_options: freqs`): BM25 needs only term counts,
+  and positions were 45 % of the index. The URL's words are searchable as `url.text`.
+  `doc_id` holds the same id as doc values only, for sorting.
+  `config/text_index/icu.json` holds the settings and mappings.
 - **Analysis.** One analyzer for every text field and language: `icu_tokenizer` (Unicode
   word breaks with dictionaries for CJK and Thai) and `icu_folding` (case, accents,
   width). A keyword's language is unknown, so per-language analyzers would need routing;
@@ -42,18 +48,28 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   differently in every build. Anserini fixed the same problem the same way ([Lin and
   Yang, SIGIR 2019](https://arxiv.org/abs/1807.05798)).
 - **Build.** A new index per build, in bulk-load mode (no replica, no refresh, async
-  translog). `_bulk` requests of 8 MiB, two in flight, resent whole on 429 or 503.
-  After the load: refresh, check that the index holds every doc, flush, wait until the
-  retention leases pass the last operation, commit again, force merge to one segment and
-  check the merge task, refresh so that searches use the merged segment, restore refresh
-  and durability, block writes. Then one `_aliases` call moves the alias. A failure
-  before the move deletes the new index and leaves the alias as it was. With
-  `keep_prev`, the previous index stays for rollback; older ones are deleted.
+  translog).
+  - One build runs at a time: it holds a lock file in the work dir. It first deletes
+    indices that killed builds left, and checks that the disk can take twice the
+    expected index and stay out of the flood stage.
+  - `_bulk` requests of 8 MiB, two in flight, resent whole on 429, 503 or a lost reply.
+    Reads are resent the same way; requests that must not run twice (create, delete,
+    alias move, merge) are not.
+  - After the load: refresh, check that the index holds every doc, flush, wait until the
+    retention leases pass the last operation (or stop), check the disk again for one
+    more copy of the index, commit again, force merge to one segment and check the merge
+    task. Every poll of the task refreshes, so each merged shard frees its old segments
+    at once. Then restore refresh and durability, and block writes.
+  - One `_aliases` call moves the alias. If its reply is lost, the alias shows whether it
+    moved. A failure before the move deletes the new index and leaves the alias as it
+    was. With `keep_prev`, the previous index stays for rollback; older ones are
+    deleted, and newer ones (another build's) never.
 - **Eval.** For each golden keyword, the top 10 ids are compared with the doc ids of its
   golden URLs. `recall_pairs` counts (keyword, URL) pairs, as the metric's old rank
   code did, with never-crawled URLs in the denominator; `recall_unique` counts distinct
-  URLs, as the coverage tables do. `presence` is the share of golden pairs whose page
-  is in the index, the ceiling of both.
+  URLs, as the coverage tables do. Both have a 95 % interval that resamples keywords; in
+  the distinct-URL one, a URL golden for c keywords weighs 1/c in each. `presence` is
+  the share of golden pairs whose page is in the index, the ceiling of both.
 
 ## Decision rule (written before the NanoMIRACL runs, 2026-10-23 05:40 UTC)
 
@@ -145,9 +161,9 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
 
 | Variant | Docs | Bytes/doc | Per text byte | 128M docs |
 |---|---|---|---|---|
-| **`icu` with `url.text`, the settings now** | 44,028 | 1,840 | 0.447 | **0.24 TB** |
+| **body `freqs`, with `url.text`: the settings now** | 44,028 | 1,003 | 0.244 | **0.13 TB** |
+| `icu` with `url.text`, body with positions | 44,028 | 1,840 | 0.447 | 0.24 TB |
 | `icu` before `url.text`, the settings of the decision | 44,028 | 1,791 | 0.435 | 0.23 TB |
-| body `freqs`, with `url.text` | 44,028 | 1,003 | 0.244 | 0.13 TB |
 | `icu`, every 4th file | 10,270 | 1,841 | 0.479 | |
 | `icu`, every 2nd file | 21,978 | 1,860 | 0.453 | |
 | body without positions (`index_options: freqs`) | 44,028 | 953 | 0.232 | 0.12 TB |
@@ -160,6 +176,13 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
   sample grows (0.479, 0.453, 0.435), so this is an upper estimate.
 - **Positions** are 47 % of the index. Without them, all 1,948 batch-20 keywords return
   the same top-10 ids and scores (`c50k_freqs_rank.py`); only phrase queries need them.
+  The body has been indexed without them since the 10-23 review, after the same check
+  with the tuned query on the 54k golden index (`freqs_check.py`): same top-10 ids and
+  scores for all 1,948 keywords, at 1,072 bytes per doc against 2,165. NanoMIRACL scores
+  the same on all 1,600 questions (`nm_freqs_check.py`). The first such build after a
+  restart of the local Docker VM kept every id but moved the scores of 955 keywords
+  slightly and was 0.13 % larger; three later builds matched exactly
+  (`freqs_scores.py`), and the cause was not found.
 - **`url.text`** adds 55 bytes per doc (+3.1 %), measured again with and without it on
   the same 44,028 docs (1,785 → 1,840).
 - **Other settings.** `zstd` gains nothing over `best_compression`. Keeping the body in
@@ -177,26 +200,45 @@ TB is 10^12 bytes; `df -h` on Host2 prints TiB.
     06:00 UTC, 1.2 TiB (1.32 TB).
   - Text Parquet: 0.4 TB, as in `RECRAWL.md`. This sample's Parquet would take 0.22 TB.
   - HTML staging: at most ~288k pages at once, about 0.014 TB.
-- **S holds**: `icu` needs 0.23 TB, and 0.24 TB with `url.text`.
-- **A rebuild needs more than one index**, which the rule did not cover. A build holds the
-  serving index and the new one. Upper bound: the new index's unmerged segments still
-  carry the recovery source (0.19 TB at 128M) while the merged copy is written, as at
-  44k docs. Lower bound: over a load of hours the leases advance, and natural merges
-  drop most of it.
+- **S holds**: `icu` needs 0.23 TB, and 0.24 TB with `url.text`; the body without
+  positions now needs 0.13 TB.
+- **A rebuild needs more than one index**, which the rule did not cover. A build holds
+  the serving index, the new index as loaded, and the merged copy that the force merge
+  writes. The loaded index may still carry the recovery source: 0.19 TB at 128M as an
+  upper bound, as at 44k docs. Over a load of hours the leases advance and natural
+  merges drop most of it, which gives the lower bound.
+- **Until the 10-23 review, the merge held a whole extra copy.** Each merged shard kept
+  its old segments until the one refresh at the end, so the peak was three indices, and
+  the table here first missed the merged copy. Now every poll of the merge refreshes,
+  and Host2 merges one shard at a time, so the merge adds one shard (1/8 of the index).
 
-| TB at 128M docs | One index | Two kept (`keep_prev`) | Build peak | Build peak, `keep_prev` |
+| TB at 128M docs, no `keep_prev` | One index | First build | Rebuild before the review | Rebuild now |
 |---|---|---|---|---|
-| `icu` | 0.23 | 0.46 | 0.46–0.88 | 0.69–1.11 |
-| body `freqs` | 0.12 | 0.24 | 0.24–0.55 | 0.37–0.68 |
-| `icu` with `url.text` | 0.24 | 0.47 | 0.47–0.90 | 0.71–1.13 |
-| body `freqs`, with `url.text` | 0.13 | 0.26 | 0.26–0.57 | 0.39–0.70 |
+| **body `freqs`, with `url.text`: the settings now** | 0.13 | 0.14–0.33 | 0.38–0.57 | **0.27–0.46** |
+| `icu` with `url.text`, body with positions | 0.24 | 0.27–0.45 | 0.71–0.90 | 0.50–0.69 |
 
+`keep_prev` adds one more index to every column but the first.
+
+- **Host2 on 10-23 at 15:00 UTC** (read-only):
+  - `/data` holds 7.62 TB, is 77 % used and has 1.73 TB free; ext4 also keeps 0.38 TB
+    for root.
+  - 5.42 TB of it is the crawler's last 8 hours in `/data/ipc/crawl_result`: 2.48 TB of
+    crawl results and 2.94 TB of router output for the ingestor. The hourly prune
+    deletes about 0.66 TB.
+  - Free space before the prune since the crawler restarted on 10-20: 1.1–1.3 TiB from
+    10-20 to 10-22, 1.3–1.6 TiB on 10-23. After the flood stage, the text and the
+    staging, that leaves 0.41 TB for the index on the worst day and 0.63 TB at 10-23's
+    low.
+  - 380 GB of 811 GB memory available, swap 7.5 of 8 GB used, 144 cores,
+    `vm.max_map_count` 1,048,576. Docker's root is on `/` with 367 GiB free, so the
+    index needs a bind mount on `/data`.
 - **The flood stage is the hard limit.** It applies to a single node and counts the
-  crawler's files on `/data`. At the pre-prune low, after the text and the staging, it
-  leaves 0.52 TB. So no build fits with `keep_prev`. Without it, `icu` fits only near
-  the lower bound, and the body without positions fits unless the peak is near its upper
-  bound. A build that crosses the flood stage fails and deletes its index; the serving
-  index stays readable.
+  crawler's files on `/data`. No build fits with `keep_prev`. The body without positions
+  fits even on the worst day unless more than 0.14 TB of recovery source survives the
+  load; `icu` with positions fits only at 10-23's level. The flood stage blocks writes
+  but not a merge that is running, so the build checks the free space itself before it
+  loads and before it merges, and stops instead of crossing it. The serving index stays
+  readable either way.
 
 ### Golden batch 20 on the crawl sample
 
@@ -348,6 +390,54 @@ Recall given present (`tune_report.py`; Δ on all keywords is descriptive):
   ranks by links and clicks, which a text index does not have. The batch was taken on
   2026-10-16 and its pages were fetched seven days later.
 
+### Golden batch 20 as the official metric counts it
+
+The official coverage table counts distinct golden URLs per tag. A URL is indexed when
+it is on our list (`selected_urls_current`), and `ranked_rate` is hard-coded to 0. This
+run measures what the ranked rate would be, through the product build and search
+(`golden_official.py`), with the settings now (body `freqs`).
+
+- **Flags.** Batch 20's `is_crawled` and `is_indexed`, as the official run of 10-18 wrote
+  them into `metric_url`, read once and read-only (`golden_flags.py`). They reproduce
+  its numbers: head 7,329 URLs with 1,814 indexed (24.75 %), random 8,031 with 1,852
+  (23.06 %). Every indexed URL is also crawled.
+- **Index.** Only the on-list golden pages that the Mac fetched (3,137 docs), plus 0,
+  10k, 22k or 44k crawl pages. A page that is not on the list would not be in the
+  production index, so it is left out here, unlike the tuning runs.
+- **Counting.** Per tag: N golden URLs, I of them on the list, F on the list with a page
+  in the index, and H in the top 10 of at least one of the tag's keywords. Only on-list
+  ids count, so H/N, the ranked rate, can never pass I/N, the indexed rate. Intervals
+  resample keywords, 10,000 draws; a URL golden for c keywords weighs 1/c in each. The
+  query was chosen on the dev half of the keywords, so the test half is the headline.
+
+Test half, 44k crawl pages:
+
+| Tag | N | Crawled | On the list (I/N) | With a page (F/I) | Top 10 of those (H/F) | **Ranked rate H/N** |
+|---|---|---|---|---|---|---|
+| head | 3,636 | 27.9 % | 965 (26.5 %) | 90.2 % | 79.4 % | **0.190** [0.173, 0.207] |
+| random | 3,974 | 25.5 % | 924 (23.3 %) | 88.9 % | 85.0 % | **0.176** [0.160, 0.191] |
+
+- **All keywords**, descriptive since the dev half chose the query: head 0.182 [0.171,
+  0.193] = 0.248 × 0.897 × 0.819, random 0.175 [0.164, 0.186] = 0.231 × 0.895 × 0.849.
+  `text-index-eval` on the same index gives the same distinct-URL recall (0.1819 and
+  0.1752), so no off-list golden page reached a top 10. 2.0 % of the keywords get no
+  hit, as the index holds fewer golden pages.
+- **What limits it.** Three quarters of the golden URLs are not on the list: that ceiling
+  belongs to the selection, not to the index. Of the on-list URLs, about 10 % had no
+  page, mostly robots.txt for the Mac's user agent and 403s; the crawler fetched all of
+  them once, so the recrawl may get some. Of the on-list pages in the index, 79–85 %
+  reach the top 10.
+- **The tuned query** raises the test-half ranked rate over `combined_fields` before
+  tuning: head 0.175 → 0.190 (+0.009 to +0.022), random 0.167 → 0.176 (+0.004 to
+  +0.013).
+- **Size of the index.** On the test half, H/F falls from 0.853 with no crawl pages to
+  0.794 with 44k for head, and from 0.890 to 0.850 for random (paired, −0.079 to −0.040
+  and −0.057 to −0.026): about 1.5 points per doubling from 10k on. 128M is about 11
+  more doublings, and its pages are chosen to look like golden pages. So these rates
+  are upper bounds, and this run gives no number for 128M.
+- **The first weeks.** Until the recrawl has fetched the list, fewer on-list pages have
+  text, so F/I and the ranked rate start lower.
+
 ## Decision
 
 **OpenSearch 3.9.0 with `config/text_index/icu.json`.** Q, S and M hold:
@@ -367,6 +457,11 @@ no `keep_prev`, and a build peak measured before the first full build (next sect
 `url.text`.** It passed the tuning rule on the test half of batch 20, +0.050 [+0.040,
 +0.061] in recall given present over `combined_fields`. The text analyzer did not
 change, so the NanoMIRACL result stands.
+
+**Body without positions, after the 10-23 review.** It returns the same top 10 with
+the tuned query and on NanoMIRACL, and it halves the index to 0.13 TB at 128M. With
+the merge fix, a rebuild then fits Host2's `/data` even on the worst day since the
+crawler restarted, unless much recovery source survives the load.
 
 ## Found on the way
 
@@ -405,24 +500,58 @@ change, so the NanoMIRACL result stands.
 - In a `pattern_replace` filter, `%[0-9A-F]{2}|[^\p{L}\p{N}]+` leaves hex fragments:
   after a `/`, the second branch also takes the `%` of the next escape, so `/%E0` keeps
   `E0`. The filter now repeats one group of both, with `%` out of the second branch.
+- A force merge commits shard by shard, but each shard's old segments stay on disk until
+  a refresh, and the build refreshed only when the whole task had ended. So a rebuild
+  held three indices, not two. OpenSearch also merges several shards at once (the
+  `force_merge` pool has 1/8 of the cores, 18 threads on Host2). The build now refreshes
+  at every poll, and the Host2 node sets `thread_pool.force_merge.size: 1`.
+- The flood stage blocks writes, not a merge that is running: OpenSearch checks the
+  block only when the merge is requested. A merge that starts below the flood stage can
+  then fill the disk, under the crawler too. Hence the build's own checks.
+- urllib raises `RemoteDisconnected`, `IncompleteRead` and timeouts as they are, not as
+  `HTTPError`. The client turned only `HTTPError` into a `TextIndexError`, so one lost
+  reply among the ~68k bulk requests of a full build would have deleted its index.
 
 ## Before Host2
 
-- `config/container.toml` must set `text_index.settings_file` to
-  `/app/config/text_index/icu.json` (the image runs in `/work`) and `text_index.url`.
-- The node needs the security plugin, TLS and credentials as secrets, a 16–31 GB heap,
-  and a data path on Host2 `/data` within the budget above.
-- Set `text_index.keep_prev = false`; rollback is a rebuild from the Parquet.
-- Build about 10M docs first and record the peak of the shard's disk use. Scaled to
-  128M, it decides between `icu` and a body without positions, which ranks the same.
-- Set `text_index.shards` to about 8: 0.24 TB in shards of about 30 GB, the top of the
-  10–30 GiB range that [AWS suggests](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/bp-sharding.html)
+The Host2 pieces are in the repo, and nothing runs there yet:
+- `deploy/compose.compute.yaml`: the `opensearch` service (profile `search`) and the
+  `text-index` job service;
+- `config/text_index/host2.toml`: `settings_file` under `/app` (the image runs in
+  `/work`), 8 shards, no `keep_prev`. The `text-index` service passes it after
+  `container.toml`.
+
+Steps:
+1. Recompute the disk room on the day. Take the lowest free space before a prune over
+   the last days in `/data/ipc/logs/prune_crawl_result.log`. Subtract the flood stage
+   (5 % of 7.62 TB), the text Parquet and the staging.
+2. As the isel user: `mkdir -p /data/isel && mkdir -m 2770 /data/isel/opensearch`. The
+   node's user (uid 1000) joins the isel group (`group_add`), so it can write there; the
+   files it makes belong to uid 1000, so the isel user removes them through a container.
+   `host2_smoke.sh` checked this setup on the local Docker VM.
+3. `docker compose ... --profile search up -d opensearch`. Check
+   `curl 127.0.0.1:9200/_cluster/health`, and check that `_nodes` reports
+   `mlockall: true`: swap is full on Host2.
+4. Once the recrawl has text, build about 10M docs first (`docker compose ... run --rm
+   text-index text-index-build --text-root` on a few partitions) and record the peak
+   disk use. Then build all of it.
+5. Run `text-index-eval --batch N` on the next golden batch: batch 20 alone chose the
+   query.
+
+Choices and limits:
+- **No security plugin.** Like the crawler API, the node listens on 127.0.0.1 only. Any
+  Host2 user can reach it. A lost index is rebuilt from the Parquet, in hours.
+- **Default flood stage.** The crawler runs as root and can also use ext4's 5 % root
+  reserve. When OpenSearch stops at 95 %, the crawler still has about 0.77 TB, a little
+  more than the hour of output between two prunes.
+- **8 shards**: 0.13 TB in shards of about 16 GB, inside the 10–30 GiB range that [AWS
+  suggests](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/bp-sharding.html)
   when search latency matters.
-- Keep the default flood stage. It stops OpenSearch before the crawler runs out of
-  disk.
-- Index only live docs, add fallback documents for docs without text, and give the
-  metric a `RankMeasure` (`docs/RECRAWL.md` §13).
-- Check the query on the next golden batch: batch 20 alone chose it.
+- **Still open** (`docs/RECRAWL.md` §13):
+  - index only live docs, before the first list swap after the recrawl has run;
+  - compact the text Parquet, before its first 30-day cycle ends;
+  - fallback documents for docs without text;
+  - a `RankMeasure` for the metric.
 
 ## Reproduction
 
@@ -449,3 +578,10 @@ Scripts (sha256 prefix), kept outside the repo:
 | `golden_tune.py` | `708fe18a0a34c538` | index and query candidates; one build per index, many queries |
 | `tune_report.py` | `5cf3b3f4d6182cd4` | recall given present on dev, test or all, with paired bootstrap per script |
 | `tune_breakdown.py` | `6fd4c7b0e19f20da` | pairs that entered or left the top 10, by length, host and tag |
+| `freqs_check.py` | `4af8cc26ffd4f44f` | top-10 ids and scores of a body-`freqs` build and of a rebuild against the live index, with the tuned query |
+| `nm_freqs_check.py` | `d988badb77fcfaed` | NanoMIRACL with body `freqs`, question by question against the recorded `icu` run |
+| `freqs_scores.py` | `f96f2dc0de45a73a` | score differences of another body-`freqs` build; its `scores_compared` field is unused |
+| `freqs_scores2.py` | `b83154732b3da96e` | the same at 10 and 11 hits |
+| `golden_flags.py` | `4c194f64dfb7c616` | batch 20's official `is_crawled` and `is_indexed` flags, read once from metricdb |
+| `golden_official.py` | `92a6f07cf46d3320` | batch 20 as the official metric counts it: on-list pages, four background sizes, paired bootstrap |
+| `host2_smoke.sh` | `d9ad011c446507fa` | the Host2 node's settings and data directory permissions on the local Docker VM |
