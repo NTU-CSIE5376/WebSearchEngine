@@ -5,6 +5,10 @@ and records every request as (method, path, body). Tests can make it answer the 
 `_bulk` requests with an HTTP status (`bulk_http`), make the next `_bulk` fail some
 items (`item_status`), skew `_count` (`count_offset`), fail the force merge on some
 shards (`merge_failed`), and set the ids a search for a given text returns (`hits`).
+They can also apply a request and drop its reply (`drop`), refuse a request with HTTP
+500 without applying it (`fail`), hold the retention leases back (`lease_lag`), set the
+node's disk (`fs`), fail shards of a search (`failed_shards`), and keep the merge task
+running for some polls (`merge_polls`).
 """
 
 from __future__ import annotations
@@ -28,6 +32,12 @@ class OpenSearchStub:
         self.count_offset = 0
         self.merge_failed = 0                     # shards the force merge task fails on
         self.hits: dict[str, list[str]] = {}      # query text -> ids, best first
+        self.drop: list[str] = []                 # path parts: apply, then close unanswered
+        self.fail: list[str] = []                 # path parts: answer 500, apply nothing
+        self.lease_lag = 0
+        self.fs = {"total_in_bytes": 10**15, "available_in_bytes": 10**14}
+        self.failed_shards = 0
+        self.merge_polls = 0                      # _tasks answers "not completed" this often
         self._lock = threading.Lock()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -58,7 +68,12 @@ class OpenSearchStub:
         self.item_status = []
         return 200, {"errors": errors, "items": items}
 
-    def _search(self, target: str, body: dict) -> dict:
+    def _search(self, target: str, body: dict, params: str) -> tuple[int, dict]:
+        if self.failed_shards:
+            if "allow_partial_search_results=false" in params:
+                return 503, {"error": "search_phase_execution_exception"}
+            return 200, {"took": 1, "_shards": {"failed": self.failed_shards},
+                         "hits": {"hits": []}}
         names = self.aliases.get(target, {target})
         docs = {i: d for name in names for i, d in self.indices[name]["docs"].items()}
         query = body["query"]
@@ -67,7 +82,7 @@ class OpenSearchStub:
         else:
             text = next(iter(query.values()))["query"]
             ids = [i for i in self.hits.get(text, []) if i in docs]
-        return {"took": 1, "hits": {"hits": [{"_id": i} for i in ids[:body["size"]]]}}
+        return 200, {"took": 1, "hits": {"hits": [{"_id": i} for i in ids[:body["size"]]]}}
 
     def _route(self, method: str, path: str, query: str, raw: bytes) -> tuple[int, object]:
         parts = [unquote(p) for p in path.strip("/").split("/")]
@@ -97,7 +112,12 @@ class OpenSearchStub:
         if parts[:2] == ["_cat", "indices"]:
             return 200, [{"index": i} for i in sorted(self.indices)
                          if fnmatch.fnmatch(i, parts[2])]
+        if parts[:3] == ["_nodes", "stats", "fs"]:
+            return 200, {"nodes": {"n1": {"fs": {"total": self.fs}}}}
         if parts[0] == "_tasks":
+            if self.merge_polls:
+                self.merge_polls -= 1
+                return 200, {"completed": False}
             failed = self.merge_failed
             return 200, {"completed": True, "response": {"_shards": {
                 "total": 1, "successful": 1 - failed, "failed": failed}}}
@@ -105,7 +125,10 @@ class OpenSearchStub:
         if op == "_bulk":
             return self._bulk(name, raw)
         if op == "_search":
-            return 200, self._search(name, body)
+            return self._search(name, body, query)
+        if op == "_mapping":
+            return 200, {i: {"mappings": self.indices[i]["body"]["mappings"]}
+                         for i in self.aliases.get(name, {name})}
         if op == "_count":
             return 200, {"count": len(self.indices[name]["docs"]) + self.count_offset}
         if op == "_settings":
@@ -116,7 +139,7 @@ class OpenSearchStub:
         if op == "_stats" and len(parts) == 2:
             n = len(self.indices[name]["docs"])
             copy = {"seq_no": {"max_seq_no": n - 1},
-                    "retention_leases": {"leases": [{"retaining_seq_no": n}]},
+                    "retention_leases": {"leases": [{"retaining_seq_no": n - self.lease_lag}]},
                     "commit": {"user_data": {"min_retained_seq_no": str(n)}}}
             return 200, {"indices": {name: {"shards": {"0": [copy]}}}}
         if op == "_stats":
@@ -139,7 +162,19 @@ class OpenSearchStub:
                 raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 parts = urlsplit(self.path)
                 with stub._lock:
-                    status, body = stub._route(self.command, parts.path, parts.query, raw)
+                    refused = next((f for f in stub.fail if f in parts.path), None)
+                    if refused:
+                        stub.fail.remove(refused)
+                        stub.requests.append((self.command, parts.path, None))
+                        status, body = 500, {"error": "forced"}
+                    else:
+                        status, body = stub._route(self.command, parts.path, parts.query, raw)
+                    lost = next((d for d in stub.drop if d in parts.path), None)
+                    if lost:
+                        stub.drop.remove(lost)
+                if lost:
+                    self.close_connection = True      # applied; the client sees no reply
+                    return
                 data = json.dumps(body).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")

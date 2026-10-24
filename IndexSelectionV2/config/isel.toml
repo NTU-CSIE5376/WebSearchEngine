@@ -295,3 +295,8 @@ force_merge_segments = 1                 # segments per shard after the build
 keep_prev = true                         # keep the previous index for rollback
 lookup_chunk = 1000                      # doc ids per presence lookup
 warmup_queries = 20                      # unmeasured queries before an eval
+flood_free_ratio = 0.05                  # free share the node's flood stage keeps (95 %,
+                                         # the default); a build that would cross it stops
+expected_bytes_per_doc = 1003            # icu.json on 44k crawled pages; a build needs
+                                         # twice this per doc free before it loads
+progress_every = 1000                    # _bulk requests between progress log lines

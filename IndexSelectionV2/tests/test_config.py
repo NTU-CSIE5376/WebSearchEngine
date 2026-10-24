@@ -58,6 +58,9 @@ def test_base_config_loads(base_cfg):
      "weights must be >= 1"),
     ("[text_index]\nbulk_bytes = 0\n", "text_index sizes and counts must be > 0"),
     ("[text_index]\nretries = -1\n", "retries, backoff_s and warmup_queries"),
+    ("[text_index]\nexpected_bytes_per_doc = 0\n", "text_index sizes and counts must be > 0"),
+    ("[text_index]\nprogress_every = 0\n", "text_index sizes and counts must be > 0"),
+    ("[text_index]\nflood_free_ratio = 1.0\n", "flood_free_ratio must be in"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
