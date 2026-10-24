@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import BASE
+from conftest import BASE, ROOT
 
 from isel.config import ConfigError, load_config
 
@@ -65,6 +65,13 @@ def test_base_config_loads(base_cfg):
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
         load_config(_overlay(tmp_path, text))
+
+
+def test_host2_overlay_sets_the_text_index():
+    t = load_config([BASE, ROOT / "config/container.toml",
+                     ROOT / "config/text_index/host2.toml"]).text_index
+    assert (ROOT / Path(t.settings_file).relative_to("/app")).is_file()   # the image's copy
+    assert t.keep_prev is False and t.shards == 8
 
 
 def test_config_rejects_missing_key(tmp_path):
