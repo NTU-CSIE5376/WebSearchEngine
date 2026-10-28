@@ -47,11 +47,13 @@ class GuardCfg:
 
 @dataclass(frozen=True)
 class CrawlerDbCfg:
+    engine: str
     dsn_env: str
     connect_timeout_s: int
     num_shards: int
     url_table_fmt: str
     split_table: str
+    io_wait_types: list[str]
     session: dict[str, str]
 
 
@@ -148,7 +150,9 @@ class DuckDbCfg:
 @dataclass(frozen=True)
 class FullCfg:
     chunk_blocks: int
+    hash_chunks: int
     chunks_per_file: int
+    chunk_retries: int
     min_free_gb: float
     tau_margin: float
     parse_threads: int
@@ -286,6 +290,9 @@ LGBM_THREAD_ALIASES = ("n_jobs", "nthread", "nthreads", "num_thread")
 # values fail the parse, or round url_score (extra_float_digits < 1).
 CSV_SESSION = {"datestyle": "ISO", "extra_float_digits": "1", "client_encoding": "UTF8"}
 QUERY_TYPES = ("combined_fields", "most_fields", "best_fields")
+CRAWLERDB_ENGINES = ("postgres", "yugabyte")
+# yb_hash_code() returns a uint16, so a YugabyteDB shard table spans [0, 65536).
+YB_HASH_SPACE = 65536
 # OpenSearch index names are lowercase; the physical indices add "-<utc id>".
 INDEX_ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
@@ -425,6 +432,9 @@ def _validate(cfg: Config) -> None:
             raise ConfigError(message)
 
     need(cfg.crawlerdb.num_shards > 0, "crawlerdb.num_shards must be > 0")
+    need(cfg.crawlerdb.engine in CRAWLERDB_ENGINES,
+         f"crawlerdb.engine must be one of {CRAWLERDB_ENGINES}")
+    need(bool(cfg.crawlerdb.io_wait_types), "crawlerdb.io_wait_types must not be empty")
     _validate_guard(cfg.guard, need)
     _validate_session("crawlerdb", cfg.crawlerdb.session, cfg.guard, need)
     _validate_session("metricdb", cfg.metricdb.session, cfg.guard, need)
@@ -547,6 +557,9 @@ def _validate_full(cfg: Config, need: Any) -> None:
     # A chunk read at the worst-case speed must still finish inside its timeout.
     need(f.chunk_blocks * 8192 <= g.min_mb_s * 1_000_000 * g.timeout_cap_s,
          "full.chunk_blocks must be readable at guard.min_mb_s within guard.timeout_cap_s")
+    need(f.hash_chunks > 0 and YB_HASH_SPACE % f.hash_chunks == 0,
+         f"full.hash_chunks must be > 0 and divide {YB_HASH_SPACE}")
+    need(f.chunk_retries >= 0, "full.chunk_retries must be >= 0")
     need(f.min_free_gb >= 0, "full.min_free_gb must be >= 0")
     need(f.parse_threads > 0, "full.parse_threads must be > 0")
     need(f.connections > 0 and f.max_heap_mb_s > 0,

@@ -7,6 +7,7 @@ import pytest
 from conftest import replace
 from psycopg import errors
 
+from isel import pull
 from isel.io import read_json
 from isel.pg import assert_read_only_sql
 from isel.pull import FULL_SCHEMA, estimate_full, pull_full
@@ -20,10 +21,13 @@ class FakeSession:
 
     def __init__(self, probe: tuple, failing: set[str] = frozenset(),
                  sizes: dict[str, list[int]] | None = None, csv: bytes = b"",
-                 io: list[tuple[int, int, int]] | None = None, broken: set[str] = frozenset()):
+                 io: list[tuple[int, int, int]] | None = None, broken: set[str] = frozenset(),
+                 restarts: dict[str, int] | None = None):
         self.probe = probe
         self.failing = set(failing)
         self.broken = set(broken)   # tables whose COPY raises a non-retryable error
+        self.restarts = dict(restarts or {})   # serialization failures left per table
+        self.queries: list[str] = []
         self.sizes = {t: list(v) for t, v in (sizes or {}).items()}   # successive heap sizes
         self.csv = csv
         self.io = list(io or [(0, 0, 0)])   # successive (wal_bytes, wal_fpi, writes) readings
@@ -32,6 +36,9 @@ class FakeSession:
 
     def fetchone(self, query, params=None):
         assert_read_only_sql(query)
+        self.queries.append(query)
+        if "yb_servers" in query:
+            return (3,)
         if "pg_stat_wal" in query:
             return self.io.pop(0) if len(self.io) > 1 else self.io[0]
         if "pg_relation_size" in query:
@@ -39,6 +46,8 @@ class FakeSession:
             return (sizes.pop(0) if len(sizes) > 1 else sizes[0],)
         if "pg_stat_user_tables" in query:
             return self.probe
+        if "pg_postmaster_start_time" in query:
+            return self.probe[:1]
         raise AssertionError(query)
 
     def set_statement_timeout(self, seconds):
@@ -51,6 +60,10 @@ class FakeSession:
             raise errors.QueryCanceled("canceling statement due to statement timeout")
         if any(f"FROM {table} " in query for table in self.broken):
             raise RuntimeError("server closed the connection unexpectedly")
+        for table, left in self.restarts.items():
+            if f"FROM {table} " in query and left > 0:
+                self.restarts[table] = left - 1
+                raise errors.SerializationFailure("Restart read required")
         return bytearray(self.csv)
 
 
@@ -71,6 +84,22 @@ def _full_cfg(base_cfg, **full):
     cfg = replace(base_cfg, "crawlerdb", num_shards=2)
     return replace(cfg, "full", **{"chunk_blocks": 10, "chunks_per_file": 2, "min_free_gb": 0.0,
                                    **full})
+
+
+def _yb_cfg(base_cfg, **full):
+    cfg = replace(base_cfg, "crawlerdb", num_shards=2, engine="yugabyte")
+    return replace(cfg, "full", **{"hash_chunks": 4, "chunks_per_file": 2, "min_free_gb": 0.0,
+                                   **full})
+
+
+def _hash_ranges(session):
+    """(table, lo, hi) of every YugabyteDB COPY in order."""
+    out = []
+    for query, _ in session.copies:
+        table = query.split("FROM ")[1].split()[0]
+        lo, hi = (int(part.split()[1]) for part in query.split("yb_hash_code(url) ")[1:3])
+        out.append((table, lo, hi))
+    return out
 
 
 def _ranges(session):
@@ -203,7 +232,7 @@ def test_full_export_refuses_another_layout_or_a_full_disk(tmp_path, base_cfg):
     sizes = {"url_state_current_000": [10], "url_state_current_001": [10]}
     pull_full(_full_cfg(base_cfg), [FakeSession(PROBE, sizes=sizes)], tmp_path, shards=[0],
               now=T0)
-    with pytest.raises(RuntimeError, match=r"different full\.chunk_blocks"):
+    with pytest.raises(RuntimeError, match=r"full\.chunk_blocks"):
         pull_full(_full_cfg(base_cfg, chunk_blocks=5), [FakeSession(PROBE, sizes=sizes)],
                   tmp_path, now=T1)
     with pytest.raises(RuntimeError, match="GB free"):
@@ -217,3 +246,65 @@ def test_full_estimate_counts_chunks_and_worst_case_hours(base_cfg):
     est = estimate_full(cfg, FakeSession(PROBE, sizes=sizes))
     assert est["chunks"] == 4 and est["largest_shard"] == 0
     assert est["chunk_timeout_s"] == 215     # 1 GiB at 5 MB/s
+
+
+def test_yugabyte_export_reads_the_hash_space_of_each_shard_once(tmp_path, base_cfg):
+    session = FakeSession(PROBE)
+    out = pull_full(_yb_cfg(base_cfg), [session], tmp_path, now=T0)
+    assert out["shards_missing"] == 0
+    quarters = [(0, 16384), (16384, 32768), (32768, 49152), (49152, 65536)]
+    assert _hash_ranges(session) == [(f"url_state_current_{s:03d}", lo, hi)
+                                     for s in range(2) for lo, hi in quarters]
+    files = sorted(p.name for p in (tmp_path / "shard=000").iterdir())
+    assert files == ["part-0000000000-0000032768.parquet", "part-0000032768-0000065536.parquet"]
+    meta = read_json(tmp_path / "_meta.json")
+    assert meta["extents"] == {"0": [[0, 65536]], "1": [[0, 65536]]}
+    assert meta["engine"] == "yugabyte" and meta["hash_chunks"] == 4
+    assert meta["frozen_probe"]["tuple_changes"] is None
+    assert set(meta["io"]["0"]) == {"seconds"}
+    # No heap size, WAL or pg_stat_io reads: none of them exist on YugabyteDB.
+    assert not [q for q in session.queries if "pg_relation_size" in q or "pg_stat_" in q]
+
+
+def test_yugabyte_charges_the_csv_bytes_each_chunk_returned(tmp_path, base_cfg):
+    rate = FakeRate()
+    cfg = _yb_cfg(base_cfg)
+    row = b"https://a.example/,1,2026-10-01 00:00:00,5,t,0,0,f,0,f,0,f,f,1,1,0.5,0\n"
+    session = FakeSession(PROBE, csv=row)
+    out = pull_full(cfg, [session], tmp_path, shards=[0], now=T0, rate=rate)
+    assert out["rows"] == 4 and rate.reserved == [len(row)] * 4
+    assert {timeout for _, timeout in session.copies} == {cfg.guard.timeout_cap_s}
+
+
+def test_full_export_refuses_to_resume_on_another_engine(tmp_path, base_cfg):
+    sizes = {"url_state_current_000": [10]}
+    pull_full(_full_cfg(base_cfg), [FakeSession(PROBE, sizes=sizes)], tmp_path, shards=[0],
+              now=T0)
+    with pytest.raises(RuntimeError, match=r"crawlerdb\.engine"):
+        pull_full(_yb_cfg(base_cfg), [FakeSession(PROBE)], tmp_path, now=T1)
+
+
+def test_a_read_restart_rereads_only_that_chunk(tmp_path, base_cfg, monkeypatch):
+    waits = []
+    monkeypatch.setattr(pull, "_sleep", waits.append)
+    session = FakeSession(PROBE, restarts={"url_state_current_000": 2})
+    out = pull_full(_yb_cfg(base_cfg), [session], tmp_path, shards=[0], now=T0)
+    assert out["shards_failed"] == [] and waits == [1, 2]
+    assert [r[1:] for r in _hash_ranges(session)][:3] == [(0, 16384)] * 3
+
+
+def test_a_shard_that_keeps_restarting_resumes_on_the_next_run(tmp_path, base_cfg, monkeypatch):
+    monkeypatch.setattr(pull, "_sleep", lambda s: None)
+    cfg = _yb_cfg(base_cfg, chunk_retries=1)
+    session = FakeSession(PROBE, restarts={"url_state_current_000": 2})
+    out = pull_full(cfg, [session], tmp_path, now=T0)
+    assert out["shards_failed"] == [0] and out["shards_missing"] == 1
+    assert read_json(tmp_path / "_meta.json")["shards_failed"] == {"0": "SerializationFailure"}
+    pull_full(cfg, [FakeSession(PROBE)], tmp_path, now=T1)
+    assert "finished_at" in read_json(tmp_path / "_meta.json")
+
+
+def test_yugabyte_estimate_counts_chunks_and_tservers(base_cfg):
+    est = estimate_full(_yb_cfg(base_cfg), FakeSession(PROBE))
+    assert est == {"shards": 2, "chunks": 8, "chunk_timeout_s": base_cfg.guard.timeout_cap_s,
+                   "tservers": 3}
