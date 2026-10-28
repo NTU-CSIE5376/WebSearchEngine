@@ -360,6 +360,10 @@ The env file `~/isel/compose.env` (not in the repo) sets `ISEL_PROJECT`, `ISEL_I
 Each step below needs the owner's approval. `pull-full` also needs the TA's approval.
 
 ```bash
+# Mac: ship one commit of this directory; the server needs no repo access
+SHA=$(git rev-parse --short HEAD)
+git archive --format=tar "$SHA:IndexSelectionV2" | ssh ntu-sa2 "mkdir -p ~/isel/src-$SHA && tar -x -C ~/isel/src-$SHA"
+# Host2, in ~/isel/src-$SHA
 D="docker compose --env-file $HOME/isel/compose.env -f deploy/compose.compute.yaml"
 GIT_SHA=$SHA $D build --build-arg GIT_SHA=$SHA isel
 J="$D run --rm isel"
