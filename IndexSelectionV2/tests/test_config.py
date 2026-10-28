@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import BASE
+from conftest import BASE, ROOT
 
 from isel.config import ConfigError, load_config
 
@@ -38,6 +38,10 @@ def test_base_config_loads(base_cfg):
     ("[full]\nsample_percent = 'x'\n", "expected float"),
     ("[full]\nsample_percent = 0.00001\n", "at most 4 decimals"),
     ("[full]\nsample_salt = 'isel'\n", "differ from dataset.neg_salt"),
+    ("[crawlerdb]\nengine = 'cockroach'\n", "crawlerdb.engine must be one of"),
+    ("[crawlerdb]\nio_wait_types = []\n", "io_wait_types must not be empty"),
+    ("[full]\nhash_chunks = 3\n", "divide 65536"),
+    ("[full]\nchunk_retries = -1\n", "chunk_retries must be >= 0"),
     ("[full]\nagg_share = 1.0\n", "agg_share must be in"),
     ("[full]\nagg_salt = 'sample-v1'\n", "agg_salt must be set and differ"),
     ("[eval]\nk_headline = 5\n", "k_headline"),
@@ -52,6 +56,16 @@ def test_base_config_loads(base_cfg):
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
         load_config(_overlay(tmp_path, text))
+
+
+def test_yugabyte_overlay_switches_the_crawlerdb_engine(base_cfg):
+    cfg = load_config([BASE, ROOT / "config/container.toml",
+                       ROOT / "config/crawlerdb/yugabyte.toml"])
+    assert base_cfg.crawlerdb.engine == "postgres"
+    assert cfg.crawlerdb.engine == "yugabyte" and cfg.full.connections == 3
+    assert cfg.crawlerdb.dsn_env != base_cfg.crawlerdb.dsn_env
+    # The overlay adds follower reads on top of every base session setting.
+    assert cfg.crawlerdb.session == {**base_cfg.crawlerdb.session, "yb_read_from_followers": "on"}
 
 
 def test_config_rejects_missing_key(tmp_path):

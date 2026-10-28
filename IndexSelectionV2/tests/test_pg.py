@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import FakeConn
+from conftest import FakeConn, replace
 
 from isel.cli import _ids
 from isel.pg import (
@@ -119,6 +119,21 @@ def test_full_export_statement_passes_the_gate(base_cfg):
     assert_read_only_sql(text)
     assert "ctid >= '(131072,0)'::tid AND ctid < '(262144,0)'::tid" in text
     assert text.endswith("TO STDOUT (FORMAT CSV)")
+
+
+def test_yugabyte_export_statement_passes_the_gate(base_cfg):
+    cfg = replace(base_cfg, "crawlerdb", engine="yugabyte")
+    text = full_sql(cfg, 7, 4096, 8192)
+    assert_read_only_sql(text)
+    assert "yb_hash_code(url) >= 4096 AND yb_hash_code(url) < 8192" in text
+    assert "ctid" not in text
+
+
+def test_io_waiters_counts_the_configured_wait_types():
+    conn = FakeConn({"pg_stat_activity": [(4,)]})
+    assert ReadOnlySession(conn, io_wait_types=["IO", "TServerWait"]).io_waiters() == 4
+    (text, params), = conn.executed
+    assert "wait_event_type = ANY(%s)" in text and params == (["IO", "TServerWait"],)
 
 
 def test_require_env_reads_a_secret_file(tmp_path, monkeypatch):

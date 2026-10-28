@@ -41,6 +41,19 @@ services:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
 
+  # The same jobs reading crawlerdb on YugabyteDB (DESIGN §4.1). Only the crawlerdb
+  # engine and DSN change; every other database and path is the one `isel` uses:
+  #   docker compose ... run --rm isel-yb pull-full --dry-run
+  isel-yb:
+    extends: {service: isel}
+    profiles: [job]
+    entrypoint: ["isel", "--config", "/app/config/isel.toml",
+                 "--config", "/app/config/container.toml",
+                 "--config", "/app/config/crawlerdb/yugabyte.toml"]
+    environment:
+      ISEL_CRAWLERDB_YB_DSN_FILE: /run/secrets/crawlerdb_yb_dsn
+    secrets: [crawlerdb_yb_dsn]
+
   # Recrawl loops (docs/RECRAWL.md). Started only after the crawler serves the
   # manual-bulk-crawl API of WebCrawler PR #84 at bd40191 or later: isel relies on its
   # ttl_days and DELETE, or /data fills up, and reads its per-crawler result partitions:
@@ -77,6 +90,8 @@ services:
 secrets:
   crawlerdb_dsn:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/crawlerdb_dsn
+  crawlerdb_yb_dsn:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/crawlerdb_yb_dsn
   metricdb_dsn:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/metricdb_dsn
   selectdb_admin_dsn:
