@@ -63,7 +63,8 @@ flowchart LR
 
 The list needs page text to build an inverted index, but `crawl_result` keeps HTML for
 only 8 hours and the crawler never re-fetches a page. `recrawl.py` re-fetches the list
-through the manual bulk crawl API of NTU-CSIE5376/WebCrawler#84 (`bd40191`):
+through the manual bulk crawl API of NTU-CSIE5376/WebCrawler#84 (`bd40191` or later,
+checked against `cc96500`):
 
 | Command | Does |
 |---|---|

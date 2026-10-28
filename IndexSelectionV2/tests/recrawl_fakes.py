@@ -1,7 +1,7 @@
 """Stand-ins for the crawler side of the recrawl: WebCrawler PR #84's job API and workers.
 
 `ApiStub` serves `POST /v1/manual-bulk-crawls` and `GET` / `DELETE .../{job_id}`
-as PR #84 at bd40191 does. A POST canonicalizes each URL with w3lib, drops later
+as PR #84 at cc96500 does. A POST canonicalizes each URL with w3lib, drops later
 duplicates, routes each URL to one of `CRAWLERS` crawlers by hostname, and
 creates `results/{job}/request.json` with an empty `crawler_NN/` partition per
 crawler, a queue entry `pending/crawler_NN/{job}.json` per crawler, and the
@@ -125,7 +125,7 @@ class ApiStub:
         job_id = uuid.uuid4().hex
         created = self.clock()
         listed = list(normalized)
-        payload = {"version": 1, "urls": listed, "max_concurrency_ratio": 0.5,
+        payload = {"version": 1, "urls": listed,
                    "crawler_ids": [crawler_of(u) for u in listed],
                    "result_dir": str(self.results), "created_at": created.isoformat(),
                    "ttl_days": ttl, "expires_at": (created + timedelta(days=ttl)).isoformat()}

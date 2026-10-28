@@ -542,10 +542,10 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
 
         first = plan_cycle(cfg, admin, T0, api)
         assert (first["jobs"], first["docs"], first["refused"], first["unknown"]) == (1, 4, 0, 0)
-        # Hosts fill the job in rank order, at most two docs each; their URLs alternate.
-        assert stub.posts == [[A1, B1, C1, A2]]
+        # Hosts fill the job in rank order, at most two docs each, one host after another.
+        assert stub.posts == [[A1, A2, B1, C1]]
         ((batch, job_id, state, doc_ids),) = _jobs(admin)
-        assert (state, doc_ids) == ("submitted", [pg_doc_id(u) for u in (A1, B1, C1, A2)])
+        assert (state, doc_ids) == ("submitted", [pg_doc_id(u) for u in (A1, A2, B1, C1)])
         assert stub.jobs() == [job_id]
         assert _host(admin, "a.example") == (batch, T0 + timedelta(seconds=2 * r.min_gap_s))
         assert _host(admin, "b.example") == (batch, T0 + timedelta(seconds=r.min_gap_s))
@@ -577,7 +577,7 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         assert (rows[A1]["title"], rows[A1]["description"], rows[A1]["lang"]) == (
             "颱風假", "停班停課", "zh")
         assert "防颱準備" in rows[A1]["body"] and "首頁" not in rows[A1]["body"]
-        assert rows[B1]["fetched_at"] == done + timedelta(seconds=1)   # its position in the job
+        assert rows[B1]["fetched_at"] == done + timedelta(seconds=2)   # its position in the job
         assert _doc(admin, A2, "state", "attempts", "fail_reason") == ("failed", 1, "http_503")
         assert _doc(admin, C1, "state", "fail_reason", "due_at") == (
             "failed", "ignore_request", done + timedelta(days=r.robots_retry_days))
@@ -586,7 +586,7 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         with gzip.open(Path(r.log_root) / "20261015" / f"job-{batch}.jsonl.gz", "rt") as fh:
             log = [json.loads(line) for line in fh]
         assert [(x["url"], x["index"], x["outcome"]) for x in log] == [
-            (A1, 0, "fetched"), (B1, 1, "fetched"), (C1, 2, "robots"), (A2, 3, "throttled")]
+            (A1, 0, "fetched"), (A2, 1, "throttled"), (B1, 2, "fetched"), (C1, 3, "robots")]
         assert _jobs(admin)[0][2] == "applied"
         assert archive_cycle(cfg, admin, done)["jobs"] == 0      # applied once only
 
@@ -604,7 +604,7 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         # Fetched docs come due again after stale_days and go out first by rank.
         stale = later + timedelta(days=r.stale_days, seconds=1)
         revisit = plan_cycle(cfg, admin, stale, api)
-        assert revisit["swept"] == 4 and stub.posts[-1] == [A1, B1, C1, A2]
+        assert revisit["swept"] == 4 and stub.posts[-1] == [A1, A2, B1, C1]
     finally:
         admin.close()
 
