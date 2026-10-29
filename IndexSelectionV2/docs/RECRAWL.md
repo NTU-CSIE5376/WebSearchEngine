@@ -35,8 +35,8 @@
   is max(5 s, latency) with a 6.6 s median latency, so about 0.15 qps. With robots.txt
   requests and ~10 % failures, that gives ~108M pages in 14 days.
 - 93.8 % of the normal crawl's requests hit listed hosts, so both share most hosts'
-  budget. Under PR #84's default `manual_first`, API requests go first. Large hosts are
-  the bottleneck, not bandwidth.
+  budget. PR #84 as merged defaults to `manual_first`, so API requests go first. Large
+  hosts are the bottleneck, not bandwidth.
 - So 128M cannot finish in 14 days. The goal is as many pages as possible, best rank
   first.
 
@@ -47,8 +47,8 @@
   process (PR #84 `docs/03` §3.7):
   - keeps API requests in a second scheduler queue. The crawler env
     `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` picks between the queues: `manual_first` (the
-    default) dispatches API requests before normal ones, `balanced` alternates, and
-    `normal_first` does the reverse. Jobs carry no policy.
+    default as merged) dispatches API requests before normal ones, `balanced` alternates,
+    and `normal_first` does the reverse. Jobs carry no policy.
   - admits up to 64 jobs (`MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`) in submission order and
     groups their URLs by hostname. A host's URLs keep submission order, by job and index.
   - holds at most the host's slot concurrency of API requests per host (16 in
@@ -56,6 +56,22 @@
     process 07). Requests that wait for a host's delay count.
   - feeds first the host with the longest estimated remaining time: its URLs left ÷ its
     estimated QPS.
+- PR #84 was merged on 2026-10-29 (`5485bcd`) with the rules above. That day no host ran
+  it: no `api` container, no `:4000`, and Host2's checkout was still `2e4f87c`.
+- A follow-up fixes the starvation that §11 describes. It is the local WebCrawler branch
+  `pr84-weighted-dispatch` (`6d23789`) and is not proposed upstream yet. It changes three
+  rules and adds logs:
+  - `weighted`, the new default policy: while both queues have requests, API requests get
+    `MANUAL_BULK_CRAWL_SHARE_PERCENT` (1–99, default 50) of the dispatches. A queue with
+    nothing to send gives its turns away and does not bank them.
+  - a host holds at most `ceil(latency / delay)` + `MANUAL_BULK_CRAWL_HOST_HEADROOM`
+    (default 1) API requests. Under AutoThrottle that is about 3, so few of them wait for
+    the delay.
+  - a host's priority adds the seconds its oldest job has waited, so newer, larger hosts
+    cannot pass over the small hosts of an old job forever.
+  - `request.start`, `request.end` and `request.fail` carry `source` (`normal` or
+    `manual`). The heartbeat adds `dequeued_normal`, `dequeued_manual`, `manual_active`
+    and `manual_save_ms`.
 - Politeness stays with the crawler's AutoThrottle. On its own side, isel keeps the
   recrawl within 0.2 qps per host: a host's next job waits `docs × min_gap_s` (5 s).
 - isel never writes crawlerdb, `/data/ipc` or `/data/manual_bulk_crawls`. It reads
@@ -263,8 +279,8 @@ Loki: at most 120 requests per host in any 10 minutes.
 |---|---|---|
 | R0 | schema, sync, plan, archive, extraction, tests, local end-to-end runs (done) | this repository only |
 | R1 (Hard Stop) | check `:5445` is at 0002, migrate to 0003; `recrawl-sync` on the live run; `recrawl-plan --dry-run` | the batch-20 swap is done; Host1 has space for the schema |
-| R2 | WebCrawler#84 merged and deployed | crawler running |
-| R3 (Hard Stop) | start both loops; trial of 1–5M pages; measure HTML and text size, the time from POST to results, and the normal crawl's rate (§11) | R2 |
+| R2 | WebCrawler#84 deployed with the follow-up of §4 (#84 merged 2026-10-29, not deployed that day) | crawler running |
+| R3 (Hard Stop) | start both loops; a trial on canary process 07 first, then 1–5M pages; measure HTML and text size, the time from POST to results, and both sources' rates (§11) | R2 |
 | R4 | the full list, then only new, due and unfinished pages each period | R3's measurements |
 
 To remove the recrawl: `git revert`, then `alembic downgrade 0002`, which drops the
@@ -276,22 +292,25 @@ Known risks:
   it. Once 48 jobs are open, the planner claims nothing. If the crawler is back within
   the TTL, the jobs complete. If not, they become `lost`, and the results the other
   partitions already fetched are dropped with them.
-- **Slots held by waiting requests.** A host may hold 16 API requests, but AutoThrottle
-  starts one per delay, so most of them wait. 16 such hosts fill a process's 256, and
-  the longest-remaining-time order feeds the slow hosts first. At ~0.3 qps per host,
-  that is ~5 req/s per process and ~77 req/s over 16 processes, below the 106 req/s
-  that 14 days need. 48 jobs of ~29 hosts give ~87 hosts per process, far more than 16.
-  A smaller `host_docs_per_job` caps a host's slots at its docs in the job, but under
-  the rule of one open job per host it slows the large hosts. On the crawler side, a
-  per-host cap that follows the host's delay would fix it. Both wait for trial
-  measurements.
-- **Normal crawl starvation.** Under `manual_first`, a process dispatches a normal
-  request only when no API request waits in its scheduler. Once API requests hold all
-  256 slots, the normal crawl on that process stops. On PR #84 the TA asked that neither
-  side starve. R3 compares the normal crawl's `request.start` rate in Loki before and
-  after the start, and the crawler stats `scheduler/dequeued/normal` and
-  `scheduler/dequeued/manual`. If the normal crawl drops, the crawler sets
-  `MANUAL_BULK_CRAWL_SCHEDULING_POLICY=balanced`, or isel lowers `max_jobs_inflight`.
+- **Slots held by waiting requests (fix proposed, not adopted).** As merged, a host may
+  hold 16 API requests, but AutoThrottle starts one per delay, so most of them wait. 16
+  such hosts fill a process's 256. In a local simulation of one process with production
+  settings, 88 % of the slots waited and API requests ran at 6.1 req/s. The per-host cap
+  of §4 cut the waiting share to 13 % and raised API requests to 28.3 req/s.
+- **Normal crawl starvation (fix proposed, not adopted).** Under `manual_first`, a
+  process dispatches a normal request only when no API request waits in its scheduler.
+  In the simulation the normal crawl fell to 1 % of its rate; under `balanced` it fell
+  to 13 %, because waiting API requests held the slots. On PR #84 the TA asked that
+  neither side starve. With the follow-up at a share of 50, the normal crawl kept 56 %
+  and API requests got 50.0 % of the dispatches. The simulation and its numbers are in
+  index-selection `docs/experiments/2026-10-29-pr84-starvation.md`.
+- **R3 trial on process 07.** The API routes a URL to crawler
+  `domain_state.shard_id // shards_per_ingestor`. isel reads crawlerdb, so the first
+  trial can send only URLs that route to the canary process 07. Then 07 carries all API
+  work and the other 15 processes are the control. Compare by process the rates of
+  `request.start` with `source` `normal` and `manual` before and after, and the
+  heartbeat's `dequeued_*` counters. If the normal crawl on 07 drops below its share,
+  lower `MANUAL_BULK_CRAWL_SHARE_PERCENT` or isel's `max_jobs_inflight`.
 
 ## 12. Rejected alternatives
 
