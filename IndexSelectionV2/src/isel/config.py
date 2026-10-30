@@ -163,6 +163,7 @@ class FullCfg:
     agg_share: float
     agg_salt: str
     kept_share_max_z: float
+    max_host_days: float
 
 
 @dataclass(frozen=True)
@@ -562,6 +563,7 @@ def _validate_full(cfg: Config, need: Any) -> None:
     need(f.chunk_retries >= 0, "full.chunk_retries must be >= 0")
     need(f.min_free_gb >= 0, "full.min_free_gb must be >= 0")
     need(f.parse_threads > 0, "full.parse_threads must be > 0")
+    need(f.max_host_days > 0, "full.max_host_days must be > 0")
     need(f.connections > 0 and f.max_heap_mb_s > 0,
          "full.connections and full.max_heap_mb_s must be > 0")
     need(all(cfg.crawlerdb.session.get(k) == v for k, v in CSV_SESSION.items()),

@@ -170,7 +170,7 @@ verbose = -1
 [eval]
 test_batches = [6, 7, 8, 18, 19]
 k_values = [32000000, 64000000, 128000000]
-k_headline = 128000000
+k_headline = 64000000                    # TY Huang 2026-10-27: 64M fits the crawl bandwidth
 fractions = [0.019, 0.039, 0.077]        # K as a share of the pool at each batch's as_of
 gain_curve_k = [1000000, 2000000, 4000000, 8000000, 16000000, 32000000, 64000000,
                 128000000, 256000000, 512000000]
@@ -218,6 +218,8 @@ agg_share = 0.5                          # share of the sample that only feeds d
 agg_salt = "agg-v1"                      # splits the sample into those two halves
 kept_share_max_z = 6.0                   # score-full stops when its kept rows differ from
                                          # the sample's estimate by more than this many SDs
+max_host_days = 14.0                     # select-full keeps at most this many days of recrawl
+                                         # per hostname at 1 / recrawl.min_gap_s qps (241,920)
 
 [selectdb]                               # OUR selectdb (:5445), the only database isel writes
 admin_dsn_env = "ISEL_SELECTDB_ADMIN_DSN"

@@ -42,6 +42,7 @@ from isel.io import (
 )
 from isel.manifest import RANK_ORDER, write_run
 from isel.model import TrainedModel
+from isel.urlnorm import HOST_RE
 
 SCORED_SCHEMA = pa.schema([("url", pa.string()), ("shard", pa.int16()), ("h", pa.uint64()),
                            ("score", pa.float64())])
@@ -55,6 +56,11 @@ log = logging.getLogger(__name__)
 
 class NotEnoughCandidates(RuntimeError):
     """Raised when fewer than K distinct URLs scored at or above tau."""
+
+
+def host_cap(cfg: Config) -> int:
+    """URLs a hostname may hold in the list: its recrawl in `full.max_host_days`."""
+    return int(cfg.full.max_host_days * 86400 / cfg.recrawl.min_gap_s)
 
 
 def _scored(model: TrainedModel, frame: pa.Table) -> tuple[pa.Table, np.ndarray]:
@@ -211,12 +217,14 @@ def select_full(cfg: Config, work_dir: Path, k: int) -> dict[str, Any]:
     """Writes the exact top-K distinct URLs as a manifest run under `full/selection/`.
 
     Order: `RANK_ORDER`, the same order as the backtest boundary. A URL found
-    in two shards keeps its best score and that row's shard. The crawler's
-    `domain_id` comes from the export shard the row was scored in, so a
-    consumer can route the page to the crawler process that owns the domain.
+    in two shards keeps its best score and that row's shard. A hostname keeps
+    at most its best `host_cap` URLs, the most the recrawl fetches from it in
+    `full.max_host_days`; the places it frees go to the next URLs in order. The
+    crawler's `domain_id` comes from the export shard the row was scored in, so
+    a consumer can route the page to the crawler process that owns the domain.
 
     Raises:
-        NotEnoughCandidates: If fewer than K distinct URLs were kept.
+        NotEnoughCandidates: If fewer than K distinct URLs fit the host cap.
     """
     scored = work_dir / "full" / "scored"
     meta = read_json(scored / "_meta.json") or {}
@@ -235,8 +243,15 @@ def select_full(cfg: Config, work_dir: Path, k: int) -> dict[str, Any]:
     if candidates < k:
         raise NotEnoughCandidates(f"only {candidates} URLs scored >= tau, need {k}; "
                                   "raise full.tau_margin and rerun score-full")
+    cap = host_cap(cfg)
     con.execute(f"CREATE TEMP TABLE top AS SELECT * FROM ({best}) "
+                f"QUALIFY row_number() OVER (PARTITION BY lower(regexp_extract(url, "
+                f"{sql_str(HOST_RE)}, 1)) ORDER BY {RANK_ORDER}) <= {cap} "
                 f"ORDER BY {RANK_ORDER} LIMIT {int(k)}")
+    (kept,) = con.execute("SELECT count(*) FROM top").fetchone()
+    if kept < k:
+        raise NotEnoughCandidates(f"only {kept} URLs fit {cap} per hostname, need {k}; "
+                                  "raise full.tau_margin or full.max_host_days")
     con.execute("CREATE TEMP TABLE top_routed (url VARCHAR, crawl_shard SMALLINT, "
                 "domain_id BIGINT, score DOUBLE)")
     export = work_dir / "full" / "export"
@@ -253,7 +268,7 @@ def select_full(cfg: Config, work_dir: Path, k: int) -> dict[str, Any]:
         cfg, con, "SELECT url, crawl_shard, domain_id, score, NULL::VARCHAR[] AS reason "
                   "FROM top_routed",
         work_dir / "full" / "selection", run_id,
-        {"scope": "full", "k": k, "candidates": candidates, "tau": meta["tau"],
+        {"scope": "full", "k": k, "candidates": candidates, "host_cap": cap, "tau": meta["tau"],
          "model_dir": meta["model_dir"], "snapshot_at": meta["snapshot_at"],
          "target_batch": meta["target_batch"], "model_meta": meta["model_meta"],
          "code_version": code_version(), "selected_at": datetime.now(UTC).isoformat()})

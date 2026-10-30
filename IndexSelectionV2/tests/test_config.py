@@ -15,7 +15,7 @@ def _overlay(tmp_path: Path, text: str) -> list[Path]:
 
 
 def test_base_config_loads(base_cfg):
-    assert base_cfg.eval.k_headline == 128_000_000
+    assert base_cfg.eval.k_headline == 64_000_000
     assert len(base_cfg.sha256()) == 64
 
 

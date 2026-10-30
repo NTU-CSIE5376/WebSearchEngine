@@ -203,6 +203,23 @@ def test_select_full_is_the_exact_top_k_with_ties_and_duplicates(tmp_path):
     assert run["boundary_score"] == 2.0 and run["candidates"] == 6 and run["scope"] == "full"
 
 
+def test_select_full_caps_each_hostname_and_gives_its_places_to_the_next_urls(tmp_path):
+    def row(url, score):
+        return {"url": url, "shard": 0, "h": md5_number_lower(url), "score": score}
+
+    big = ["https://big.example/0", "https://BIG.example/1", "https://big.example/2"]
+    small = ["https://small.example/0", "https://small.example/1", "https://small.example/2"]
+    _write_scored(tmp_path, 5, {0: [row(u, 9.0 - i) for i, u in enumerate(big)]
+                                + [row(u, 3.0 - i) for i, u in enumerate(small)]})
+    # One day at one request per 12 h: a hostname keeps its best 2 URLs.
+    cfg = replace(replace(small_cfg(tmp_path), "full", max_host_days=1.0), "recrawl", min_gap_s=43200.0)
+    run = select_full(cfg, tmp_path, 4)
+    assert _manifest(tmp_path, run).column("url").to_pylist() == big[:2] + small[:2]
+    assert run["host_cap"] == 2
+    with pytest.raises(NotEnoughCandidates, match="2 per hostname"):
+        select_full(cfg, tmp_path, 5)
+
+
 def test_select_full_refuses_too_few_candidates_or_a_larger_k(tmp_path):
     _write_scored(tmp_path, 5, {0: [{"url": "https://a.example/", "shard": 0, "h": 1,
                                      "score": 1.0}]})

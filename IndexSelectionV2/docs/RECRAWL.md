@@ -23,22 +23,37 @@
 | Rule | Value |
 |---|---|
 | Unit | the full hostname; `en.wikipedia.org` and `zh.wikipedia.org` count separately |
-| Rate | at most 0.2 requests per second per host, so requests at least 5 s apart |
-| Scope | the sum of every fetcher: the crawler (normal and API requests), sitemap patrol, golden patrol |
-| robots.txt | always honoured; its requests count against the same budget |
+| Crawler limit | the production crawler runs AutoThrottle (target concurrency 2, delay 0.25–10 s, 16 per hostname). API and normal requests for a hostname share one downloader slot, so the recrawl adds no second rate |
+| Recrawl rate | isel adds at most 0.2 requests per second per hostname on average: a host's next job waits `docs × min_gap_s` (5 s) |
+| Audit | per hostname, a 10-minute rate of at most the normal crawl's rate + 0.22 req/s, and at most 67 requests in any 60 s (1.2 × the 56 seen on 2026-10-30) |
+| robots.txt | always honoured |
+
+`domain_qps.json` (default delay 5 s) applies only when `CRAWLER_USE_AUTOTHROTTLE` is
+off. Every production process sets it on in `supervisord.conf`.
 
 ## 3. Capacity
 
-- The list spans 1,677,068 hosts; a host allows 17,280 requests a day. The largest,
-  `www.espn.com`, has 656,637 URLs and needs 38 days.
-- At a full 0.2 qps everywhere, 14 days would cover 123.0M URLs (96.1 %). A real cycle
-  is max(5 s, latency) with a 6.6 s median latency, so about 0.15 qps. With robots.txt
-  requests and ~10 % failures, that gives ~108M pages in 14 days.
-- 93.8 % of the normal crawl's requests hit listed hosts, so both share most hosts'
-  budget. PR #84 as merged defaults to `manual_first`, so API requests go first. Large
-  hosts are the bottleneck, not bandwidth.
-- So 128M cannot finish in 14 days. The goal is as many pages as possible, best rank
-  first.
+The list is 64M (`eval.k_headline`), as TY Huang asked on 2026-10-27. Figures are for
+the batch-20 list.
+
+- The top 64M are 64,000,005 URLs on 1,204,079 hostnames. 14 days need 52.9 req/s,
+  9.4 % of the crawler's ~560 req/s since 2026-10-29.
+- At 0.2 qps a hostname gets 241,920 requests in 14 days. `www.espn.com` alone has
+  638,981 URLs and would need 37 days.
+- So `select-full` keeps at most `full.max_host_days` × 86,400 / `min_gap_s` = 241,920
+  URLs per hostname. The cap hits 23 hostnames, and the next URLs take their
+  places.
+- Batch-20 golden coverage (the official `indexed_rate`):
+
+  | List | head | random |
+  |---|---|---|
+  | 128M | 24.75 % | 23.06 % |
+  | 64M, no cap | 23.69 % | 21.99 % |
+  | 64M, 241,920 per hostname | 23.58 % | 21.85 % |
+
+- Each of the 20 capped hostnames with normal traffic has at least 0.34 req/s of slot
+  rate left, more than the 0.2 the recrawl takes. Per process, the recrawl needs
+  2.75–3.96 req/s, 8–12 % of the process's ~33 req/s.
 
 ## 4. Architecture: the crawler's job API
 
@@ -56,11 +71,13 @@
     process 07). Requests that wait for a host's delay count.
   - feeds first the host with the longest estimated remaining time: its URLs left ÷ its
     estimated QPS.
-- PR #84 was merged on 2026-10-29 (`5485bcd`) with the rules above. That day no host ran
-  it: no `api` container, no `:4000`, and Host2's checkout was still `2e4f87c`.
+- PR #84 was merged on 2026-10-29 (`5485bcd`) with the rules above. Host2 runs it since
+  2026-10-29 17:29Z (`39e1363`): the `api` container listens on `127.0.0.1:4000`, and the
+  policy env is unset, so `manual_first` applies. The image rebuild also moved Scrapy to
+  2.19.0 (`requirements.txt` pins only `>=2.13`).
 - A follow-up fixes the starvation that §11 describes. It is the local WebCrawler branch
-  `pr84-weighted-dispatch` (`6d23789`) and is not proposed upstream yet. It changes three
-  rules and adds logs:
+  `pr84-weighted-dispatch` (`6d23789`, tests in `f5a7b93`) and is not proposed upstream
+  yet. It changes three rules and adds logs:
   - `weighted`, the new default policy: while both queues have requests, API requests get
     `MANUAL_BULK_CRAWL_SHARE_PERCENT` (1–99, default 50) of the dispatches. A queue with
     nothing to send gives its turns away and does not bank them.
@@ -273,14 +290,14 @@ A loop, every 60 s. It never changes `result_root`. A spawn pool of `archive_wor
 ## 11. Rollout
 
 A **Hard Stop** phase needs the owner's approval before it starts. The R3 audit checks
-Loki: at most 120 requests per host in any 10 minutes.
+Loki against the audit row of §2.
 
 | Phase | Content | Precondition |
 |---|---|---|
 | R0 | schema, sync, plan, archive, extraction, tests, local end-to-end runs (done) | this repository only |
 | R1 (Hard Stop) | check `:5445` is at 0002, migrate to 0003; `recrawl-sync` on the live run; `recrawl-plan --dry-run` | the batch-20 swap is done; Host1 has space for the schema |
-| R2 | WebCrawler#84 deployed with the follow-up of §4 (#84 merged 2026-10-29, not deployed that day) | crawler running |
-| R3 (Hard Stop) | start both loops; a trial on canary process 07 first, then 1–5M pages; measure HTML and text size, the time from POST to results, and both sources' rates (§11) | R2 |
+| R2 | the follow-up of §4 deployed with `MANUAL_BULK_CRAWL_SHARE_PERCENT=20`. #84 alone runs since 2026-10-29 under `manual_first`, so isel must not send jobs before this | crawler running |
+| R3 (Hard Stop) | start both loops; a trial on process 03 first, then 1–5M pages; measure HTML and text size, the time from POST to results, and both sources' rates (§11) | R2 |
 | R4 | the full list, then only new, due and unfinished pages each period | R3's measurements |
 
 To remove the recrawl: `git revert`, then `alembic downgrade 0002`, which drops the
@@ -304,13 +321,17 @@ Known risks:
   neither side starve. With the follow-up at a share of 50, the normal crawl kept 56 %
   and API requests got 50.0 % of the dispatches. The simulation and its numbers are in
   index-selection `docs/experiments/2026-10-29-pr84-starvation.md`.
-- **R3 trial on process 07.** The API routes a URL to crawler
+- **R3 trial on process 03.** The API routes a URL to crawler
   `domain_state.shard_id // shards_per_ingestor`. isel reads crawlerdb, so the first
-  trial can send only URLs that route to the canary process 07. Then 07 carries all API
-  work and the other 15 processes are the control. Compare by process the rates of
+  trial can send only URLs that route to process 03. Then 03 carries all API work and
+  the other 15 processes are the control. Compare by process the rates of
   `request.start` with `source` `normal` and `manual` before and after, and the
-  heartbeat's `dequeued_*` counters. If the normal crawl on 07 drops below its share,
+  heartbeat's `dequeued_*` counters. If the normal crawl on 03 drops below its share,
   lower `MANUAL_BULK_CRAWL_SHARE_PERCENT` or isel's `max_jobs_inflight`.
+  - Not 07: it runs 384 concurrent requests and a 150M scraper slot, unlike the other
+    15, and it sat idle from 2026-10-26 until the 10-29 restart.
+  - 03 has a recrawl demand of 3.78 req/s, near the highest, and three capped hostnames,
+    each with normal traffic.
 
 ## 12. Rejected alternatives
 
