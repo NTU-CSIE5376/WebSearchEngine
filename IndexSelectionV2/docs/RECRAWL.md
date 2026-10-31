@@ -83,7 +83,7 @@ the batch-20 list.
   policy env is unset, so `manual_first` applies. The image rebuild also moved Scrapy to
   2.19.0 (`requirements.txt` pins only `>=2.13`).
 - A follow-up fixes the starvation that §11 describes. It is the local WebCrawler branch
-  `pr84-weighted-dispatch` (`6d23789`, tests in `f5a7b93`, pacing in `e1ae98d`) and is
+  `pr84-weighted-dispatch` (`6d23789`, tests in `f5a7b93`, pacing in `e1ae98d` and `f24189c`) and is
   not proposed upstream yet. It changes four rules and adds logs:
   - `weighted`, the new default policy: while both queues have requests, API requests get
     `MANUAL_BULK_CRAWL_SHARE_PERCENT` (1–99, default 50) of the dispatches. A queue with
@@ -96,6 +96,10 @@ the batch-20 list.
   - `CRAWLER_MANUAL_BULK_CRAWL_HOST_INTERVAL` (default 0 = off) spaces a host's API
     requests on a fixed grid. At 4.8 s a host's recrawl stayed at 15–16 requests in any
     60 s in the round-5 simulation; without it a 120-doc batch went out at the slot's rate.
+    Each redirect hop and retry of a URL moves the host's next request one interval later
+    (`f24189c`), so they count against the same 0.208 req/s. A host that redirects gets
+    fewer docs a day: at 0.378 extra requests per doc (`www.cnnbrasil.com.br` on the
+    normal crawl), its 241,920 docs take about 18.6 days.
   - `request.start`, `request.end` and `request.fail` carry `source` (`normal` or
     `manual`). The heartbeat adds `dequeued_normal`, `dequeued_manual`, `manual_active`
     and `manual_save_ms`.
