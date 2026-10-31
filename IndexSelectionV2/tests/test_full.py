@@ -12,7 +12,7 @@ from isel.backtest import select_sample, train_frozen
 from isel.features import FeatureStore, open_store
 from isel.io import atomic_write_json, read_json, write_parquet_atomic
 from isel.pull import FULL_SCHEMA
-from isel.score import SCORED_SCHEMA, NotEnoughCandidates, score_full, select_full
+from isel.score import SCORED_SCHEMA, NotEnoughCandidates, host_cap, score_full, select_full
 from isel.urlnorm import md5_number_lower
 
 
@@ -218,6 +218,11 @@ def test_select_full_caps_each_hostname_and_gives_its_places_to_the_next_urls(tm
     assert run["host_cap"] == 2
     with pytest.raises(NotEnoughCandidates, match="2 per hostname"):
         select_full(cfg, tmp_path, 5)
+
+
+def test_default_host_cap_is_two_weeks_at_a_fifth_of_a_request_per_second(base_cfg):
+    # min_gap_s and max_host_days move together: the 64M list was chosen at this cap.
+    assert host_cap(base_cfg) == 241_920
 
 
 def test_select_full_refuses_too_few_candidates_or_a_larger_k(tmp_path):
