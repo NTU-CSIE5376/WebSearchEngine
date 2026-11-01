@@ -247,6 +247,20 @@ def test_a_new_live_run_replaces_the_request(cfg, api):
     assert json.loads(layout(cfg).request_file.read_text())["model_run_id"] == 2
 
 
+def test_a_request_near_its_expiry_is_replaced(cfg, api):
+    live = make_run(cfg, 1, URLS)
+    push_cycle(cfg, layout(cfg), client(api), live, clock=lambda: T0)
+    old = request_id(cfg)
+    days = cfg.recrawl.expires_days
+    near = T0 + timedelta(days=days - 2)
+    assert "renewed" not in push_cycle(cfg, layout(cfg), client(api), live, clock=lambda: near)
+    late = T0 + timedelta(days=days - 1, minutes=1)
+    stats = push_cycle(cfg, layout(cfg), client(api), live, clock=lambda: late)
+    assert stats["renewed"] and stats["cancelled"] == old and request_id(cfg) != old
+    # Docs still queued under the old request are sent again under the new one.
+    assert len(api.queued(request_id(cfg))) == 5
+
+
 # ---------------------------------------------------------------- pull
 
 def test_pull_stores_text_and_outcomes_and_maps_by_id(cfg, api):
@@ -385,6 +399,23 @@ def test_a_late_cancel_does_not_free_docs_queued_in_the_new_request(cfg, api):
     assert {r["outcome"] for r in outcomes(cfg)} == {"requeue"}
     assert api.requests[old].segments == {}
     assert due_ids(cfg, live2, new, later + timedelta(minutes=10)) == []
+
+
+def test_a_cancel_written_after_the_new_fetch_does_not_make_it_due(cfg, api):
+    push_cycle(cfg, layout(cfg), client(api), make_run(cfg, 1, URLS), clock=lambda: T0)
+    switch = T0 + timedelta(hours=1)
+    api.clock = lambda: switch + timedelta(minutes=30)       # the crawler closes the old
+    live2 = make_run(cfg, 2, URLS)                           # request late...
+    push_cycle(cfg, layout(cfg), client(api), live2, clock=lambda: switch)
+    new = request_id(cfg)
+    api.clock = lambda: switch + timedelta(minutes=5)        # ...after the new fetches
+    api.crawl({u: Page(html=GOOD) for u in URLS}, request_id=new)
+    Puller(cfg, client(api)).cycle(force=True, now=switch)
+    latest = {}
+    for r in sorted(outcomes(cfg), key=lambda r: r["finished_at"]):
+        latest[r["doc_id"]] = r["outcome"]
+    assert set(latest.values()) == {"requeue"}               # newest rows are the old cancel
+    assert due_ids(cfg, live2, new, switch + timedelta(hours=1)) == []
 
 
 def test_compaction_keeps_what_is_due(cfg, api):

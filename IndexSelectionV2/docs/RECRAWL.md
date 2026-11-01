@@ -68,9 +68,10 @@ selectdb public.model_runs (live run) ──► work/full/selection/run=<label>/
                                due_query (next push), text-index-build
 ```
 
-- One crawl request per live run (`isel-run-<id>`, `expires_days` 30). A new live run
-  `DELETE`s the old request, which cancels its queue; its unacked segments, including
-  the `cancelled` records, stay until pull acks them.
+- One crawl request per live run (`isel-run-<id>`, `expires_days` 30). A new live run,
+  or a request one day before its expiry, `DELETE`s the old request, which cancels its
+  queue; its unacked segments, including the `cancelled` records, stay until pull acks
+  them. An expired request would answer 409 to every batch.
 - Each URL goes out as `{id: str(doc_id), url: canonical_url, priority: rank}`. The
   crawler canonicalizes URLs; results map back by `id` only.
 - The client never seals a request: retries of the same list keep going into it.
@@ -108,7 +109,7 @@ through a tmp file and a rename.
 | `retry` | `http_<code>` (not 404/410), `dns`, `timeout`, `connection`, `retries_exhausted`, no HTML, extraction failure | `finished_at` + `min(retry_base_s · 2^(n−1), retry_max_s)`; `stale_days` once n ≥ `max_attempts` (5). n counts the retries since the last `fetched` |
 | `robots` | `robots` | `finished_at` + `robots_retry_days` (30) |
 | `gone` | `non_html`, `http_404`, `http_410`, skipped `invalid` | never |
-| `requeue` | `expired`, `cancelled` | now; not counted in n |
+| `requeue` | `expired`, `cancelled` | now; not counted in n. Only the current request's requeue counts: another request's says only that it ended, and the crawler may write it after the new request already fetched the doc |
 
 A doc is in flight, and not due, while the current request's newest push of it has no
 outcome of the same request with `finished_at` ≥ `pushed_at` − `clock_skew_s` (300 s,

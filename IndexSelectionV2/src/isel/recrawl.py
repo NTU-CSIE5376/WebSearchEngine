@@ -255,8 +255,11 @@ WITH list AS (
   SELECT doc_id, canonical_url AS url, rank
   FROM read_parquet({sql_str(str(manifest / '*.parquet'))})
   QUALIFY row_number() OVER (PARTITION BY doc_id ORDER BY rank, canonical_url) = 1),
+-- Another request's requeue says only that it ended; a doc it held was due, and its
+-- other rows still say so. It must not hide a result the current request got since.
 out AS (SELECT DISTINCT doc_id, request_id, outcome, finished_at
-        FROM {_scan(lay.outcome, 'outcome')}),
+        FROM {_scan(lay.outcome, 'outcome')}
+        WHERE outcome <> 'requeue' OR request_id = {sql_str(request_id)}),
 last AS (SELECT doc_id, arg_max(outcome, finished_at) AS outcome, max(finished_at) AS at
          FROM out GROUP BY doc_id),
 ok AS (SELECT doc_id, max(finished_at) AS at FROM out WHERE outcome = 'fetched'
@@ -302,12 +305,19 @@ def _wait(stats: dict[str, Any], seconds: float, **flags: Any) -> dict[str, Any]
 
 
 def _ensure_request(cfg: Config, lay: Layout, api: CrawlApi, live: LiveRun,
-                    stats: dict[str, Any]) -> str | None:
-    """The request of the live run; a new live run replaces the old request."""
+                    stats: dict[str, Any], now: datetime) -> str | None:
+    """The request of the live run, replaced for a new live run or a day before expiry.
+
+    An expired request answers 409 to every batch, so it must not run out.
+    """
     r = cfg.recrawl
     current = read_json(lay.request_file)
     if current and current["model_run_id"] == live.run_id:
-        return current["request_id"]
+        renew = (datetime.fromisoformat(current["created_at"])
+                 + timedelta(days=r.expires_days - 1))
+        if now < renew:
+            return current["request_id"]
+        stats["renewed"] = True
     meta = validate_run(live.run_dir)
     if meta.get("scope") != "full":
         raise RecrawlError(f"{live.run_dir} is not a select-full run")
@@ -325,8 +335,7 @@ def _ensure_request(cfg: Config, lay: Layout, api: CrawlApi, live: LiveRun,
         raise RecrawlError(f"POST {api.url} answered {reply.status}: {reply.error}")
     request_id = reply.body["request_id"]
     atomic_write_json(lay.request_file, {"request_id": request_id, "model_run_id": live.run_id,
-                                         "run_label": live.label,
-                                         "created_at": datetime.now(UTC).isoformat()})
+                                         "run_label": live.label, "created_at": now.isoformat()})
     stats["created"] = request_id
     return request_id
 
@@ -343,10 +352,10 @@ def push_cycle(cfg: Config, lay: Layout, api: CrawlApi, live: LiveRun,
     """
     r = cfg.recrawl
     stats: dict[str, Any] = {"batches": 0, "docs": 0, "invalid": 0, "duplicate": 0}
-    request_id = _ensure_request(cfg, lay, api, live, stats)
+    now = clock()
+    request_id = _ensure_request(cfg, lay, api, live, stats, now)
     if request_id is None:
         return _wait(stats, r.api_backoff_s, paused=True)
-    now = clock()
     dues = sorted(lay.due(request_id).glob("due-*.parquet"))
     due = dues[-1] if dues else None
     if due is not None and due.with_suffix(".done").exists():
@@ -690,7 +699,8 @@ def report(cfg: Config, api: CrawlApi, live: LiveRun, now: datetime) -> dict[str
         rows = con.execute(f"""
 WITH list AS (SELECT DISTINCT doc_id FROM read_parquet(
                 {sql_str(str(live.run_dir / 'manifest' / '*.parquet'))})),
-out AS (SELECT DISTINCT doc_id, outcome, finished_at FROM {_scan(lay.outcome, 'outcome')}),
+out AS (SELECT DISTINCT doc_id, outcome, finished_at FROM {_scan(lay.outcome, 'outcome')}
+        WHERE outcome <> 'requeue' OR request_id = {sql_str(current.get('request_id', ''))}),
 last AS (SELECT doc_id, arg_max(outcome, finished_at) AS outcome, max(finished_at) AS at
          FROM out GROUP BY doc_id)
 SELECT count(*), count(*) FILTER (WHERE last.outcome IS NULL),
