@@ -1,11 +1,13 @@
 # Recrawl design
 
-- Code (implemented, tested, not deployed): `src/isel/recrawl.py`, `src/isel/extract.py`,
-  `src/isel/schema.py`. Parameters: `[recrawl]` in `config/isel.toml`.
-- Crawler side: the manual bulk crawl API of
-  [WebCrawler PR #84](https://github.com/NTU-CSIE5376/WebCrawler/pull/84) at `bd40191`,
-  used as is. The one open crawler-side problem, API requests on busy hosts, is
-  [WebCrawler#85](https://github.com/NTU-CSIE5376/WebCrawler/issues/85).
+- Code (implemented, tested, not deployed): `src/isel/recrawl.py`, `src/isel/extract.py`.
+  Parameters: `[recrawl]` in `config/isel.toml`.
+- Crawler side: the bulk crawl v2 API of WebCrawler (branch `bulk-crawl-v2`, on top of
+  PR #106). It replaces PR #84's job API; the contract is in WebCrawler `docs/03` and in
+  the spec `bulk-crawl-v2-server-spec.md`. The client spec is
+  `bulk-crawl-v2-client-spec.md`.
+- isel keeps no database for the recrawl. Every piece of state is a file with one
+  writer (§5). selectdb is read only for the live run.
 
 ## 1. Why recrawl
 
@@ -15,297 +17,236 @@
   re-fetches a page: nothing sets `should_crawl` back to TRUE.
 - 55 % of the 128M list was last fetched before June 2026.
 
-## 2. Rule
+## 2. Who decides what
 
-| Rule | Value |
+| Decision | Owner |
 |---|---|
-| Unit | the full hostname; `en.wikipedia.org` and `zh.wikipedia.org` count separately |
-| Rate | at most 0.2 requests per second per host, so requests at least 5 s apart |
-| Scope | the sum of every fetcher: the crawler (normal and API requests), sitemap patrol, golden patrol |
-| robots.txt | always honoured; its requests count against the same budget |
+| Which pages, in which order (rank) | isel: the live run's manifest |
+| When a page is due again (revisit, retry backoff, robots, gone) | isel: the outcome files (§6) |
+| When a host is fetched and how fast | the crawler: per-slot queues, LPT on the whole backlog, PR #106's per-host cap and weighted share, AutoThrottle, 429/503 blocks |
+| How much the crawler may hold for isel | the crawler: 503 + `Retry-After` on POST, a result quota on unacked segments |
+
+isel sets no rate, packs no jobs and locks no host. robots.txt is always honoured.
 
 ## 3. Capacity
 
-- The list spans 1,677,068 hosts; a host allows 17,280 requests a day. The largest,
-  `www.espn.com`, has 656,637 URLs and needs 38 days.
-- At a full 0.2 qps everywhere, 14 days would cover 123.0M URLs (96.1 %). A real cycle
-  is max(5 s, latency) with a 6.6 s median latency, so about 0.15 qps. With robots.txt
-  requests and ~10 % failures, that gives ~108M pages in 14 days.
-- 93.8 % of the normal crawl's requests hit listed hosts, and API requests yield to them
-  on a shared host (WebCrawler#85). Large hosts are the bottleneck, not bandwidth.
-- So 128M cannot finish in 14 days. The goal is as many pages as possible, best rank
-  first.
+The list is 64M (`eval.k_headline`), as TY Huang asked on 2026-10-27. Figures are for
+the batch-20 list.
 
-## 4. Architecture: the crawler's job API
+- The top 64M are 64,000,005 URLs on 1,204,079 hostnames. 14 days need 52.9 req/s,
+  9.4 % of the crawler's ~560 req/s before the YugabyteDB cutover.
+- `select-full` takes the top 64M by score with no per-hostname cap; the crawler's pace
+  decides how far each host gets. `www.espn.com`, the largest, has 638,981 URLs: 14 days
+  need 0.53 req/s. Below that, its lowest-ranked URLs are fetched after the 14 days,
+  not dropped.
+- Under v1 a host had one open job of 240 docs, and its next job waited for the whole
+  job, so a big host was capped near 240 ÷ the job's lifetime (main7b: p50 1,175 s,
+  about 0.20 docs/s). v2 has no jobs: the crawler sees the whole backlog of each slot.
+- Batch-20 golden coverage (the official `indexed_rate`):
 
-- Recrawl is not a second crawler. isel hands URL lists to the production crawler's job
-  API, and the crawler fetches them with its normal spider at priority 0. Each crawler
-  process keeps at most 128 API requests in flight (`max_concurrency_ratio` 0.5 of 256),
-  queued requests included. That is a ceiling, not a floor.
-- Politeness stays with the crawler's AutoThrottle. On its own side, isel keeps the
-  recrawl within 0.2 qps per host: a host's next job waits `docs × min_gap_s` (5 s).
-- isel never writes crawlerdb, `/data/ipc` or `/data/manual_bulk_crawls`. It reads
-  results read-only and deletes them only through the API.
+  | List | head | random |
+  |---|---|---|
+  | 128M | 24.75 % | 23.06 % |
+  | 64M, no cap | 23.69 % | 21.99 % |
+  | 64M, 241,920 per hostname | 23.58 % | 21.85 % |
+
+- `recrawl-report` shows progress from the outcome files: docs left, docs fetched in
+  the last day and the days left at that pace, next to the crawler's own counts.
+
+## 4. Flow
 
 ```
-selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
-                                   │ recrawl-plan (loop)
-                                   ▼
-  POST 127.0.0.1:4000/v1/manual-bulk-crawls {"urls": [...], "ttl_days": 3} -> job_id
-                                   ▼
-  /data/manual_bulk_crawls/pending/{job_id}.json + pending/crawler_NN/{job_id}.json
-                                   │ each crawler takes its part, FIFO
-                                   ▼
-  /data/manual_bulk_crawls/results/{job_id}/request.json
-  /data/manual_bulk_crawls/results/{job_id}/crawler_NN/{NNNNN.json,NNNNN.html,progress.json}
-          │ recrawl-plan: GET until completed, DELETE once applied
-          │ recrawl-archive (loop, read-only, completed jobs only)
-          ▼
-  /data/isel/text/fetch_date=YYYYMMDD/job-<batch_id>.parquet   (text, permanent)
-  /data/isel/log/YYYYMMDD/job-<batch_id>.jsonl.gz              (per-URL results, permanent)
+selectdb public.model_runs (live run) ──► work/full/selection/run=<label>/manifest/*.parquet
+                                              │ recrawl-push (loop)
+                                              ▼
+  due/<request>/due-<ts>.parquet ──► push/<request>/<ts>-<n>.parquet ──► POST /urls (<= 10k)
+                                              │ the crawler fetches by its own schedule
+                                              ▼
+  GET /segments (long poll) ──► recrawl-pull ──► text/ + outcome/ ──► POST /ack
+                                              │
+                                              ▼
+                               due_query (next push), text-index-build
 ```
 
-- The API routes each URL to the crawler that owns its domain. At POST time it creates
-  `results/{job_id}/`, `request.json` and one empty partition per crawler, so a directory
-  does not mean the job is done.
-- Each crawler writes only its own partition and sets `completed_at` in its
-  `progress.json` when its part is done. Only the API's `GET` decides that the job is
-  `completed`: every partition must be done. There is no `status.json` on disk (PR #84
-  `docs/03` §3.7).
-- `request.json` lists the URLs as the API canonicalized and deduplicated them, in the
-  order sent, and `crawler_ids`, the crawler of each URL. Result N is
-  `crawler_{crawler_ids[N]:02d}/NNNNN.json`, with its HTML in the same partition. The
-  API's download route resolves files the same way.
-- A job expires `ttl_days` after the POST. Past that, the crawler drops it, `GET` answers
-  404, and the API's hourly GC deletes its files.
+- One crawl request per live run (`isel-run-<id>`, `expires_days` 30). A new live run,
+  or a request one day before its expiry, `DELETE`s the old request, which cancels its
+  queue; its unacked segments, including the `cancelled` records, stay until pull acks
+  them. An expired request would answer 409 to every batch.
+- Each URL goes out as `{id: str(doc_id), url: canonical_url, priority: rank}`. The
+  crawler canonicalizes URLs; results map back by `id` only.
+- The client never seals a request: retries of the same list keep going into it.
 
-## 5. Frontier schema (`schema.py`, revision `0003_recrawl`)
+## 5. Files and writers
 
-| Table | One row per | Main columns |
+All under `recrawl.root` (`/data/isel/recrawl` in the container); every file is written
+through a tmp file and a rename.
+
+| File | Content | Writer |
 |---|---|---|
-| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank`, `next_at`, `batch_id` (its open job) |
-| `recrawl.doc` | `doc_id` (signed BIGINT) | `url` (canonical), `host_id`, `rank`, `model_run_id`, `state`, `due_at`, `attempts`, `batch_id`, fetch fields, `text_file`, `text_len`, `lang` |
-| `recrawl.job` | job sent to the API | `batch_id`, `job_id`, `doc_ids` (in the order sent), `state`, timestamps, `deleted_at`, `records`, `error` |
-| `recrawl.batch_seq` | (sequence) | source of `batch_id` |
+| `request.json` | `request_id`, `model_run_id`, `run_label`, `created_at` | push |
+| `due/<request>/due-<ts>.parquet` | `doc_id`, `url`, `rank` of the docs to send, by rank; `due-<ts>.done` once all batches are sent | push |
+| `push/<request>/<ts>-<n>.parquet` | `doc_id`, `pushed_at` of batch n, written before its POST | push |
+| `outcome/fetch_date=D/push-*.parquet` | URLs the API skipped as invalid (`gone`, `invalid_url`) | push |
+| `outcome/fetch_date=D/pull-*.parquet` | one row per result record | pull |
+| `text/fetch_date=D/pull-*.parquet` | `TEXT_SCHEMA`: `doc_id`, `source`, `url`, `final_url`, `fetched_at`, `http_status`, `lang`, `title`, `description`, `body`, `text_len`, `payload_sha1` | pull |
+| `outcome/`, `text/` `compact-*.parquet` | merged days before yesterday | compact |
 
-- Doc `state` is `pending`, `dispatched`, `fetched`, `failed` or `gone`; `pending` and
-  `failed` docs are due after `due_at`. A doc is live while `rank IS NOT NULL`. Sync
-  writes only `rank` and `model_run_id`; archive writes only fetch fields.
-- Job `state`:
+- Outcome rows: `doc_id` (u64), `request_id`, `outcome`, `fail_reason`, `http_status`,
+  `final_url`, `fetched_at`, `finished_at` (the crawler's time), `payload_sha1`,
+  `text_len`, `lang`.
+- A pull file is named by a hash of its segment names, so the same segments read twice
+  rewrite the same file. Readers take distinct `(doc_id, request_id, outcome,
+  finished_at)`, so a duplicate row from a cut-short compaction or a re-batched segment
+  changes nothing. The text index takes each doc's newest `fetched_at`.
+- `doc_id` is u64 everywhere: manifest, outcome, text and OpenSearch `_id`.
 
-| State | Meaning | Its docs |
+## 6. When a doc is due (`due_query`)
+
+| Last outcome (by `finished_at`) | From the record | Due again |
 |---|---|---|
-| `claimed` | committed; the POST has no clear answer yet | `dispatched` |
-| `submitted` | the API returned a `job_id` | `dispatched` |
-| `completed` | the API's `GET` reported it done; `completed_at` is the API's value | `dispatched` |
-| `error` | the results break the contract (e.g. a new order); the planner halts | `dispatched` |
-| `applied` | results applied; `deleted_at` is set once the API deleted them | — |
-| `lost` | no results will come: refused, no reply, or unknown to the API (TTL passed) | back to `pending` |
+| none | — | now |
+| `fetched` | no `error`, HTML text extracted | `finished_at` + `stale_days` (30) |
+| `retry` | `http_<code>` (not 404/410), `dns`, `timeout`, `connection`, `retries_exhausted`, no HTML, extraction failure | `finished_at` + `min(retry_base_s · 2^(n−1), retry_max_s)`; `stale_days` once n ≥ `max_attempts` (5). n counts the retries since the last `fetched` |
+| `robots` | `robots` | `finished_at` + `robots_retry_days` (30) |
+| `gone` | `non_html`, `http_404`, `http_410`, skipped `invalid` | never |
+| `requeue` | `expired`, `cancelled` | now; not counted in n. Only the current request's requeue counts: another request's says only that it ended, and the crawler may write it after the new request already fetched the doc |
 
-- A job's only deadline is `result_ttl_days` (3), sent as `ttl_days`. The server stops
-  an expired job; isel has no timeout of its own.
-- Partial indexes: `host_ready (best_rank)` and `host_queued (batch_id)` split hosts by
-  open job; `doc_due (host_id, rank)` covers due live docs; `doc_inflight (batch_id)`
-  covers `dispatched`; `doc_stale (due_at)` covers live `fetched` docs; `job_open
-  (state)` and `job_undeleted (batch_id)` cover jobs still to watch or delete.
-- Every frontier transaction takes one advisory lock, so sync, plan and archive never
-  interleave or deadlock. An instance lock keeps each command to one copy.
+A doc is in flight, and not due, while the current request's newest push of it has no
+outcome of the same request with `finished_at` ≥ `pushed_at` − `clock_skew_s` (300 s,
+validated below `retry_base_s`). Only the current request counts: a late `cancelled` of
+the old request cannot free a doc already queued in the new one. If the crawler ever
+lost a record, the doc stays in flight until the next request, at most one list cycle.
 
-## 6. `recrawl-sync`
+## 7. `recrawl-push`
 
-Run once after each swap; it refuses to run in the swap freeze window. It reads the live
-run's manifest (one row per `doc_id`, its best rank) and upserts `host` and `doc`, one
-transaction per 1M rows. Docs that left the list get `rank = NULL`, `best_rank` is
-recomputed, and hosts of new or re-ranked docs lose their backoff `next_at`.
+A loop; each cycle names its own wait.
 
-## 7. `recrawl-plan`
+1. Read the live run (admin, read-only session). If it differs from `request.json`:
+   validate the run's manifest, `DELETE` the old request, create a new one.
+2. If the newest due file is sent (`.done`) and younger than `due_interval_h` (24 h),
+   wait. Otherwise compute a new due file, or continue the unsent one.
+3. Send batches of `batch_urls` (10,000) in order. Before each POST, wait out the
+   `[guard]` windows (`pg.next_allowed_start`: the 1st and 16th 00:00–20:00 and every
+   hour :58–:10), because each POST makes the API look up `domain_state` on YugabyteDB.
+4. Write the push file (only if it does not exist: a batch sent again keeps its first
+   time), then POST with `batch_id` `<ts>-<n>`.
 
-A loop, every 30 s. No HTTP call runs inside a transaction: jobs are claimed and
-committed, then sent.
-
-1. **Recover.** A `claimed` job older than `claim_timeout_s` (600 s) is `lost` and its
-   docs return to `pending`. Docs and hosts held by a job that is no longer open are
-   released. Up to `sweep_rows` (100,000) `fetched` docs past `due_at` return to
-   `pending`.
-2. **Poll.** Each `submitted`, `completed` or `error` job gets a `GET` at most every
-   `status_poll_s` (60 s); 48 jobs make about one request a second.
-   - `completed` while the job is `submitted`: mark it `completed` with the API's
-     `completed_at`.
-   - `completed` but no results directory: the job stays `submitted`; report
-     `config_error` (wrong mount) and claim nothing.
-   - 404: `lost`, docs back to `pending`. This covers an expired job, an `error` job left
-     unfixed past its TTL, and a `completed` job the archive did not apply in time.
-   - `pending` or `running`: record `checked_at`.
-   - An answer that cannot be used (5xx, a bad body): report `api_error` and skip only
-     this job, so one broken job cannot hold back the others.
-   - No connection: report `api_error` and end the round, so a dead API costs one
-     timeout.
-3. **Delete.** Every `applied` job without `deleted_at` gets a `DELETE`. 204 or 404 sets
-   `deleted_at`; anything else reports `api_error` and is tried next cycle. This runs even
-   while the planner is halted.
-4. **Stop** claiming if a job is in `error`, if a completed job's results are not
-   mounted, during the `api_backoff_s` (300 s) pause, if `max_jobs_inflight` (48) jobs are
-   at the crawler (`claimed` + `submitted`), if as many `completed` jobs wait for the
-   archive (`archive_lag`), or if less than `min_free_gb` (800 GB) is free under
-   `text_root`.
-5. **Claim.** Ready hosts (no open job, `next_at` passed) by `best_rank`. Each gives up to
-   `host_docs_per_job` (120) due docs by rank; jobs hold up to `job_size` (3,000) URLs,
-   at most `plan_max_jobs` (8) per cycle. Inside a job the hosts' URLs alternate, so the
-   crawler's 128 API slots per process spread over many hosts. Docs become `dispatched`,
-   each host gets `batch_id` and `next_at = now + docs × min_gap_s`, and the claim
-   commits.
-6. **Send** each job and record the answer:
-
-| Response | Verdict |
+| Answer | Verdict |
 |---|---|
-| 200 with a `job_id` | `submitted` |
-| 400 "Invalid HTTP(S) URL at index N" | doc N becomes `gone` (`invalid_url`); the rest is sent again, at most `max_resend` (20) times |
-| other 400, 415, 500, 503 | nothing accepted: `lost`, docs released; pause `api_backoff_s`; unsent jobs released |
-| no reply, or 200 without a usable `job_id` | unknown: the job stays `claimed` until the claim timeout; unsent jobs released |
+| 202 | next batch; `skipped` `invalid` items become `gone` outcomes, `duplicate` items need nothing |
+| 503, 5xx, no answer | stop; wait `Retry-After` or `api_backoff_s` (300 s); the same batch goes again with the same `batch_id`, and the API answers it once |
+| 401, 404, 409, 400 | delete that batch's push file (it never reached the crawler) and fail |
 
-An unknown job may have been accepted. isel never learns its `job_id`, so the TTL
-removes its results. `--dry-run` only prints the per-host capacity report.
+On restart, the last batch with a push file is sent again, then the rest.
 
-## 8. `recrawl-archive`
+## 8. `recrawl-pull`
 
-A loop, every 60 s. It never changes `result_root`. A spawn pool of `archive_workers`
-(8) processes does each job's file work; the main process applies results in order.
+A loop. It stops below `min_free_gb` (800 GB) free under `root`; the crawler's result
+quota then fills and its manual dispatch for isel stops.
 
-1. Take each `completed` or `error` job whose `result_root/{job_id}` exists. The archive
-   never calls the API.
-2. Read `request.json` (`urls` and `crawler_ids`, one crawler per URL) and, for every
-   listed position N, `NNNNN.json` in partition `crawler_{crawler_ids[N]:02d}`. Check
-   each record: required keys and types, `url` equal to `request.json`'s N-th URL,
-   `html_file` only `NNNNN.html`, timestamps with a UTC offset.
-3. Map results to docs (`map_results`):
-   - Same length: result i is doc i. If a URL differs and equals another sent URL, the
-     order changed: a contract breach. Canonicalization alone is fine (PR #84's w3lib
-     2.3.1 turns `%25C3%25A9` into `%C3%A9`, so strings cannot be used).
-   - Shorter (the API dropped duplicates): pair only identical strings. An unmatched doc
-     is retried (`unmatched`); alone in its next job, it pairs by position.
-4. A contract breach marks the job `error` and writes nothing; the planner halts until a
-   fix lets a later cycle apply it. An `OSError` (permission, EIO, directory gone)
-   changes nothing, and the job is retried next cycle.
-5. For each 2xx HTML result, Resiliparse extracts the title, `<meta name=description>`,
-   the main-content body (full text if all boilerplate; at most 200,000 chars) and the
-   language, from the raw bytes or their `<meta charset>`.
-6. Write one zstd Parquet per job under `text_root` and a gzipped copy of the per-URL
-   results under `log_root`, dated by the job's `completed_at`, so a rerun
-   overwrites the same files. Then apply in one transaction, marking the job `applied`
-   last:
+1. List this tenant's requests; take those with unacked segments and the current one.
+   Long-poll (`long_poll_s`, 30 s) only when the current request is the only one.
+2. Take segments in order up to `pull_batch_segments` (64) or `pull_batch_mb` (256 MB
+   of gzip; a segment unpacks to several times its size and the pull has 8 GB). Wait
+   until the batch is full or its oldest segment has waited `pull_batch_s` (300 s);
+   `--once` takes what is there.
+3. Download them, check every record (keys, `id` a u64, status, types, UTC times),
+   extract the text of HTML records in `archive_workers` (8) spawn processes
+   (Resiliparse: title, description, main-content body up to 200,000 chars, language),
+   write text, then outcome, then ack the segments by name.
+4. A record that breaks the contract stops the pull before the ack; the segment stays.
 
-| Result | New state | Next attempt |
+## 9. `recrawl-compact` and `recrawl-report`
+
+- `recrawl-compact` (monthly) merges the outcome and text files of days before
+  yesterday into one file each. Outcome keeps each doc's latest `fetched` row and every
+  row after it, which is all `due_query` reads; text keeps each doc's newest row. It
+  writes the new file before deleting the old ones and skips a kind when free space is
+  below the inputs' size plus `min_free_gb`. It also deletes push dirs of requests other
+  than the current one.
+- `recrawl-report` prints `request.json`, the crawler's status of the current request,
+  and from the outcome files: the list size, never fetched, fetched within `stale_days`,
+  retry, gone, robots, fetched in the last day and `days_left`.
+
+## 10. Placement and storage
+
+| Data | Size | Location |
 |---|---|---|
-| 2xx HTML | `fetched`; `text_file`, `text_len`, `lang`, `payload_sha1` set | after `stale_days` (30) |
-| 2xx non-HTML, 404, 410 | `gone` | never |
-| `IgnoreRequest` (robots.txt) | `failed` | after `robots_retry_days` (30) |
-| 429, 503 | `failed`, `attempts + 1`; host paused `retry_base_s` | exponential backoff |
-| other failure, `unmatched`, extraction failure | `failed`, `attempts + 1` | `retry_base_s · 2^attempts`, cap 24 h; `stale_days` after `max_attempts` (5) |
+| `work_dir` (manifests, golden) and the compute jobs | live manifest 8.9 GB | Host3 `/data/isel/work` |
+| due, push, outcome | ~8 GB a cycle before compaction | Host3 `/data/isel/recrawl` |
+| Text Parquet | ~0.2 TB per copy of the 64M list; compaction keeps one | Host3 `/data/isel/recrawl/text` |
+| OpenSearch index | 0.07–0.12 TB at 64M, twice that while building | Host3 |
+| Results at the crawler | at most `result_quota_gb` (100 GB) unacked | Host2 `/data/manual_bulk_crawls` |
+| selectdb | unchanged; no recrawl tables | Host1 `:5445` |
 
-- A 2xx applies whenever it is newer than the stored fetch. A failure applies only while
-  the doc still waits on this job. A doc of the job with no result is retried
-  (`no_result`).
+- Host3 `/data` also holds a YugabyteDB tserver of crawlerdb (RF 1), so a full disk
+  stops crawlerdb; `min_free_gb` 800 protects it.
+- Extraction, measured on 9 real pages of 590 KB on average: 6.5 ms per page per process,
+  so 8 workers handle about 45.6M pages a day.
 
-**Text Parquet.** `doc_id` (uint64, as in the manifest), `batch_id`, `url`, `final_url`,
-`fetched_at`, `http_status`, `lang`, `title`, `description`, `body`, `text_len`,
-`payload_sha1`. `recrawl.doc` stores the same `doc_id` as a signed BIGINT.
+## 11. Deployment (`deploy/compose.compute.yaml`)
 
-## 9. Storage
+- `recrawl-push`: 4 CPUs, 8 GB; `recrawl-pull`: 8 CPUs, 8 GB. Profile `recrawl`,
+  `restart: unless-stopped`, `/data/isel` read-write, secret `recrawl_api_token`.
+  Both reach the API over HTTP at `http://172.16.191.2:4000`; no host network, no mount
+  of the crawler's files.
+- Run `mkdir -p /data/isel/recrawl` as the isel user before `up`.
+- `tests/recrawl_fakes.py` serves the v2 contract over HTTP; `tests/test_recrawl.py`
+  and the integration test run push, pull, compact and report against it.
 
-| Data | Size | Location | Kept |
-|---|---|---|---|
-| Pending job files | one manifest per open job, plus one marker per crawler in it | Host2 `/data/manual_bulk_crawls/pending` | a marker until its crawler finishes; the manifest until DELETE or the TTL |
-| Raw HTML + per-URL JSON | 128M pages are 5–6 TB even gzipped; ≤ ~288k pages at once (48 jobs at the crawler, 48 waiting for the archive) | Host2 `/data/manual_bulk_crawls/results` | deleted by isel once applied; the 3-day TTL removes the rest |
-| Text Parquet | ~0.35–0.4 TB | Host2 `/data/isel/text` | permanent |
-| Gzipped per-URL results | ~8 GB | Host2 `/data/isel/log` | permanent; selectdb has no backup |
-| `recrawl` schema | ~37 GB (not measured) | Host1 selectdb `:5445` | resident |
-
-- Host2 `/data` has about 2 TB free while the crawler runs, so raw HTML cannot be kept.
-  The text estimate uses Common Crawl WET (~2.8 KiB per page).
-- Extraction, measured on 9 real pages of 590 KB on average: 6.5 ms per page per
-  process, so 8 workers handle about 45.6M pages a day.
-
-## 10. Deployment (`deploy/compose.compute.yaml`)
-
-- `recrawl-plan`: `network_mode: host`, because the API listens on `127.0.0.1:4000`
-  only; the API has no auth, so no token. It also sends the DELETEs. 2 CPUs, 4 GB.
-- `recrawl-archive`: 8 CPUs for `archive_workers`, 8 GB.
-- Both: profile `recrawl`, `restart: unless-stopped`, `/data/manual_bulk_crawls/results`
-  read-only, `/data/isel` read-write. Run `mkdir -p /data/isel` as the isel user before
-  `up`, or Docker creates it as root. Start them only after WebCrawler#84 (`bd40191` or
-  later) is merged and deployed.
-- `tests/recrawl_fakes.py` holds a stub of the API and a fake crawler that write
-  per-crawler partitions like PR #84; the integration tests run the whole loop against
-  them. A separate local run against PR #84's own FastAPI app and partition writer at
-  `bd40191`, with two crawlers, also passed. It covered a job that only one crawler had
-  finished, which was not applied.
-
-## 11. Rollout
-
-A **Hard Stop** phase needs the owner's approval before it starts. The R3 audit checks
-Loki: at most 120 requests per host in any 10 minutes.
+## 12. Rollout
 
 | Phase | Content | Precondition |
 |---|---|---|
-| R0 | schema, sync, plan, archive, extraction, tests, local end-to-end runs (done) | this repository only |
-| R1 (Hard Stop) | check `:5445` is at 0002, migrate to 0003; `recrawl-sync` on the live run; `recrawl-plan --dry-run` | the batch-20 swap is done; Host1 has space for the schema |
-| R2 | WebCrawler#84 merged and deployed | crawler running |
-| R3 (Hard Stop) | start both loops; trial of 1–5M pages; measure HTML and text size and the time from POST to results | R2 |
-| R4 | the full list, then only new, due and unfinished pages each period | R3's measurements |
+| R0 | push, pull, compact, report, tests (done) | this repository only |
+| R1 (Hard Stop) | WebCrawler v2 deployed with `MANUAL_BULK_CRAWL_SHARE_PERCENT=20`; the API on Host2's LAN address with a token for isel | the crawler owners agree |
+| R2 (Hard Stop) | `work_dir` and the compute jobs on Host3; `recrawl-push --once` on a trial list | R1 |
+| R3 (Hard Stop) | both loops on the full list; measure text size, time from push to result, both sources' rates and `days_left` | R2 |
 
-To remove the recrawl: `git revert`, then `alembic downgrade 0002`, which drops the
-`recrawl` schema. The text Parquet is not touched.
+To remove the recrawl: `git revert`; stop the loops. The files under `recrawl.root` are
+not touched, and selectdb never changed.
 
-Known risks:
-
-- **A stopped crawler.** A job's URLs span many crawlers, so nearly every job waits for
-  it. Once 48 jobs are open, the planner claims nothing. If the crawler is back within
-  the TTL, the jobs complete. If not, they become `lost`, and the results the other
-  partitions already fetched are dropped with them.
-- **Head-of-line in the API.** The 128 slots count requests queued in the scheduler,
-  fill by job and index order, and have no per-host cap. By rank, each of the first 50
-  jobs holds only ~29 hosts, about 2 per crawler over 16 crawlers. If AutoThrottle holds
-  a large host near 0.3 qps, the total is about 10 req/s, far below the 106 req/s that
-  14 days need. A smaller `host_docs_per_job` alone leaves the large hosts unfinished
-  under the rule of one open job per host. The candidate fix lets a host sit in several
-  jobs, paced by `next_at`; it waits for Loki or trial measurements.
-- **Lane allocation** between normal and API requests is WebCrawler#85.
-
-## 12. Rejected alternatives
+## 13. Rejected alternatives
 
 | Alternative | Reason |
 |---|---|
-| `crawl-requests` for recrawl | ~128,000 calls, each writing crawlerdb; HTML deleted after 8 h; nothing to track |
-| Map results by URL string | the API canonicalizes URLs, so strings miss docs; map by position and check the order |
-| A threshold on rewritten URLs to detect a new order | one host fills 120 of 3,000 URLs (4 %), so a fully rewritten host trips it; an exact check is used |
-| Read each partition's `progress.json` to decide completion | a copy of the API's `job_status`; PR #84 says only the API decides, the format changed twice in one week, and it would miss the API's expiry check |
-| Download results over HTTP | ~6,000 GETs per 3,000-URL job, ~60 MB/s through FastAPI at full rate, and the archive would need the API; isel sits next to the files |
-| Scan `crawler_*` directories for result files | they also hold `.json.tmp` and `progress.json`, and crawler ids above 99 have 3 digits; `crawler_ids` in `request.json` locates each file, as the API's download route does |
-| Count `completed` jobs in `max_jobs_inflight` | they no longer hold the crawler, so the archive's delay would slow dispatch; a separate cap of the same size is used |
-| Our own job timeout plus `DELETE` to cancel | two deadlines to keep in step; the server's TTL already stops a job and answers 404 |
-| Apply late results of a `lost` job | after the TTL the server drops them, so none arrive; the code is simpler without it |
-| The default 14-day TTL | unapplied results would stay 14 days on `/data`; 3 days covers a job under FIFO, and a longer archive outage only costs a refetch |
-| Wait for a whole wave of jobs before the next | the slowest host holds the wave |
-| Permanent raw HTML | 5–6 TB against ~2 TB free; the index needs only text |
+| A `recrawl` schema in selectdb (v1, migration `0003`) | its host lock, job states and indexes served client-side scheduling, which v2 gives the crawler; what is left is derivable from append-only files, and 64M rows of updates per cycle would share the Postgres the metric reads |
+| A separate Postgres for the recrawl | a second service for the same purpose |
+| Upload the whole list at once and fetch results per job | the crawler holds results until a job ends, ~12.7 TB of raw HTML for 64M pages against ~2.5 TB free on Host2 |
+| Ack by cursor | 16 crawler processes write segments in parallel, so there is no single order; ack by name |
+| Map results by URL string | the crawler canonicalizes URLs; map by the item `id` |
+| Track "submitted" per doc in a table | the push files record it, and the crawler sends a final record for every accepted URL |
+| Seal the request after the first upload | retries of the same list go into the same request |
+| A per-hostname list cap from an assumed rate (241,920 at 4.8 s) | the rate is the crawler's to decide and is unknown before the crawl |
+| Permanent raw HTML | 5–6 TB against the free space; the index needs only text |
 
-## 13. Inverted index (planned)
+## 14. Inverted index
 
-This round only makes sure recrawl keeps enough data to build one.
+`text-index-build` and `text-index-eval` build and measure it; the design, the engine
+choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
 
 - Source: the text Parquet only (`**/*.parquet`; skip `.parquet.tmp`). Per doc, keep the
-  latest `fetched_at`. Index only live docs (`rank IS NOT NULL`), so ranked ≤ indexed.
-- Engine: Quickwit, which keeps the index on disk instead of RAM. Typesense would need an
-  estimated 100–200 GB RAM for 128M documents. Size: ~0.2 TB compact BM25, ~1.2 TB full.
+  latest `fetched_at`.
+- Engine: OpenSearch with ICU analysis. Quickwit ranked lower on Japanese, Hindi and
+  Bengali in the trial, and Typesense keeps the whole index in RAM: about 1.1–1.65 TB for
+  128M pages of body text.
 
 | Field | Use |
 |---|---|
-| `url`, `canonical_url`, `final_url` | aliases; ~23 % of crawled golden pages are redirect sources |
-| `title`, `description`, `body` | full text, BM25 |
-| `lang` | tokenizer choice; golden keywords come from 10 regions, CJK included |
+| `_id` | the doc id; a hit matches a golden URL only by it. A golden URL that redirects is on the list under its own URL, so it still matches |
+| `doc_id` | the same id as doc values only; it breaks score ties, so every build returns the same top 10 |
+| `url` | displayed; its words are searchable as `url.text` |
+| `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url.text` included. The body has no positions (`index_options: freqs`): the query never uses them, and they were 45 % of the index |
+| `lang` | stored; the trial measured what per-language analyzers would add |
 
-- **Fallback documents.** A doc without text (`gone`, `failed`, not yet fetched) is
-  indexed by its URL tokens plus crawlerdb's title and anchor text. The full export must
-  then pull `title` and `anchor_text`. The index covers all 128M URLs from day one.
-- **Recall@10.** The official metric hard-codes `ranked_num` to 0; `TypesenseRankMeasure`
-  is a stub. So measure offline: query each batch's golden keywords and match the top
-  10 canonical URLs against golden URLs. The official metric needs a `RankMeasure` PR.
+Not built yet:
+
+- **Live docs only.** Index only docs on the live run's manifest, so a dropped doc leaves
+  the next build.
+- **Words of percent-escaped URLs.** Most CJK and Indic URLs are percent escaped, and
+  `url.text` drops the escapes, so those URLs give no words.
+- **Fallback documents.** A doc without text is indexed by its URL plus crawlerdb's title
+  and anchor text. The full export must then pull `title` and `anchor_text`.
+- **Recall@10 in the metric.** The official metric hard-codes `ranked_num` to 0;
+  `text-index-eval` measures it offline the same way; the official metric needs a
+  `RankMeasure` PR.

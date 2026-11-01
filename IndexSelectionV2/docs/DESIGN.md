@@ -19,7 +19,7 @@
 - No scheduler. Each command is one run, except the two opt-in recrawl services
   ([`RECRAWL.md`](RECRAWL.md)).
 - No writes to crawlerdb, metricdb, the v1 selectdb (`:5444`) or `/data/ipc`. The
-  recrawl's results are deleted only through the crawler's API.
+  recrawl reaches the crawler only through its HTTP API.
 - No page fetching of our own and no index building yet. The recrawl asks the crawler
   to fetch the list and keeps the extracted text; the index is only planned.
 
@@ -52,7 +52,7 @@
 | Long statements | `statement_timeout` defaults to 120 s and never exceeds `guard.timeout_cap_s`. A shard that hits a timeout is retried on the next run. |
 | Server temp files | No server-side sort or aggregate; `temp_file_limit = 0`, `work_mem = 16MB`, no parallel workers. |
 | Reading while the metric works | `ReadGuard` runs before every statement. A statement may not reach into the 1st and 16th 00:00–20:00 UTC or any hour's :58–:10, even at its full timeout. It pauses while more than `guard.max_io_waiters` other sessions wait on IO (median of 3 probes). |
-| Read load | `pull-full` reads `full.chunk_blocks` heap blocks per `COPY` (a TID range scan). All sessions share one byte budget of `full.max_heap_mb_s` (2,000 MB/s, about a quarter of the metric's hourly scan). |
+| Read load | `pull-full` reads `full.chunk_blocks` heap blocks per `COPY` (a TID range scan; hash ranges on YugabyteDB, §4.1). All sessions share one byte budget of `full.max_heap_mb_s` (2,000 MB/s, about a quarter of the metric's hourly scan). |
 | Leaking credentials | DSNs come from env variables or secret files; JSON output passes `assert_no_secrets`. |
 
 **Full export.** `pull-full` opens `full.connections` sessions. Each takes whole shards
@@ -66,6 +66,71 @@ all come from this one export, so they describe one crawl state.
 
 **Golden.** `pull-golden` copies metricdb's batches, queries and URLs to
 `golden/golden.parquet`. Each row keeps the raw URL and its canonical spelling.
+
+### 4.1 crawlerdb on YugabyteDB
+
+crawlerdb is moving from PostgreSQL 16 on Host1 to YugabyteDB 2026.1.2 (YSQL, PG15
+based; tservers on .2, .3 and .4, RF 3). `crawlerdb.engine` selects how `pull-full` and
+`pull-dims` read it. The YugabyteDB overlay sets it:
+
+```bash
+isel --config config/isel.toml --config config/crawlerdb/yugabyte.toml pull-full --dry-run
+docker compose ... run --rm isel-yb pull-full --dry-run      # the same in the container
+```
+
+The overlay reads its own DSN (`ISEL_CRAWLERDB_YB_DSN`), so both engines stay
+configured and switching is one flag. metricdb and selectdb do not move.
+
+| | PostgreSQL | YugabyteDB |
+|---|---|---|
+| Key space of a shard table | heap blocks `[0, pg_relation_size / 8192)`, grows while read | `yb_hash_code(url)` in `[0, 65536)`, fixed |
+| One COPY | `ctid` range: a TID range scan of those blocks | `full.hash_chunks` equal hash ranges: an `Index Cond` on the primary key, so only the tablets holding the range are asked |
+| Rate budget `full.max_heap_mb_s` | heap bytes, reserved before the COPY | CSV bytes, charged after it (the size is not known before) |
+| COPY timeout | from the heap bytes at `guard.min_mb_s` | `guard.timeout_cap_s` |
+| Consistency | each COPY is one snapshot | each COPY reads a follower as of 30 s ago (`yb_read_from_followers`) |
+| `_meta.json` `io`, frozen probe | WAL and `pg_stat_io` deltas; `n_tup_*` | not counted: no `pg_stat_io`, no PostgreSQL WAL, `n_tup_*` per node only |
+
+- **Why equal hash ranges.** Ranges cut at tablet boundaries (`yb_tablet_metadata`) would
+  save a second tablet per chunk, but tablets split while data grows, so the ranges
+  of a resumed export would move. Keyset pages on `url` sort every tablet, because the
+  key is hashed. A hash range on PostgreSQL would scan the whole table per chunk, so
+  each engine keeps its own splitter.
+- **Read restarts.** A COPY under concurrent writes can fail with SQLSTATE 40001 once
+  its output passes `ysql_output_buffer_size`; YSQL does not retry it then. A follower
+  read uses a read time older than any clock skew, so it does not restart. Any 40001
+  still rereads that chunk up to `full.chunk_retries` times; after that the shard
+  resumes on the next run like a timeout.
+- **One snapshot for the whole export** is not taken. `yb_read_time` and
+  `pg_export_snapshot` work only inside the history retention (900 s by default),
+  and raising it to hours keeps more MVCC versions under the crawler's writes.
+  The PostgreSQL export never had one snapshot either; `as_of` filters the pool.
+- **Load guard.** The read windows stay: the metric reads crawlerdb wherever it
+  lives. `guard.max_io_waiters` counts `crawlerdb.io_wait_types` in the local
+  node's `pg_stat_activity`; the YugabyteDB wait types are still to be measured.
+- **Connections.** List every tserver in the DSN with `load_balance_hosts=random`
+  (libpq 16 or later; psycopg's binary wheel ships libpq 18). The overlay opens 3.
+- **An export finishes on the engine that started it.** The engine is part of the
+  `_meta.json` layout, like `chunk_blocks`.
+
+**Checked locally** (`pytest -m yugabyte`, image `yugabytedb/yugabyte:2026.1.2.0-b137`):
+every crawlerdb session setting is accepted; the server refuses writes; a hash range
+plans as `Index Scan using <table>_pkey` with `Index Cond: yb_hash_code(url) >= ... AND
+< ...` and `last_fetch_ok IS NOT NULL` as a `Storage Filter` (on 200,000 rows, 1/8 of the
+hash space scanned 25,080 rows); the YugabyteDB and PostgreSQL exports of the same rows
+are equal row for row. Follower reads hide rows written in the last 30 s.
+
+**Not checked yet** (needs a read-only account on the course cluster): whether
+`COPY (SELECT ...) TO` is served by followers (compare the tservers' read metrics),
+the scan speed per node, and the wait types to count.
+
+**When to read.**
+
+| Phase | Read | Why |
+|---|---|---|
+| Migration running | PostgreSQL only, once it is up and frozen, never during the Voyager export | a frozen source gives the last consistent PostgreSQL export; two full scans at once slow both |
+| Data loaded, tablets splitting | neither | YugabyteDB is incomplete and busy with split compactions |
+| After cutover, tablet counts stable for hours | YugabyteDB, one shard | measure MB/s per node and the crawler's write latency; set `full.max_heap_mb_s` from them |
+| Then | YugabyteDB, full | inside the usual read windows |
 
 ## 5. Point in time and features (`features.py`, `derive.py`, `dataset.py`)
 
@@ -225,7 +290,6 @@ then runs `alembic check` against `schema.py`; any difference rolls the whole ru
 |---|---|
 | `public.selected_urls_current` | `url` PK, `score`, `first_seen` (NULL), `run_id` FK `ON DELETE RESTRICT`, `selected_at`; the v1 columns |
 | `public.model_runs` | the v1 columns, plus `status` (loading, validated, live, retired, abandoned, rolled_back; at most one live), `activated_at`, `config_sha256`, `code_version` |
-| `recrawl.host`, `recrawl.doc`, `recrawl.job`, `recrawl.batch_seq` | the recrawl frontier (revision 0003): one row per hostname, per doc and per job sent to the crawler API. See [`RECRAWL.md`](RECRAWL.md) |
 
 **How the metric reads it.** `SELECT url FROM public.selected_urls_current WHERE url =
 ANY(:urls)`, 10,000 URLs at a time, as the hard-coded `select` role. Since
@@ -247,8 +311,8 @@ metric builds the random set at 12:00 and the head set at 18:00.
 5433 and 5444, and any database that holds `url_state_current_000` or `metric_url`.
 
 **Reader role.** `migrate-selectdb` creates the `select` role with the password the
-metric hard-codes. The role can only `SELECT` from `public`; it has no access to the
-`recrawl` schema.
+metric hard-codes. The role can only `SELECT` from `public`. The recrawl keeps no
+tables here; it reads only the live run from `model_runs` ([`RECRAWL.md`](RECRAWL.md)).
 
 **Self-check.** `verify-live --batch <b>` sends the metric's query as `select`.
 `indexed_metric_rate` equals the metric's `indexed_rate`: canonical golden URLs found ÷
@@ -280,7 +344,7 @@ distinct canonical golden URLs.
 | Setting | Reason |
 |---|---|
 | `profiles: [job]`, used with `run --rm` | one container per command; `up` starts nothing |
-| except `recrawl-plan`, `recrawl-archive` (`profiles: [recrawl]`) | long-running loops with `restart: unless-stopped`, one instance each (advisory lock). `recrawl-plan` uses `network_mode: host` to reach the crawler API on `127.0.0.1:4000`; both mount `/data/manual_bulk_crawls/results` read-only and `/data/isel` writable |
+| except `recrawl-push`, `recrawl-pull` (`profiles: [recrawl]`) | long-running loops with `restart: unless-stopped`, one instance each. Both reach the crawler API over HTTP on Host2's LAN address with the `recrawl_api_token` secret and mount `/data/isel` writable |
 | `read_only: true`, `tmpfs: /tmp` | only `/work` is writable |
 | secrets as `<NAME>_FILE` | DSNs never appear in `docker inspect`, env or logs |
 | `mem_limit` 128g, `cpus` 32 | DuckDB 96 GB and LightGBM 32 threads fit below the limit |
@@ -295,6 +359,10 @@ The env file `~/isel/compose.env` (not in the repo) sets `ISEL_PROJECT`, `ISEL_I
 Each step below needs the owner's approval. `pull-full` also needs the TA's approval.
 
 ```bash
+# Mac: ship one commit of this directory; the server needs no repo access
+SHA=$(git rev-parse --short HEAD)
+git archive --format=tar "$SHA:IndexSelectionV2" | ssh ntu-sa2 "mkdir -p ~/isel/src-$SHA && tar -x -C ~/isel/src-$SHA"
+# Host2, in ~/isel/src-$SHA
 D="docker compose --env-file $HOME/isel/compose.env -f deploy/compose.compute.yaml"
 GIT_SHA=$SHA $D build --build-arg GIT_SHA=$SHA isel
 J="$D run --rm isel"
@@ -302,6 +370,7 @@ $J check-config
 $J pull-golden
 $J pull-dims
 $J pull-full --dry-run                 # catalog only: heap bytes, chunks, free disk
+                                       # on YugabyteDB: J="$D run --rm isel-yb" (§4.1)
 $J pull-full                           # rerun until shards_missing = 0
 $J derive-sample
 $J derive-positives
@@ -315,11 +384,12 @@ $J migrate-selectdb --stamp-baseline         # first run on the pre-Alembic :544
 $J publish --run-dir /work/full/selection/run=<id>
 $J swap --db-run-id <n>
 $J verify-live --batch <b>
-# recrawl (docs/RECRAWL.md), only after WebCrawler#84 (bd40191 or later) is merged and deployed
-$J recrawl-sync                        # after each swap; refused in the freeze window
-$J recrawl-plan --dry-run              # per-host capacity report; sends nothing
-$D --profile recrawl up -d recrawl-plan recrawl-archive
-$D --profile recrawl stop recrawl-plan # stops sending new jobs at once
+# recrawl (docs/RECRAWL.md), only after the crawler serves the bulk crawl v2 API
+$J recrawl-push --once                 # one push cycle: the request, the due docs, the batches
+$J recrawl-report                      # progress of the live list
+$D --profile recrawl up -d recrawl-push recrawl-pull
+$D --profile recrawl stop recrawl-push # stops sending new batches at once
+$J recrawl-compact                     # monthly: merge old outcome and text files
 ```
 
 **Recovery**

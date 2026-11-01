@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import tomllib
 import types
 import typing
@@ -46,11 +47,13 @@ class GuardCfg:
 
 @dataclass(frozen=True)
 class CrawlerDbCfg:
+    engine: str
     dsn_env: str
     connect_timeout_s: int
     num_shards: int
     url_table_fmt: str
     split_table: str
+    io_wait_types: list[str]
     session: dict[str, str]
 
 
@@ -147,7 +150,9 @@ class DuckDbCfg:
 @dataclass(frozen=True)
 class FullCfg:
     chunk_blocks: int
+    hash_chunks: int
     chunks_per_file: int
+    chunk_retries: int
     min_free_gb: float
     tau_margin: float
     parse_threads: int
@@ -188,34 +193,52 @@ class ScheduleCfg:
 @dataclass(frozen=True)
 class RecrawlCfg:
     api_url: str
+    api_token_file: str
     api_timeout_s: float
-    result_root: str
-    text_root: str
-    log_root: str
-    job_size: int
-    host_docs_per_job: int
-    max_jobs_inflight: int
-    plan_max_jobs: int
-    plan_interval_s: float
     api_backoff_s: float
-    claim_timeout_s: int
-    status_poll_s: int
-    result_ttl_days: int
-    max_resend: int
-    sweep_rows: int
+    root: str
+    batch_urls: int
+    result_quota_gb: float
+    expires_days: int
+    due_interval_h: float
+    clock_skew_s: int
+    long_poll_s: int
+    pull_batch_s: float
+    pull_batch_segments: int
+    pull_batch_mb: int
     stale_days: int
     retry_base_s: int
     retry_max_s: int
     max_attempts: int
     robots_retry_days: int
-    host_pause_max_s: int
-    archive_interval_s: float
     archive_workers: int
     min_free_gb: int
     max_body_chars: int
-    sync_chunk_rows: int
-    min_gap_s: float
-    report_days: list[int]
+
+
+@dataclass(frozen=True)
+class TextIndexCfg:
+    url: str
+    timeout_s: float
+    alias: str
+    settings_file: str
+    shards: int
+    query_type: str
+    fields: list[str]
+    k: int
+    read_batch_rows: int
+    bulk_bytes: int
+    bulk_workers: int
+    retries: int
+    backoff_s: float
+    lease_wait_s: float
+    force_merge_segments: int
+    keep_prev: bool
+    lookup_chunk: int
+    warmup_queries: int
+    flood_free_ratio: float
+    expected_bytes_per_doc: int
+    progress_every: int
 
 
 @dataclass(frozen=True)
@@ -237,6 +260,7 @@ class Config:
     selectdb: SelectDbCfg
     schedule: ScheduleCfg
     recrawl: RecrawlCfg
+    text_index: TextIndexCfg
 
     @property
     def work_dir(self) -> Path:
@@ -258,6 +282,12 @@ LGBM_THREAD_ALIASES = ("n_jobs", "nthread", "nthreads", "num_thread")
 # crawlerdb session settings that fix the CSV text the full export parses: other
 # values fail the parse, or round url_score (extra_float_digits < 1).
 CSV_SESSION = {"datestyle": "ISO", "extra_float_digits": "1", "client_encoding": "UTF8"}
+QUERY_TYPES = ("combined_fields", "most_fields", "best_fields")
+CRAWLERDB_ENGINES = ("postgres", "yugabyte")
+# yb_hash_code() returns a uint16, so a YugabyteDB shard table spans [0, 65536).
+YB_HASH_SPACE = 65536
+# OpenSearch index names are lowercase; the physical indices add "-<utc id>".
+INDEX_ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 
 def _deep_merge(base: dict[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
@@ -395,6 +425,9 @@ def _validate(cfg: Config) -> None:
             raise ConfigError(message)
 
     need(cfg.crawlerdb.num_shards > 0, "crawlerdb.num_shards must be > 0")
+    need(cfg.crawlerdb.engine in CRAWLERDB_ENGINES,
+         f"crawlerdb.engine must be one of {CRAWLERDB_ENGINES}")
+    need(bool(cfg.crawlerdb.io_wait_types), "crawlerdb.io_wait_types must not be empty")
     _validate_guard(cfg.guard, need)
     _validate_session("crawlerdb", cfg.crawlerdb.session, cfg.guard, need)
     _validate_session("metricdb", cfg.metricdb.session, cfg.guard, need)
@@ -440,37 +473,65 @@ def _validate(cfg: Config) -> None:
     _validate_full(cfg, need)
     _validate_selectdb(cfg, need)
     _validate_recrawl(cfg, need)
+    _validate_text_index(cfg, need)
 
 
 def _validate_recrawl(cfg: Config, need: Any) -> None:
     r = cfg.recrawl
     need(r.api_url.startswith(("http://", "https://")) and not r.api_url.endswith("/"),
          "recrawl.api_url must be an http(s) URL without a trailing slash")
-    need(len({r.result_root, r.text_root, r.log_root}) == 3,
-         "recrawl.result_root, text_root and log_root must differ")
-    need(min(r.job_size, r.host_docs_per_job, r.max_jobs_inflight, r.plan_max_jobs,
-             r.claim_timeout_s, r.sweep_rows,
-             r.stale_days, r.retry_base_s, r.max_attempts, r.robots_retry_days,
-             r.host_pause_max_s, r.sync_chunk_rows, r.max_body_chars, r.archive_workers) > 0,
+    need(bool(r.api_token_file) and bool(r.root),
+         "recrawl.api_token_file and recrawl.root must be set")
+    need(min(r.batch_urls, r.stale_days, r.retry_base_s, r.max_attempts, r.robots_retry_days,
+             r.max_body_chars, r.archive_workers, r.pull_batch_segments, r.pull_batch_mb) > 0,
          "recrawl sizes, counts and intervals must be > 0")
-    need(r.job_size <= 10000, "recrawl.job_size must be <= 10000, the API's max_urls")
-    need(r.host_docs_per_job <= r.job_size, "recrawl.host_docs_per_job must be <= job_size")
-    need(r.max_resend >= 0, "recrawl.max_resend must be >= 0")
-    need(min(r.plan_interval_s, r.archive_interval_s, r.min_gap_s, r.api_timeout_s,
-             r.api_backoff_s) > 0,
-         "recrawl.plan_interval_s, archive_interval_s, min_gap_s, api_timeout_s and "
-         "api_backoff_s must be > 0")
-    need(r.claim_timeout_s > r.api_timeout_s,
-         "recrawl.claim_timeout_s must be > api_timeout_s, or a slow reply looks lost")
-    need(1 <= r.result_ttl_days <= 60,
-         "recrawl.result_ttl_days must be 1 to 60, the API's ttl_days range")
-    need(0 <= r.status_poll_s < r.result_ttl_days * 86400,
-         "recrawl.status_poll_s must be >= 0 (every plan cycle) and shorter than "
-         "result_ttl_days")
+    need(r.batch_urls <= 10000, "recrawl.batch_urls must be <= 10000, the API's max_urls")
+    need(min(r.api_timeout_s, r.api_backoff_s, r.result_quota_gb, r.due_interval_h,
+             r.pull_batch_s) > 0,
+         "recrawl.api_timeout_s, api_backoff_s, result_quota_gb, due_interval_h and "
+         "pull_batch_s must be > 0")
+    need(1 <= r.expires_days <= 60, "recrawl.expires_days must be 1 to 60, the API's range")
+    need(0 <= r.long_poll_s <= 60, "recrawl.long_poll_s must be 0 to 60, the API's range")
+    need(0 <= r.clock_skew_s < r.retry_base_s,
+         "recrawl.clock_skew_s must be >= 0 and < retry_base_s, or a retry looks in flight")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
-    need(bool(r.report_days) and all(d > 0 for d in r.report_days),
-         "recrawl.report_days must be non-empty and > 0")
+
+
+def _field_weight(spec: str) -> float | None:
+    """The weight of a `name^weight` field spec (1.0 without `^`); None if malformed."""
+    name, sep, weight = spec.partition("^")
+    if not name or (sep and not weight):
+        return None
+    try:
+        return float(weight) if sep else 1.0
+    except ValueError:
+        return None
+
+
+def _validate_text_index(cfg: Config, need: Any) -> None:
+    t = cfg.text_index
+    need(t.url.startswith(("http://", "https://")) and not t.url.endswith("/"),
+         "text_index.url must be an http(s) URL without a trailing slash")
+    need(INDEX_ALIAS_RE.fullmatch(t.alias) is not None,
+         "text_index.alias must be lowercase letters, digits, '_' or '-'")
+    need(bool(t.settings_file), "text_index.settings_file must be set")
+    need(t.query_type in QUERY_TYPES, f"text_index.query_type must be one of {QUERY_TYPES}")
+    weights = [_field_weight(f) for f in t.fields]
+    need(bool(weights) and all(w is not None and w > 0 for w in weights),
+         "text_index.fields must be non-empty `name` or `name^weight` with weight > 0")
+    # Lucene's CombinedFieldQuery rejects weights below 1.
+    need(t.query_type != "combined_fields" or all(w >= 1 for w in weights),
+         "text_index.fields weights must be >= 1 with combined_fields")
+    need(min(t.timeout_s, t.lease_wait_s) > 0,
+         "text_index.timeout_s and lease_wait_s must be > 0")
+    need(min(t.shards, t.k, t.read_batch_rows, t.bulk_bytes, t.bulk_workers,
+             t.force_merge_segments, t.lookup_chunk, t.expected_bytes_per_doc,
+             t.progress_every) > 0,
+         "text_index sizes and counts must be > 0")
+    need(0 < t.flood_free_ratio < 1, "text_index.flood_free_ratio must be in (0, 1)")
+    need(min(t.retries, t.backoff_s, t.warmup_queries) >= 0,
+         "text_index.retries, backoff_s and warmup_queries must be >= 0")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:
@@ -480,6 +541,9 @@ def _validate_full(cfg: Config, need: Any) -> None:
     # A chunk read at the worst-case speed must still finish inside its timeout.
     need(f.chunk_blocks * 8192 <= g.min_mb_s * 1_000_000 * g.timeout_cap_s,
          "full.chunk_blocks must be readable at guard.min_mb_s within guard.timeout_cap_s")
+    need(f.hash_chunks > 0 and YB_HASH_SPACE % f.hash_chunks == 0,
+         f"full.hash_chunks must be > 0 and divide {YB_HASH_SPACE}")
+    need(f.chunk_retries >= 0, "full.chunk_retries must be >= 0")
     need(f.min_free_gb >= 0, "full.min_free_gb must be >= 0")
     need(f.parse_threads > 0, "full.parse_threads must be > 0")
     need(f.connections > 0 and f.max_heap_mb_s > 0,

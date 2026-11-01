@@ -1,0 +1,30 @@
+{
+  "settings": {
+    "codec": "best_compression",
+    "analysis": {
+      "char_filter": {
+        "url_split": {"type": "pattern_replace",
+                      "pattern": "(?:%[0-9A-Fa-f]{2}|[^\\p{L}\\p{N}\\p{M}%])+",
+                      "replacement": " "}
+      },
+      "analyzer": {
+        "text": {"type": "custom", "tokenizer": "icu_tokenizer", "filter": ["icu_folding"]},
+        "url": {"type": "custom", "char_filter": ["url_split"], "tokenizer": "icu_tokenizer",
+                "filter": ["icu_folding"]}
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "_source": {"excludes": ["body", "doc_id"]},
+    "properties": {
+      "doc_id": {"type": "unsigned_long", "index": false},
+      "url": {"type": "keyword", "index": false, "doc_values": false,
+              "fields": {"text": {"type": "text", "analyzer": "url"}}},
+      "lang": {"type": "keyword"},
+      "title": {"type": "text", "analyzer": "text"},
+      "description": {"type": "text", "analyzer": "text"},
+      "body": {"type": "text", "analyzer": "text", "index_options": "freqs"}
+    }
+  }
+}

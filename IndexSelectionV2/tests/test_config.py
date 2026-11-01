@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import BASE
+from conftest import BASE, ROOT
 
 from isel.config import ConfigError, load_config
 
@@ -15,7 +15,7 @@ def _overlay(tmp_path: Path, text: str) -> list[Path]:
 
 
 def test_base_config_loads(base_cfg):
-    assert base_cfg.eval.k_headline == 128_000_000
+    assert base_cfg.eval.k_headline == 64_000_000
     assert len(base_cfg.sha256()) == 64
 
 
@@ -38,6 +38,10 @@ def test_base_config_loads(base_cfg):
     ("[full]\nsample_percent = 'x'\n", "expected float"),
     ("[full]\nsample_percent = 0.00001\n", "at most 4 decimals"),
     ("[full]\nsample_salt = 'isel'\n", "differ from dataset.neg_salt"),
+    ("[crawlerdb]\nengine = 'cockroach'\n", "crawlerdb.engine must be one of"),
+    ("[crawlerdb]\nio_wait_types = []\n", "io_wait_types must not be empty"),
+    ("[full]\nhash_chunks = 3\n", "divide 65536"),
+    ("[full]\nchunk_retries = -1\n", "chunk_retries must be >= 0"),
     ("[full]\nagg_share = 1.0\n", "agg_share must be in"),
     ("[full]\nagg_salt = 'sample-v1'\n", "agg_salt must be set and differ"),
     ("[eval]\nk_headline = 5\n", "k_headline"),
@@ -48,10 +52,40 @@ def test_base_config_loads(base_cfg):
     ("[selectdb]\nadmin_dsn_env = 'ISEL_CRAWLERDB_DSN'\n", "must differ"),
     ("[selectdb]\nforbidden_ports = []\n", "forbidden_ports"),
     ("[schedule]\nswap_freeze_window = ['20:00', '11:30']\n", "swap_freeze_window"),
+    ("[text_index]\nurl = 'http://127.0.0.1:9200/'\n", "without a trailing slash"),
+    ("[text_index]\nalias = 'Isel-Text'\n", "alias must be lowercase"),
+    ("[text_index]\nquery_type = 'query_string'\n", "query_type must be one of"),
+    ("[text_index]\nfields = ['title^x']\n", "weight > 0"),
+    ("[text_index]\nfields = []\n", "must be non-empty"),
+    # Lucene's CombinedFieldQuery rejects a field weight below 1.
+    ("[text_index]\nquery_type = 'combined_fields'\nfields = ['title', 'body^0.5']\n",
+     "weights must be >= 1"),
+    ("[text_index]\nbulk_bytes = 0\n", "text_index sizes and counts must be > 0"),
+    ("[text_index]\nretries = -1\n", "retries, backoff_s and warmup_queries"),
+    ("[text_index]\nexpected_bytes_per_doc = 0\n", "text_index sizes and counts must be > 0"),
+    ("[text_index]\nprogress_every = 0\n", "text_index sizes and counts must be > 0"),
+    ("[text_index]\nflood_free_ratio = 1.0\n", "flood_free_ratio must be in"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
         load_config(_overlay(tmp_path, text))
+
+
+def test_yugabyte_overlay_switches_the_crawlerdb_engine(base_cfg):
+    cfg = load_config([BASE, ROOT / "config/container.toml",
+                       ROOT / "config/crawlerdb/yugabyte.toml"])
+    assert base_cfg.crawlerdb.engine == "postgres"
+    assert cfg.crawlerdb.engine == "yugabyte" and cfg.full.connections == 3
+    assert cfg.crawlerdb.dsn_env != base_cfg.crawlerdb.dsn_env
+    # The overlay adds follower reads on top of every base session setting.
+    assert cfg.crawlerdb.session == {**base_cfg.crawlerdb.session, "yb_read_from_followers": "on"}
+
+
+def test_host2_overlay_sets_the_text_index():
+    t = load_config([BASE, ROOT / "config/container.toml",
+                     ROOT / "config/text_index/host2.toml"]).text_index
+    assert (ROOT / Path(t.settings_file).relative_to("/app")).is_file()   # the image's copy
+    assert t.keep_prev is False and t.shards == 8
 
 
 def test_config_rejects_missing_key(tmp_path):

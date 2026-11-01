@@ -55,7 +55,7 @@ _WINDOW_HORIZON = timedelta(days=32)
 # Our parallel export sessions share one application_name; their own IO waits are
 # not load, while other backends slowed by our reads are.
 _IO_WAITERS_SQL = ("SELECT count(*) FROM pg_stat_activity WHERE state = 'active' "
-                   "AND wait_event_type = 'IO' "
+                   "AND wait_event_type = ANY(%s) "
                    "AND application_name <> current_setting('application_name')")
 
 
@@ -408,10 +408,11 @@ class ReadOnlySession:
     """A connection wrapper that only lets paced read statements through."""
 
     def __init__(self, conn: psycopg.Connection, pacer: Pacer | None = None,
-                 timeout_s: int | None = None) -> None:
+                 timeout_s: int | None = None, io_wait_types: Sequence[str] = ("IO",)) -> None:
         self.conn = conn
         self._pacer = pacer or Pacer(0.0)
         self.timeout_s = timeout_s
+        self._io_wait_types = list(io_wait_types)
         # Set after construction: the guard probes load through this session.
         self.guard: ReadGuard | None = None
 
@@ -424,7 +425,7 @@ class ReadOnlySession:
         """Active backends of other applications waiting on IO (not guarded)."""
         assert_read_only_sql(_IO_WAITERS_SQL)
         with self.conn.cursor() as cur:
-            cur.execute(_IO_WAITERS_SQL)
+            cur.execute(_IO_WAITERS_SQL, (self._io_wait_types,))
             return int(cur.fetchall()[0][0])
 
     def set_statement_timeout(self, seconds: int) -> None:
@@ -470,10 +471,12 @@ class ReadOnlySession:
 
 
 def _open(cfg: Config, dsn_env: str, app_suffix: str, session: Mapping[str, str],
-          connect_timeout_s: int, min_interval_s: float) -> ReadOnlySession:
+          connect_timeout_s: int, min_interval_s: float,
+          io_wait_types: Sequence[str] = ("IO",)) -> ReadOnlySession:
     conn = connect(require_env(dsn_env), app_name=f"{cfg.run.app_name}_{app_suffix}",
                    session=session, connect_timeout_s=connect_timeout_s)
-    read_only = ReadOnlySession(conn, Pacer(min_interval_s), timeout_s=timeout_seconds(session))
+    read_only = ReadOnlySession(conn, Pacer(min_interval_s), timeout_s=timeout_seconds(session),
+                                io_wait_types=io_wait_types)
     read_only.guard = ReadGuard(cfg.guard, read_only.io_waiters)
     return read_only
 
@@ -481,7 +484,7 @@ def _open(cfg: Config, dsn_env: str, app_suffix: str, session: Mapping[str, str]
 def open_crawlerdb(cfg: Config) -> ReadOnlySession:
     c = cfg.crawlerdb
     return _open(cfg, c.dsn_env, "crawler", c.session, c.connect_timeout_s,
-                 cfg.pull.min_interval_s)
+                 cfg.pull.min_interval_s, c.io_wait_types)
 
 
 def open_metricdb(cfg: Config) -> ReadOnlySession:
