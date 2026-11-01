@@ -205,6 +205,7 @@ class RecrawlCfg:
     long_poll_s: int
     pull_batch_s: float
     pull_batch_segments: int
+    pull_batch_mb: int
     stale_days: int
     retry_base_s: int
     retry_max_s: int
@@ -482,7 +483,7 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
     need(bool(r.api_token_file) and bool(r.root),
          "recrawl.api_token_file and recrawl.root must be set")
     need(min(r.batch_urls, r.stale_days, r.retry_base_s, r.max_attempts, r.robots_retry_days,
-             r.max_body_chars, r.archive_workers, r.pull_batch_segments) > 0,
+             r.max_body_chars, r.archive_workers, r.pull_batch_segments, r.pull_batch_mb) > 0,
          "recrawl sizes, counts and intervals must be > 0")
     need(r.batch_urls <= 10000, "recrawl.batch_urls must be <= 10000, the API's max_urls")
     need(min(r.api_timeout_s, r.api_backoff_s, r.result_quota_gb, r.due_interval_h,

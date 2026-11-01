@@ -284,6 +284,23 @@ def test_the_same_segments_twice_write_the_same_files(cfg, api):
     assert {p: p.read_bytes() for p in layout(cfg).root.glob("[ot]*/**/*.parquet")} == first
 
 
+def test_pull_bounds_a_batch_by_size(cfg, api):
+    live = make_run(cfg, 1, URLS)
+    push_cycle(cfg, layout(cfg), client(api), live, clock=lambda: T0)
+    rid = request_id(cfg)
+    for u in URLS[:3]:
+        api.crawl({u: Page(html=GOOD)}, only={str(md5_number_lower(u))})
+    small = replace(cfg, "recrawl", pull_batch_mb=1)
+    sizes = [len(b) for b in api.requests[rid].segments.values()]
+    assert sum(sizes) < 1e6                            # all three fit in one batch
+    assert Puller(small, client(api)).cycle(force=True, now=T0)["segments"] == 3
+    for u in URLS[3:]:
+        api.crawl({u: Page(html=GOOD)}, only={str(md5_number_lower(u))})
+    tiny = replace(cfg, "recrawl", pull_batch_mb=1, pull_batch_segments=1)
+    assert Puller(tiny, client(api)).cycle(force=True, now=T0)["segments"] == 1
+    assert len(api.requests[rid].segments) == 1
+
+
 def test_pull_stops_below_its_free_space(cfg, api):
     stats = Puller(replace(cfg, "recrawl", min_free_gb=10**9), client(api)).cycle(force=True)
     assert stats["disk_full"] and stats["segments"] == 0

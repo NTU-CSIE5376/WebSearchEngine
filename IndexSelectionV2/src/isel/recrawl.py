@@ -568,12 +568,19 @@ class Puller:
             if listed.status != 200:
                 stats["api_error"] = f"GET segments {request_id}: {listed.status} {listed.error}"
                 return _wait(stats, r.api_backoff_s, paused=True)
-            names = [s["name"] for s in listed.body["segments"]][:r.pull_batch_segments]
+            names, size, full = [], 0, False
+            for seg in listed.body["segments"]:
+                # A segment unpacks to several times its size; bound what one batch holds.
+                if names and (len(names) == r.pull_batch_segments
+                              or size + seg["bytes"] > r.pull_batch_mb * 1e6):
+                    full = True
+                    break
+                names.append(seg["name"])
+                size += seg["bytes"]
             if not names:
                 continue
             seen = min(self.first_seen.setdefault((request_id, n), self.clock()) for n in names)
-            if not (force or len(names) >= r.pull_batch_segments
-                    or self.clock() - seen >= r.pull_batch_s):
+            if not (force or full or self.clock() - seen >= r.pull_batch_s):
                 continue
             segments = []
             for name in names:

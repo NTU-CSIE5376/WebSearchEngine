@@ -253,7 +253,9 @@ due_interval_h = 24                      # how often the due docs are computed a
 clock_skew_s = 300                       # Host2 vs Host3 clock tolerance; < retry_base_s
 long_poll_s = 30                         # GET segments waits this long for new results
 pull_batch_s = 300.0                     # pull waits this long for pull_batch_segments
-pull_batch_segments = 64                 # segments per text/outcome file
+pull_batch_segments = 64                 # segments per text/outcome file, at most
+pull_batch_mb = 256                      # gzip MB per batch, at most; a segment unpacks to
+                                         # several times its size and the pull has 8 GB
 stale_days = 30                          # uniform revisit interval
 retry_base_s = 600                       # failed doc: retry_base_s * 2^(attempts - 1)
 retry_max_s = 86400

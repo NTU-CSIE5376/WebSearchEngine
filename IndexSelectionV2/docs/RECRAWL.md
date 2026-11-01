@@ -145,8 +145,10 @@ quota then fills and its manual dispatch for isel stops.
 
 1. List this tenant's requests; take those with unacked segments and the current one.
    Long-poll (`long_poll_s`, 30 s) only when the current request is the only one.
-2. Wait until `pull_batch_segments` (64) segments are listed or the oldest has waited
-   `pull_batch_s` (300 s); `--once` takes what is there.
+2. Take segments in order up to `pull_batch_segments` (64) or `pull_batch_mb` (256 MB
+   of gzip; a segment unpacks to several times its size and the pull has 8 GB). Wait
+   until the batch is full or its oldest segment has waited `pull_batch_s` (300 s);
+   `--once` takes what is there.
 3. Download them, check every record (keys, `id` a u64, status, types, UTC times),
    extract the text of HTML records in `archive_workers` (8) spawn processes
    (Resiliparse: title, description, main-content body up to 200,000 chars, language),
