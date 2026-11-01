@@ -273,7 +273,7 @@ pages themselves are fetched and indexed among the crawl pages.
 
 - **Fetch.** A Mac fetched each of batch 20's 14,822 golden URLs once on 2026-10-23,
   08:01–10:01 UTC (`golden_fetch.py`). It sent at most one request per host every 5 s
-  (0.2 qps, robots.txt included, as the recrawl rule), obeyed robots.txt, made no
+  (0.2 qps, robots.txt included, the recrawl rule at the time), obeyed robots.txt, made no
   retries, and named the course in its User-Agent. A 2xx HTML page became one
   `TEXT_SCHEMA` row through `isel.extract`. Its `url` and `doc_id` come from the golden
   canonical URL, so a hit matches as in `text-index-eval`.
