@@ -1,10 +1,9 @@
-"""The crawlerdb read path against a throwaway local YugabyteDB, checked against Postgres.
+"""The crawlerdb read path against a throwaway local YugabyteDB.
 
-Run with `uv run pytest -m yugabyte`. It starts the production YugabyteDB version
-and the `postgres:16` container of `test_integration_pg`, loads the same rows into
-both, and requires the two full exports to be equal row for row. Nothing here
-touches a course server: both containers listen on 127.0.0.1 only and are removed
-when the module ends.
+Run with `uv run pytest -m yugabyte`. It starts the course cluster's YugabyteDB
+version, loads the rows of `test_integration_pg`, and checks the full export
+against psycopg's own decoding of the same rows. Nothing here touches a course
+server: the container listens on 127.0.0.1 only and is removed when the module ends.
 """
 
 from __future__ import annotations
@@ -17,19 +16,11 @@ import psycopg
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from conftest import BASE, ROOT, replace
-from test_integration_pg import (  # noqa: F401 - `dsn` is the Postgres fixture
-    ALLOWED,
-    SHARDS,
-    _free_port,
-    _load,
-    _urls,
-    dsn,
-)
+from conftest import replace
+from test_integration_pg import ALLOWED, SHARDS, _free_port, _load, _urls
 
-from isel.config import load_config
-from isel.pg import ReadGuard, open_crawlerdb
-from isel.pull import FULL_SCHEMA, estimate_full, full_sql, pull_dims, pull_full
+from isel.pg import ReadGuard, ReadOnlyViolation, open_crawlerdb
+from isel.pull import CRAWL_COLUMNS, FULL_SCHEMA, estimate_full, full_sql, pull_dims, pull_full
 
 pytestmark = pytest.mark.yugabyte
 
@@ -65,21 +56,14 @@ def yb_dsn():
         subprocess.run(["docker", "stop", name], check=False, capture_output=True)
 
 
-def _cfg(tmp_path, monkeypatch, url, engine):
-    overlays = [ROOT / "config/crawlerdb/yugabyte.toml"] if engine == "yugabyte" else []
-    cfg = load_config([BASE, *overlays])
-    monkeypatch.setenv(cfg.crawlerdb.dsn_env, url)
-    cfg = replace(cfg, "run", work_dir=str(tmp_path))
+@pytest.fixture
+def cfg(base_cfg, tmp_path, monkeypatch, yb_dsn):
+    monkeypatch.setenv(base_cfg.crawlerdb.dsn_env, yb_dsn)
+    cfg = replace(base_cfg, "run", work_dir=str(tmp_path))
     cfg = replace(cfg, "crawlerdb", num_shards=SHARDS)
     cfg = replace(cfg, "routing", overrides={})
     cfg = replace(cfg, "pull", min_interval_s=0.0)
-    return replace(cfg, "full", chunk_blocks=1, hash_chunks=8, chunks_per_file=3,
-                   min_free_gb=0.0)
-
-
-@pytest.fixture
-def yb_cfg(tmp_path, monkeypatch, yb_dsn):
-    return _cfg(tmp_path, monkeypatch, yb_dsn, "yugabyte")
+    return replace(cfg, "full", hash_chunks=8, chunks_per_file=3, min_free_gb=0.0)
 
 
 def _session(cfg):
@@ -88,7 +72,7 @@ def _session(cfg):
     return session
 
 
-def _export(cfg, out, connections=2):
+def _export(cfg, out, connections):
     sessions = [_session(cfg) for _ in range(connections)]
     try:
         summary = pull_full(cfg, sessions, out, now=ALLOWED)
@@ -99,26 +83,28 @@ def _export(cfg, out, connections=2):
     return summary, table.cast(FULL_SCHEMA).sort_by("url")
 
 
-def test_every_session_setting_applies_on_yugabyte(yb_cfg, tmp_path):
-    session = _session(yb_cfg)
+def test_every_session_setting_applies_and_the_gate_holds(cfg, tmp_path):
+    session = _session(cfg)
     try:
-        for name in yb_cfg.crawlerdb.session:
+        for name in cfg.crawlerdb.session:
             assert session.fetchone(f"SHOW {name}") is not None, name
         assert session.fetchone("SHOW default_transaction_read_only") == ("on",)
         assert session.fetchone("SHOW yb_read_from_followers") == ("on",)
         assert session.io_waiters() >= 0
-        assert pull_dims(yb_cfg, session, tmp_path / "dims")["split_hosts"] == 1
+        assert pull_dims(cfg, session, tmp_path / "dims")["split_hosts"] == 1
         with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
             session.conn.execute("CREATE TABLE should_not_exist (a int)")
+        with pytest.raises(ReadOnlyViolation):
+            session.fetchall("SELECT \"set_config\"('default_transaction_read_only', 'off', false)")
     finally:
         session.close()
 
 
-def test_a_hash_range_reads_only_its_keys_through_the_primary_key(yb_cfg):
-    session = _session(yb_cfg)
+def test_a_hash_range_reads_only_its_keys_through_the_primary_key(cfg):
+    session = _session(cfg)
     try:
-        assert estimate_full(yb_cfg, session)["tservers"] == 1
-        copy = full_sql(yb_cfg, 0, 8192, 16384)
+        assert estimate_full(cfg, session)["tservers"] == 1
+        copy = full_sql(cfg, 0, 8192, 16384)
         select = copy.removeprefix("COPY (").removesuffix(") TO STDOUT (FORMAT CSV)")
         plan = "\n".join(row[0] for row in session.fetchall(f"EXPLAIN {select}"))
     finally:
@@ -126,13 +112,20 @@ def test_a_hash_range_reads_only_its_keys_through_the_primary_key(yb_cfg):
     assert "Index Cond" in plan and "yb_hash_code(url)" in plan, plan
 
 
-def test_yugabyte_and_postgres_exports_are_equal_row_for_row(
-        tmp_path, monkeypatch, yb_dsn, dsn):  # noqa: F811
-    yb_cfg = _cfg(tmp_path / "yb", monkeypatch, yb_dsn, "yugabyte")
-    pg_cfg = _cfg(tmp_path / "pg", monkeypatch, dsn, "postgres")
-    yb_out, yb_rows = _export(yb_cfg, tmp_path / "yb" / "export", connections=3)
-    pg_out, pg_rows = _export(pg_cfg, tmp_path / "pg" / "export")
+def test_the_full_export_reads_every_crawled_row_once_as_psycopg_decodes_it(cfg, tmp_path,
+                                                                           yb_dsn):
+    summary, exported = _export(cfg, tmp_path / "export", connections=3)
     crawled = sorted(u for n, u in enumerate(_urls()) if n % 10 != 0)
-    assert yb_out["shards_missing"] == pg_out["shards_missing"] == 0
-    assert yb_rows.column("url").to_pylist() == crawled
-    assert yb_rows.equals(pg_rows)
+    assert summary["shards_missing"] == 0 and summary["rows"] == len(crawled)
+    assert exported.column("url").to_pylist() == crawled
+    columns = ", ".join(f"{expr} AS {name}" for name, expr, _ in CRAWL_COLUMNS)
+    rows = []
+    with psycopg.connect(yb_dsn) as conn:
+        for shard in range(SHARDS):
+            cur = conn.execute(f"SELECT {columns} FROM url_state_current_{shard:03d} "
+                               "WHERE last_fetch_ok IS NOT NULL")
+            names = [d.name for d in cur.description]
+            rows += [{**dict(zip(names, r, strict=True)), "shard": shard} for r in cur]
+    decoded = pa.Table.from_pylist(rows, schema=FULL_SCHEMA).sort_by("url")
+    assert exported.equals(decoded)
+    assert sum("\n" in u for u in exported.column("url").to_pylist()) == 9

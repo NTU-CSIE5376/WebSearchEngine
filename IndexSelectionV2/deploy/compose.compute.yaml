@@ -20,12 +20,13 @@ services:
     network_mode: bridge
     user: "1014:1015"
     environment:                        # DSNs come from secret files, never from env values
-      ISEL_CRAWLERDB_DSN_FILE: /run/secrets/crawlerdb_dsn
+      # crawlerdb on YugabyteDB. A new secret name, so a stale Host1 DSN cannot be read.
+      ISEL_CRAWLERDB_DSN_FILE: /run/secrets/crawlerdb_yb_dsn
       ISEL_METRICDB_DSN_FILE: /run/secrets/metricdb_dsn
       ISEL_SELECTDB_ADMIN_DSN_FILE: /run/secrets/selectdb_admin_dsn
       ISEL_SELECTDB_READER_DSN_FILE: /run/secrets/selectdb_reader_dsn
       ISEL_SELECTDB_READER_PASSWORD_FILE: /run/secrets/selectdb_reader_password
-    secrets: [crawlerdb_dsn, metricdb_dsn, selectdb_admin_dsn, selectdb_reader_dsn,
+    secrets: [crawlerdb_yb_dsn, metricdb_dsn, selectdb_admin_dsn, selectdb_reader_dsn,
               selectdb_reader_password]
     volumes:
       - ${ISEL_WORK_DIR:?set it in the env file (DESIGN §12.5)}:/work
@@ -40,19 +41,6 @@ services:
     logging:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
-
-  # The same jobs reading crawlerdb on YugabyteDB (DESIGN §4.1). Only the crawlerdb
-  # engine and DSN change; every other database and path is the one `isel` uses:
-  #   docker compose ... run --rm isel-yb pull-full --dry-run
-  isel-yb:
-    extends: {service: isel}
-    profiles: [job]
-    entrypoint: ["isel", "--config", "/app/config/isel.toml",
-                 "--config", "/app/config/container.toml",
-                 "--config", "/app/config/crawlerdb/yugabyte.toml"]
-    environment:
-      ISEL_CRAWLERDB_YB_DSN_FILE: /run/secrets/crawlerdb_yb_dsn
-    secrets: [crawlerdb_yb_dsn]
 
   # Recrawl loops (docs/RECRAWL.md). Started only after the crawler serves the
   # manual-bulk-crawl API of WebCrawler PR #84 at bd40191 or later: isel relies on its
@@ -88,8 +76,6 @@ services:
     cpus: 8                             # archive_workers; 6.5 ms per 590 KB page each
 
 secrets:
-  crawlerdb_dsn:
-    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/crawlerdb_dsn
   crawlerdb_yb_dsn:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/crawlerdb_yb_dsn
   metricdb_dsn:

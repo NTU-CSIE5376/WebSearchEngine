@@ -98,7 +98,7 @@ def write_export(world: World, work_dir: Path, extra: list[dict] = (),
                                  / f"part-{lo:010d}-{lo + 1:010d}.parquet")
     atomic_write_json(work_dir / "full" / "export" / "_meta.json", {
         "started_at": started_at.isoformat(), "finished_at": started_at.isoformat(),
-        "frozen_probe": {"tuple_changes": 0}, "shards_done": shards})
+        "shards_done": shards})
 
 
 def write_work_dir(world: World, work_dir: Path, sample_percent: float = 100.0) -> None:

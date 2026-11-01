@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import BASE, ROOT
+from conftest import BASE
 
 from isel.config import ConfigError, load_config
 
@@ -28,17 +28,15 @@ def test_base_config_loads(base_cfg):
     ("[guard]\ntimeout_cap_s = 2880\n", "hourly open gap"),
     ("[guard]\nmonth_window = ['20:00', '00:00']\n", "wrap"),
     ("[guard]\nmonth_window = ['00:00', '25:00']\n", "HH:MM"),
-    ("[full]\nchunk_blocks = 1000000\n", "readable at guard.min_mb_s"),
     ("[full]\nparse_threads = 0\n", "full.parse_threads must be > 0"),
-    ("[full]\nconnections = 0\n", "full.connections and full.max_heap_mb_s must be > 0"),
-    ("[full]\nmax_heap_mb_s = 0.0\n", "full.connections and full.max_heap_mb_s must be > 0"),
+    ("[full]\nconnections = 0\n", "full.connections and full.max_mb_s must be > 0"),
+    ("[full]\nmax_mb_s = 0.0\n", "full.connections and full.max_mb_s must be > 0"),
     # extra_float_digits = 0 would round url_score in the CSV text the full export parses.
     ("[crawlerdb.session]\nextra_float_digits = '0'\n", "CSV text"),
     ("[crawlerdb.session]\ndatestyle = 'SQL'\n", "CSV text"),
     ("[full]\nsample_percent = 'x'\n", "expected float"),
     ("[full]\nsample_percent = 0.00001\n", "at most 4 decimals"),
     ("[full]\nsample_salt = 'isel'\n", "differ from dataset.neg_salt"),
-    ("[crawlerdb]\nengine = 'cockroach'\n", "crawlerdb.engine must be one of"),
     ("[crawlerdb]\nio_wait_types = []\n", "io_wait_types must not be empty"),
     ("[full]\nhash_chunks = 3\n", "divide 65536"),
     ("[full]\nchunk_retries = -1\n", "chunk_retries must be >= 0"),
@@ -58,14 +56,9 @@ def test_config_rejects_bad_values(tmp_path, text, message):
         load_config(_overlay(tmp_path, text))
 
 
-def test_yugabyte_overlay_switches_the_crawlerdb_engine(base_cfg):
-    cfg = load_config([BASE, ROOT / "config/container.toml",
-                       ROOT / "config/crawlerdb/yugabyte.toml"])
-    assert base_cfg.crawlerdb.engine == "postgres"
-    assert cfg.crawlerdb.engine == "yugabyte" and cfg.full.connections == 3
-    assert cfg.crawlerdb.dsn_env != base_cfg.crawlerdb.dsn_env
-    # The overlay adds follower reads on top of every base session setting.
-    assert cfg.crawlerdb.session == {**base_cfg.crawlerdb.session, "yb_read_from_followers": "on"}
+def test_crawlerdb_reads_yugabyte_followers(base_cfg):
+    assert base_cfg.crawlerdb.session["yb_read_from_followers"] == "on"
+    assert base_cfg.full.connections == 3       # one session per tserver
 
 
 def test_config_rejects_missing_key(tmp_path):

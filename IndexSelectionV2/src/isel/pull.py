@@ -8,22 +8,19 @@ ranges, one short `COPY ... (FORMAT CSV)` per range; pyarrow parses the CSV in
 C++ and a worker thread writes it while the next range streams. No statement
 sorts or aggregates on the server.
 
-The key space depends on `crawlerdb.engine`. On PostgreSQL it is the heap: a
-ctid block range is a TID range scan that reads only those blocks. YugabyteDB
-has no ctid; a shard table is hash-sharded on `url`, so its key space is
-`yb_hash_code(url)` in [0, 65536) and a range is a primary-key scan that only
-asks the tablets holding it. Both write the same rows into the same files.
+crawlerdb is YugabyteDB (YSQL). A shard table is hash-sharded on `url`, so its
+key space is `yb_hash_code(url)` in [0, 65536) and a range is a primary-key scan
+that only asks the tablets holding it.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import queue
 import shutil
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -79,9 +76,6 @@ _CSV_CONVERT = pcsv.ConvertOptions(
     true_values=["t"], false_values=["f"], null_values=[""],
     strings_can_be_null=True, quoted_strings_can_be_null=False)
 _CSV_PARSE = pcsv.ParseOptions(newlines_in_values=True)
-_IO_SQL = ("SELECT w.wal_bytes, w.wal_fpi, (SELECT coalesce(sum(writes), 0) FROM pg_stat_io "
-           "WHERE backend_type = 'client backend') FROM pg_stat_wal w")
-PAGE_BYTES = 8192
 # A shard that hits its timeout or lock_timeout, or keeps failing serialization
 # (a YugabyteDB read restart), is retried on the next run.
 _RETRYABLE = (errors.QueryCanceled, errors.LockNotAvailable, errors.SerializationFailure)
@@ -103,49 +97,9 @@ def _select_list(cfg: Config, columns: Sequence[tuple[str, str, int]] = CRAWL_CO
     return ", ".join(f"{expr} AS {name}" for name, expr, _ in columns)
 
 
-def _yugabyte(cfg: Config) -> bool:
-    return cfg.crawlerdb.engine == "yugabyte"
-
-
 def _chunk_span(cfg: Config) -> int:
-    """Keys per COPY: heap blocks on PostgreSQL, hash codes on YugabyteDB."""
-    return YB_HASH_SPACE // cfg.full.hash_chunks if _yugabyte(cfg) else cfg.full.chunk_blocks
-
-
-def _key_end(cfg: Config, session: ReadOnlySession, shard: int) -> int:
-    """End of a shard's key space; only the PostgreSQL heap grows while it is read."""
-    return YB_HASH_SPACE if _yugabyte(cfg) else _relation_blocks(cfg, session, shard)
-
-
-def _heap_bytes(cfg: Config, lo: int, hi: int) -> int | None:
-    """Heap bytes of a key range, known before the read only on PostgreSQL."""
-    return None if _yugabyte(cfg) else (hi - lo) * PAGE_BYTES
-
-
-def _timeout_for_bytes(cfg: Config, heap_bytes: float) -> int:
-    g = cfg.guard
-    seconds = math.ceil(heap_bytes / (g.min_mb_s * 1_000_000))
-    return min(max(seconds, g.timeout_floor_s), g.timeout_cap_s)
-
-
-def probe_frozen(cfg: Config, session: ReadOnlySession, now: datetime) -> dict[str, Any]:
-    """Server start time and cumulative row writes on the URL tables.
-
-    Two equal probes mean no row of `url_state_current_*` was inserted, updated or
-    deleted in between. YugabyteDB counts writes per node only, so there the
-    count is not recorded.
-    """
-    if _yugabyte(cfg):
-        (started,) = session.fetchone("SELECT pg_postmaster_start_time()")
-        return {"postmaster_start": started.isoformat(), "tuple_changes": None,
-                "probed_at": now.isoformat()}
-    prefix = cfg.crawlerdb.url_table_fmt.split("{", 1)[0]
-    started, changes = session.fetchone(
-        "SELECT pg_postmaster_start_time(), "
-        "coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::int8 "
-        "FROM pg_stat_user_tables WHERE starts_with(relname, %s)", (prefix,))
-    return {"postmaster_start": started.isoformat(), "tuple_changes": int(changes),
-            "probed_at": now.isoformat()}
+    """Hash codes per COPY."""
+    return YB_HASH_SPACE // cfg.full.hash_chunks
 
 
 def pull_dims(cfg: Config, session: ReadOnlySession, out_dir: Path) -> dict[str, Any]:
@@ -160,20 +114,9 @@ def pull_dims(cfg: Config, session: ReadOnlySession, out_dir: Path) -> dict[str,
             "pending": sum(r[1] is None for r in rows)}
 
 
-def _relation_blocks(cfg: Config, session: ReadOnlySession, shard: int) -> int:
-    """Current heap size of a shard table in blocks (not the stale `relpages`); 0 if missing."""
-    (blocks,) = session.fetchone(
-        "SELECT coalesce(pg_relation_size(to_regclass(%s)), 0) "
-        "/ current_setting('block_size')::int8", (_table_name(cfg, shard),))
-    return int(blocks)
-
-
 def full_sql(cfg: Config, shard: int, lo: int, hi: int) -> str:
-    """One COPY over keys [lo, hi) of a shard: heap blocks, or hash codes on YugabyteDB."""
-    if _yugabyte(cfg):
-        keys = f"yb_hash_code(url) >= {int(lo)} AND yb_hash_code(url) < {int(hi)}"
-    else:
-        keys = f"ctid >= '({int(lo)},0)'::tid AND ctid < '({int(hi)},0)'::tid"
+    """One COPY over hash codes [lo, hi) of a shard."""
+    keys = f"yb_hash_code(url) >= {int(lo)} AND yb_hash_code(url) < {int(hi)}"
     return (f"COPY (SELECT {_select_list(cfg, FULL_COLUMNS)} FROM {_table_name(cfg, shard)} "
             f"WHERE {keys} AND last_fetch_ok IS NOT NULL) TO STDOUT (FORMAT CSV)")
 
@@ -189,40 +132,16 @@ def _csv_table(data: bytes | bytearray, shard: int) -> pa.Table:
     return table.cast(FULL_SCHEMA)
 
 
-def _io_counters(cfg: Config, session: ReadOnlySession) -> dict[str, int]:
-    """Cluster-wide WAL and client-backend block writes, to compare a shard with idle time.
-
-    YugabyteDB has no `pg_stat_io` and writes no PostgreSQL WAL, so nothing is counted there.
-    """
-    if _yugabyte(cfg):
-        return {}
-    wal_bytes, wal_fpi, writes = session.fetchone(_IO_SQL)
-    return {"wal_bytes": int(wal_bytes), "wal_fpi": int(wal_fpi),
-            "client_backend_writes": int(writes)}
-
-
 def estimate_full(cfg: Config, session: ReadOnlySession,
                   shards: Iterable[int] | None = None) -> dict[str, Any]:
-    """Reads only catalog sizes: heap bytes, COPY statements and worst-case hours.
+    """Counts the COPY statements and the tservers the sessions can spread over.
 
-    YugabyteDB reports no heap size, so there it counts the COPY statements and
-    the tservers the sessions can spread over.
+    YugabyteDB reports no heap size, so the read time is not estimated.
     """
-    if _yugabyte(cfg):
-        chosen = _shards(cfg, shards)
-        (nodes,) = session.fetchone("SELECT count(*) FROM yb_servers()")
-        return {"shards": len(chosen), "chunks": len(chosen) * cfg.full.hash_chunks,
-                "chunk_timeout_s": cfg.guard.timeout_cap_s, "tservers": int(nodes)}
-    blocks = {s: _relation_blocks(cfg, session, s) for s in _shards(cfg, shards)}
-    heap = sum(blocks.values()) * PAGE_BYTES
-    return {
-        "shards": len(blocks), "heap_bytes": heap,
-        "chunks": sum(math.ceil(b / cfg.full.chunk_blocks) for b in blocks.values()),
-        "chunk_timeout_s": _timeout_for_bytes(cfg, cfg.full.chunk_blocks * PAGE_BYTES),
-        "hours_at_min_mb_s": round(heap / (cfg.guard.min_mb_s * 1_000_000) / 3600, 1),
-        "largest_shard": max(blocks, key=blocks.get) if blocks else None,
-        "blocks": {str(s): b for s, b in blocks.items()},
-    }
+    chosen = _shards(cfg, shards)
+    (nodes,) = session.fetchone("SELECT count(*) FROM yb_servers()")
+    return {"shards": len(chosen), "chunks": len(chosen) * cfg.full.hash_chunks,
+            "chunk_timeout_s": cfg.guard.timeout_cap_s, "tservers": int(nodes)}
 
 
 def _check_disk(cfg: Config, path: Path) -> None:
@@ -251,65 +170,45 @@ def _export_file(cfg: Config, session: ReadOnlySession, final: Path, shard: int,
     """Streams keys [lo, hi) of one shard into `final`, one COPY per chunk.
 
     A worker thread parses and writes each chunk while the next COPY streams;
-    pyarrow releases the GIL, so the server rarely waits for this client. On
-    PostgreSQL a chunk reserves its heap bytes from `rate` before it reads; on
-    YugabyteDB, where the size is unknown, the CSV bytes it returned are charged
-    after it.
+    pyarrow releases the GIL, so the server rarely waits for this client. A
+    chunk's size is unknown before it is read, so the CSV bytes it returned are
+    charged to `rate` after it.
     """
     span = _chunk_span(cfg)
     start, read = time.monotonic(), 0
+    session.set_statement_timeout(cfg.guard.timeout_cap_s)
     with AtomicParquetWriter(final, FULL_SCHEMA) as writer, ThreadPoolExecutor(1) as pool:
         pending = None
         for c_lo in range(lo, hi, span):
             c_hi = min(c_lo + span, hi)
-            heap = _heap_bytes(cfg, c_lo, c_hi)
-            if heap is None:
-                session.set_statement_timeout(cfg.guard.timeout_cap_s)
-            else:
-                session.set_statement_timeout(_timeout_for_bytes(cfg, heap))
-                rate.wait(heap)
             data = _copy_chunk(cfg, session, full_sql(cfg, shard, c_lo, c_hi), shard)
-            read += len(data) if heap is None else heap
-            if heap is None:
-                rate.wait(len(data))
+            read += len(data)
+            rate.wait(len(data))
             if pending is not None:
                 pending.result()
             pending = pool.submit(lambda d=data: writer.write(_csv_table(d, shard)))
         if pending is not None:
             pending.result()
     seconds = time.monotonic() - start
-    unit = "CSV" if _yugabyte(cfg) else "heap"
-    log.info("shard %03d keys %d-%d: %d rows in %.0f s, %.0f MB/s of %s", shard, lo, hi,
-             writer.rows, seconds, read / 1e6 / max(seconds, 1e-9), unit)
+    log.info("shard %03d keys %d-%d: %d rows in %.0f s, %.0f MB/s of CSV", shard, lo, hi,
+             writer.rows, seconds, read / 1e6 / max(seconds, 1e-9))
     return writer.rows
 
 
 def _export_shard(cfg: Config, session: ReadOnlySession, out_dir: Path, shard: int,
-                  extents: list[list[int]], grow: Callable[[int, int], None],
                   rate: ByteRate) -> int:
-    """Exports every extent of a shard as files of `chunks_per_file` chunks; skips done files.
-
-    Pages appended while the export runs become one more extent, so rows that
-    moved to the end of the heap are still read.
-    """
+    """Exports a shard as files of `chunks_per_file` chunks; skips done files."""
     span = _chunk_span(cfg) * cfg.full.chunks_per_file
     shard_dir = out_dir / f"shard={shard:03d}"
-    rows, i = 0, 0
-    while i < len(extents):
-        lo, hi = extents[i]
-        for f_lo in range(lo, hi, span):
-            f_hi = min(f_lo + span, hi)
-            final = shard_dir / f"part-{f_lo:010d}-{f_hi:010d}.parquet"
-            if final.exists():
-                rows += pq.ParquetFile(final).metadata.num_rows
-                continue
-            _check_disk(cfg, out_dir)
-            rows += _export_file(cfg, session, final, shard, f_lo, f_hi, rate)
-        i += 1
-        if i == len(extents) and not _yugabyte(cfg):
-            grown = _relation_blocks(cfg, session, shard)
-            if grown > extents[-1][1]:
-                grow(extents[-1][1], grown)
+    rows = 0
+    for f_lo in range(0, YB_HASH_SPACE, span):
+        f_hi = min(f_lo + span, YB_HASH_SPACE)
+        final = shard_dir / f"part-{f_lo:010d}-{f_hi:010d}.parquet"
+        if final.exists():
+            rows += pq.ParquetFile(final).metadata.num_rows
+            continue
+        _check_disk(cfg, out_dir)
+        rows += _export_file(cfg, session, final, shard, f_lo, f_hi, rate)
     return rows
 
 
@@ -319,10 +218,9 @@ def pull_full(cfg: Config, sessions: Sequence[ReadOnlySession], out_dir: Path,
     """Exports every crawled row into `shard=NNN/part-<lo>-<hi>.parquet`, resumably.
 
     Each session takes whole shards from a shared queue and keeps its own read
-    guard; one `ByteRate` caps the bytes all of them read per second. The first
-    visit of a shard records its key space in `_meta.json` as an extent; a
-    resumed run reuses it, so file ranges never move. The engine is part of the
-    layout, so an export is finished on the engine that started it. A shard
+    guard; one `ByteRate` caps the CSV bytes all of them read per second. The
+    chunk layout is recorded in `_meta.json`, so a resumed run with another
+    layout is refused and file ranges never move. A shard
     whose COPY hits its timeout or lock_timeout, or fails serialization after
     `full.chunk_retries` rereads, is recorded in `shards_failed` and resumed by
     the next run at file granularity. Any other error stops every
@@ -332,22 +230,16 @@ def pull_full(cfg: Config, sessions: Sequence[ReadOnlySession], out_dir: Path,
     consistently.
     """
     now = now or datetime.now(UTC)
-    first = sessions[0]
-    rate = rate or ByteRate(cfg.full.max_heap_mb_s * 1e6)
+    rate = rate or ByteRate(cfg.full.max_mb_s * 1e6)
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = out_dir / "_meta.json"
     meta = read_json(meta_path) or {}
-    span_key = "hash_chunks" if _yugabyte(cfg) else "chunk_blocks"
-    layout = {"engine": cfg.crawlerdb.engine, span_key: getattr(cfg.full, span_key),
-              "chunks_per_file": cfg.full.chunks_per_file}
+    layout = {"hash_chunks": cfg.full.hash_chunks, "chunks_per_file": cfg.full.chunks_per_file}
     if meta and any(meta.get(k) != v for k, v in layout.items()):
-        raise RuntimeError(f"the existing export used a different crawlerdb.engine, "
-                           f"full.{span_key} or full.chunks_per_file; "
-                           "finish it with the same config")
+        raise RuntimeError("the existing export used a different full.hash_chunks or "
+                           "full.chunks_per_file; finish it with the same config")
     if "started_at" not in meta:
-        meta.update(layout, started_at=now.isoformat(),
-                    frozen_probe=probe_frozen(cfg, first, now))
-    extents: dict[str, list[list[int]]] = meta.setdefault("extents", {})
+        meta.update(layout, started_at=now.isoformat())
     done = set(meta.get("shards_done", []))
     failed: dict[str, str] = meta.setdefault("shards_failed", {})
     meta.setdefault("shards_done", sorted(done))
@@ -365,38 +257,25 @@ def pull_full(cfg: Config, sessions: Sequence[ReadOnlySession], out_dir: Path,
 
     def export(session: ReadOnlySession, shard: int) -> None:
         key = str(shard)
-        if key not in extents:
-            end = _key_end(cfg, session, shard)
-            with lock:
-                extents[key] = [[0, end]]
-            save()
-
-        def grow(lo: int, hi: int) -> None:
-            with lock:
-                extents[key].append([lo, hi])
-            save()
-
-        before, start = _io_counters(cfg, session), time.monotonic()
+        start = time.monotonic()
         try:
-            rows = _export_shard(cfg, session, out_dir, shard, extents[key], grow, rate)
+            rows = _export_shard(cfg, session, out_dir, shard, rate)
         except _RETRYABLE as exc:
             with lock:
                 failed[key] = type(exc).__name__
             log.warning("shard %03d failed (%s); it resumes on the next run",
                         shard, type(exc).__name__)
         else:
-            after = _io_counters(cfg, session)
-            io = {"seconds": round(time.monotonic() - start),
-                  **{k: after[k] - before[k] for k in after}}
+            seconds = round(time.monotonic() - start)
             with lock:
                 done.add(shard)
                 failed.pop(key, None)
                 meta.setdefault("rows", {})[key] = rows
-                meta.setdefault("io", {})[key] = io
+                meta.setdefault("seconds", {})[key] = seconds
                 meta["shards_done"] = sorted(done)
                 finished = len(done)
-            log.info("shard %03d: %d crawled rows (%d done in total, %d queued this run); "
-                     "cluster-wide during it: %s", shard, rows, finished, total, io)
+            log.info("shard %03d: %d crawled rows in %d s (%d done in total, %d queued this run)",
+                     shard, rows, seconds, finished, total)
         save()
 
     def work(session: ReadOnlySession) -> None:
@@ -420,9 +299,7 @@ def pull_full(cfg: Config, sessions: Sequence[ReadOnlySession], out_dir: Path,
     if missing:
         meta.pop("finished_at", None)
     elif "finished_at" not in meta:
-        finished_at = datetime.now(UTC)
-        meta.update(finished_at=finished_at.isoformat(),
-                    end_probe=probe_frozen(cfg, first, finished_at))
+        meta["finished_at"] = datetime.now(UTC).isoformat()
     save()
     return {"shards_done": len(done), "shards_missing": len(missing),
             "shards_failed": sorted(int(s) for s in failed),
