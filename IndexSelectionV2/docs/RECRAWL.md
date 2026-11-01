@@ -49,7 +49,10 @@ the batch-20 list.
   sending. In the round-5 simulation (2026-10-31, `index-selection` experiment
   2026-10-29, §9.8) capped hosts got 0.193–0.200 req/s: 14.0–14.5 days. 0.208 qps stays
   within the audit's 0.22. Round 5 ran with the crawler's per-host interval, which is
-  now removed; round 6 measures the same list without it. The cap hits 23 hostnames, and the next URLs take their
+  now removed. Round 6 (2026-11-01, without it): two capped hosts got 0.196-0.202 req/s
+  (13.8-14.5 days); one whose simulated slot is 0.33 req/s got 0.159-0.171 (16.4-17.6
+  days). Host2's capped hostnames have slots of 0.54-1.39 req/s. Recrawl used its whole 20 %
+  share (7.6 req/s per process against 3.78 needed) and normal kept 91 %. The cap hits 23 hostnames, and the next URLs take their
   places.
 - Batch-20 golden coverage (the official `indexed_rate`):
 
