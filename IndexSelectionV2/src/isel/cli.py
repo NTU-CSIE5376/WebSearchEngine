@@ -283,41 +283,41 @@ def cmd_verify_live(cfg: Config, args: argparse.Namespace) -> Any:
     return verify_live(cfg, cfg.work_dir, args.batch)
 
 
-def _recrawl(cfg: Config, action: Any, read_only: bool = False) -> Any:
-    """Runs `action(conn)` as admin on a selectdb at the newest schema revision.
-
-    The reader role cannot see `recrawl`, so read-only work uses the admin role
-    in a read-only session.
-    """
+def _live_run(cfg: Config) -> Any:
+    """The live run, read as admin in a read-only session of a selectdb at head."""
+    from isel.recrawl import live_run
     from isel.selectdb import assert_ready, connect
 
-    conn = connect(cfg, cfg.selectdb.admin_dsn_env, read_only=read_only)
+    conn = connect(cfg, cfg.selectdb.admin_dsn_env, read_only=True)
     try:
         assert_ready(cfg, conn)
-        return action(conn)
+        return live_run(cfg, conn)
     finally:
         conn.close()
 
 
-def cmd_recrawl_sync(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.recrawl import sync
+def cmd_recrawl_push(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import open_api, run_pusher
 
-    return _recrawl(cfg, lambda conn: sync(cfg, conn))
-
-
-def cmd_recrawl_plan(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.recrawl import capacity_report, run_planner
-
-    if args.dry_run:
-        return _recrawl(cfg, lambda conn: capacity_report(conn, datetime.now(UTC)),
-                        read_only=True)
-    return _recrawl(cfg, lambda conn: run_planner(cfg, conn, args.once))
+    return run_pusher(cfg, open_api(cfg), lambda: _live_run(cfg), args.once)
 
 
-def cmd_recrawl_archive(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.recrawl import run_archiver
+def cmd_recrawl_pull(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import open_api, run_puller
 
-    return _recrawl(cfg, lambda conn: run_archiver(cfg, conn, args.once))
+    return run_puller(cfg, open_api(cfg), args.once)
+
+
+def cmd_recrawl_compact(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import compact
+
+    return compact(cfg, datetime.now(UTC))
+
+
+def cmd_recrawl_report(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import open_api, report
+
+    return report(cfg, open_api(cfg), _live_run(cfg), datetime.now(UTC))
 
 
 def _text_index_client(cfg: Config):
@@ -328,9 +328,10 @@ def _text_index_client(cfg: Config):
 
 
 def cmd_text_index_build(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import layout
     from isel.textindex import build
 
-    return build(cfg, _text_index_client(cfg), Path(args.text_root or cfg.recrawl.text_root))
+    return build(cfg, _text_index_client(cfg), Path(args.text_root or layout(cfg).text))
 
 
 def cmd_text_index_eval(cfg: Config, args: argparse.Namespace) -> Any:
@@ -402,16 +403,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("rollback", help="make the previous list live again")
     p = sub.add_parser("verify-live", help="indexed rate of a batch under the live list")
     p.add_argument("--batch", type=int, required=True)
-    sub.add_parser("recrawl-sync", help="load the live run into the recrawl frontier")
-    p = sub.add_parser("recrawl-plan", help="send due docs as jobs to the crawler API (loop)")
+    p = sub.add_parser("recrawl-push", help="send the live list's due docs to the crawler (loop)")
     p.add_argument("--once", action="store_true", help="run one cycle and exit")
-    p.add_argument("--dry-run", action="store_true",
-                   help="print the per-host capacity report; send nothing")
-    p = sub.add_parser("recrawl-archive", help="apply finished jobs; store page text (loop)")
+    p = sub.add_parser("recrawl-pull", help="store the crawler's results as text (loop)")
     p.add_argument("--once", action="store_true", help="run one cycle and exit")
+    sub.add_parser("recrawl-compact", help="merge old outcome and text files; drop old pushes")
+    sub.add_parser("recrawl-report", help="progress of the live list's recrawl")
     p = sub.add_parser("text-index-build",
                        help="index the newest text of each doc; swap the alias to it")
-    p.add_argument("--text-root", help="text Parquet root (default recrawl.text_root)")
+    p.add_argument("--text-root", help="text Parquet root (default recrawl.root/text)")
     p = sub.add_parser("text-index-eval", help="Recall@k of a golden batch on the alias")
     p.add_argument("--batch", type=int, required=True)
     p = sub.add_parser("validate-manifest")
@@ -440,9 +440,10 @@ COMMANDS = {
     "swap": cmd_swap,
     "rollback": cmd_rollback,
     "verify-live": cmd_verify_live,
-    "recrawl-sync": cmd_recrawl_sync,
-    "recrawl-plan": cmd_recrawl_plan,
-    "recrawl-archive": cmd_recrawl_archive,
+    "recrawl-push": cmd_recrawl_push,
+    "recrawl-pull": cmd_recrawl_pull,
+    "recrawl-compact": cmd_recrawl_compact,
+    "recrawl-report": cmd_recrawl_report,
     "text-index-build": cmd_text_index_build,
     "text-index-eval": cmd_text_index_eval,
     "validate-manifest": cmd_validate_manifest,

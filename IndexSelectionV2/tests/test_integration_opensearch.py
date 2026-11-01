@@ -78,7 +78,7 @@ def node():
 
 def _text(docs, fetched_at: datetime) -> pa.Table:
     return pa.Table.from_pylist([{
-        "doc_id": md5_number_lower(canonicalize(u)), "batch_id": 1, "url": u, "final_url": u,
+        "doc_id": md5_number_lower(canonicalize(u)), "source": "r/s", "url": u, "final_url": u,
         "fetched_at": fetched_at, "http_status": 200, "lang": lang, "title": title,
         "description": desc, "body": body, "text_len": len(body), "payload_sha1": "x"}
         for u, lang, title, desc, body in docs], schema=TEXT_SCHEMA)

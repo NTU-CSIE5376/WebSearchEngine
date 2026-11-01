@@ -240,41 +240,29 @@ verify_chunk = 10000                     # URLs per lookup, as in the official m
 swap_freeze_days = [1, 16]
 swap_freeze_window = ["11:30", "20:00"]  # random set at 12:00, head set at 18:00 UTC
 
-[recrawl]                                # recrawl frontier in selectdb `recrawl`; docs/RECRAWL.md
-api_url = "http://127.0.0.1:4000"        # crawler API (WebCrawler PR #84), host network only
+[recrawl]                                # recrawl client, files only; docs/RECRAWL.md
+api_url = "http://172.16.191.2:4000"     # crawler API v2 (WebCrawler bulk-crawl-v2), Host2's LAN address
+api_token_file = "work/recrawl/api_token" # bearer token of the isel tenant; never in env values
 api_timeout_s = 10.0
-result_root = "work/recrawl/result"      # the API's results dir: {job_id}/request.json and
-                                         # {job_id}/crawler_NN/NNNNN.{json,html}; read-only
-text_root = "work/recrawl/text"          # permanent extracted text, fetch_date=YYYYMMDD/job-*.parquet
-log_root = "work/recrawl/log"            # permanent per-URL results, YYYYMMDD/job-*.jsonl.gz
-job_size = 3000                          # URLs per job; the API takes up to 10000. A job
-                                         # completes only when all its URLs finish
-host_docs_per_job = 240                  # docs per host and job; the crawler sends them at
-                                         # the host's slot rate. The host's next job goes out
-                                         # once this one is applied
-max_jobs_inflight = 48                   # jobs at the crawler; keep <= 64, the jobs a process admits;
-                                         # also the most completed jobs left to the archive
-plan_max_jobs = 8                        # jobs claimed per plan cycle
-plan_interval_s = 30.0
-api_backoff_s = 300.0                    # no new jobs after the API refused a whole job
-claim_timeout_s = 600                    # a job whose POST got no answer is lost after this
-status_poll_s = 15                       # status query of each unapplied job, at most this often
-result_ttl_days = 3                      # the job's ttl_days: the API stops it and deletes its
-                                         # results this long after the POST; isel deletes sooner
-max_resend = 20                          # 400 "at index N" drops one URL and sends again
-sweep_rows = 100000                      # fetched docs made due again per plan cycle
+api_backoff_s = 300.0                    # wait after a 5xx or no answer, unless Retry-After says
+root = "work/recrawl"                    # request.json, due/, push/, outcome/, text/
+batch_urls = 10000                       # URLs per POST; the API takes up to 10000
+result_quota_gb = 100                    # unacked results the crawler may hold for us
+expires_days = 30                        # the request's life; longer than the 14-day list cycle
+due_interval_h = 24                      # how often the due docs are computed again
+clock_skew_s = 300                       # Host2 vs Host3 clock tolerance; < retry_base_s
+long_poll_s = 30                         # GET segments waits this long for new results
+pull_batch_s = 300.0                     # pull waits this long for pull_batch_segments
+pull_batch_segments = 64                 # segments per text/outcome file
 stale_days = 30                          # uniform revisit interval
-retry_base_s = 600                       # failed doc: retry_base_s * 2^attempts
+retry_base_s = 600                       # failed doc: retry_base_s * 2^(attempts - 1)
 retry_max_s = 86400
 max_attempts = 5                         # then wait stale_days instead of retry_max_s
 robots_retry_days = 30                   # a robots.txt refusal is asked again after this
-host_pause_max_s = 86400                 # cap on a 429/503 pause
-archive_interval_s = 15.0
 archive_workers = 8                      # text extraction: 6.5 ms per 590 KB page each
-min_free_gb = 800                        # no new jobs below this free space under text_root;
-                                         # Host2 /data has ~2 TB free while the crawler runs
+min_free_gb = 800                        # pull and compaction stop below this free space
+                                         # under root; Host3 /data also holds a YB tserver
 max_body_chars = 200000                  # extracted body text kept per page
-sync_chunk_rows = 1000000                # docs per recrawl-sync transaction
 
 [text_index]                             # full-text index of the recrawl text; docs/TEXT_INDEX.md
 url = "http://127.0.0.1:9200"            # OpenSearch (deploy/compose.opensearch.yaml locally)

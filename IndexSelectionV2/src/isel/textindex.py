@@ -1,6 +1,6 @@
 """Full-text index of the recrawl text in OpenSearch: build it, query it, measure it.
 
-The input is the text Parquet that `recrawl-archive` writes (`TEXT_SCHEMA`), and only
+The input is the text Parquet that `recrawl-pull` writes (`TEXT_SCHEMA`), and only
 the newest row of each doc is indexed. A build never touches the live index: it loads
 a new physical index `{alias}-{utc id}`, checks the document count, merges it, blocks
 writes, and only then moves the alias to it in one `_aliases` call. Searches see the

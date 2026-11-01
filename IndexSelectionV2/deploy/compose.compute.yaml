@@ -54,35 +54,32 @@ services:
       ISEL_CRAWLERDB_YB_DSN_FILE: /run/secrets/crawlerdb_yb_dsn
     secrets: [crawlerdb_yb_dsn]
 
-  # Recrawl loops (docs/RECRAWL.md). Started only after the crawler serves the
-  # manual-bulk-crawl API of WebCrawler PR #84 at bd40191 or later: isel relies on its
-  # ttl_days and DELETE, or /data fills up, and reads its per-crawler result partitions:
-  #   docker compose ... --profile recrawl up -d recrawl-plan recrawl-archive
-  # isel never writes /data/manual_bulk_crawls: it POSTs jobs, reads finished results and
-  # DELETEs them through the API once their text is stored.
-  # Run `mkdir -p /data/isel` as the isel user before `up` (/data is 1777); Docker would
-  # otherwise create the bind source as root.
-  recrawl-plan:
+  # Recrawl loops (docs/RECRAWL.md), on the host that holds work_dir. Started only after
+  # the crawler serves the bulk crawl v2 API (WebCrawler bulk-crawl-v2) on Host2's LAN
+  # address; isel reaches it over HTTP only:
+  #   docker compose ... --profile recrawl up -d recrawl-push recrawl-pull
+  # Run `mkdir -p /data/isel/recrawl` as the isel user before `up` (/data is 1777); Docker
+  # would otherwise create the bind source as root.
+  recrawl-push:
     extends: {service: isel}
     profiles: [recrawl]
-    command: ["recrawl-plan"]
+    command: ["recrawl-push"]
     restart: unless-stopped
-    network_mode: host                  # the API listens on 127.0.0.1:4000 only
     volumes:
-      - /data/manual_bulk_crawls/results:/data/manual_bulk_crawls/results:ro  # job status
-      - /data/isel:/data/isel                                  # min_free_gb is measured here
-    mem_limit: 4g
-    memswap_limit: 4g
-    cpus: 2
+      - /data/isel:/data/isel                                  # due/, push/, outcome/
+    secrets: [recrawl_api_token]
+    mem_limit: 8g
+    memswap_limit: 8g
+    cpus: 4
 
-  recrawl-archive:
+  recrawl-pull:
     extends: {service: isel}
     profiles: [recrawl]
-    command: ["recrawl-archive"]
+    command: ["recrawl-pull"]
     restart: unless-stopped
     volumes:
-      - /data/manual_bulk_crawls/results:/data/manual_bulk_crawls/results:ro
-      - /data/isel:/data/isel
+      - /data/isel:/data/isel                                  # min_free_gb is measured here
+    secrets: [recrawl_api_token]
     mem_limit: 8g
     memswap_limit: 8g
     cpus: 8                             # archive_workers; 6.5 ms per 590 KB page each
@@ -149,3 +146,5 @@ secrets:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_dsn
   selectdb_reader_password:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_password
+  recrawl_api_token:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/recrawl_api_token

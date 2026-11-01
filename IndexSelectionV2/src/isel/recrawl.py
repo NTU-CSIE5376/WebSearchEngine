@@ -1,1029 +1,703 @@
-"""Recrawl frontier: hands the live selection to the crawler and stores the text it fetched.
+"""Recrawl client: hands the live list to the crawler API v2 and stores the text it fetched.
 
-The frontier lives in selectdb's `recrawl` schema (`isel.schema`). The crawler
-side is the manual-bulk-crawl job API of WebCrawler PR #84 at cc96500, the same
-as at bd40191 (`docs/RECRAWL.md`): POST a URL list with a `ttl_days`, get a
-`job_id`, and poll the job's status until the API reports it `completed`. Only
-the API decides that: the results dir `result_root/{job_id}` exists from the
-POST on, and each crawler fills its own `crawler_NN/` partition. The TTL is the
-job's only deadline: past it the API stops the job and deletes its results, and
-isel puts its docs back in line.
+The crawler decides when and how fast each host is fetched (WebCrawler bulk crawl v2,
+`docs/RECRAWL.md`). isel decides what to fetch and when a doc is due again. It keeps no
+database for this: every piece of state is a file under `recrawl.root` with one writer.
 
-- `sync` (after each swap): loads the live run's manifest. A doc is on the
-  list while `rank` is set; sync writes only `rank` and `model_run_id`.
-- `plan` (loop): packs the due docs of the best-ranked ready hosts into jobs
-  and POSTs them. A host is in at most one open job; its next job goes out
-  once this one is applied. The crawler's AutoThrottle slot sets how fast a
-  host's docs go out; isel adds no rate of its own. A job is recorded
-  `claimed` before it is sent, so no HTTP call runs inside a transaction. Plan
-  also polls each unapplied job's status and marks it `completed` with the
-  API's `completed_at`. Once a job is applied, plan DELETEs its results.
-- `archive` (loop): reads each completed job's directory without changing it
-  and without calling the API. Worker processes extract each page's text into
-  Parquet and keep a gzipped copy of the per-URL results; the main process then
-  applies them idempotently.
+- `request.json` (push): the crawl request of the live run.
+- `due/{request}/due-{ts}.parquet` (push): the docs to send, by rank; `.done` once sent.
+- `push/{request}/{ts}-{n}.parquet` (push): the docs of batch n and when it was sent,
+  written before the POST, so a doc is in flight from the moment it may be at the crawler.
+- `outcome/fetch_date=D/*.parquet` (pull; push for URLs the API skipped as invalid):
+  one row per result.
+- `text/fetch_date=D/*.parquet` (pull): the page text, the input of the text index.
 
-Results map to docs by position: `request.json` lists the URLs in the order
-sent, after the API canonicalizes them and drops duplicates, and the crawler
-that owns each one (`crawler_ids`). Result n is `crawler_{crawler_ids[n]:02d}/
-{n:05d}.json`, as the API resolves its downloads. The archive checks the order
-before it trusts it (`map_results`).
-
-Every frontier transaction takes one advisory lock, so plan, archive and sync
-never interleave their updates and cannot deadlock.
+Whether a doc is due comes from the live run's manifest and these files alone
+(`compute_due`). Result rows may repeat (a segment read twice, a compaction cut short);
+readers take distinct (doc_id, request_id, outcome, finished_at), and the text index the
+newest row of each doc, so a repeat changes nothing.
 """
 
 from __future__ import annotations
 
-import contextlib
 import gzip
 import hashlib
 import json
 import multiprocessing
-import re
 import shutil
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import psycopg
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from isel.config import Config, RecrawlCfg
 from isel.extract import extract
-from isel.io import TMP_SUFFIX, commit_file, open_duckdb, sql_str, write_parquet_atomic
+from isel.io import (
+    atomic_write_json,
+    copy_atomic,
+    open_duckdb,
+    read_json,
+    sql_str,
+    utc_id,
+    write_parquet_atomic,
+)
 from isel.manifest import validate_run
-from isel.publish import swap_allowed
-from isel.schema import DUE_STATES, OPEN_JOB_STATES
-from isel.urlnorm import md5_number_lower
+from isel.pg import next_allowed_start
 
-LOCK_CYCLE = 0x15E1_DB02      # xact lock held by every frontier transaction
-LOCK_INSTANCE = {"sync": 0x15E1_DB03, "plan": 0x15E1_DB04, "archive": 0x15E1_DB05}
-JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-BAD_INDEX_RE = re.compile(r"\bat index (\d+)$")
-NON_HTML = "NonHTML content-type"       # the crawler's error for a 2xx without HTML
-ITEM_KEYS = frozenset({"url", "final_url", "status_code", "error", "html_file", "fetched_at"})
-RESULT_COLUMNS = ("doc_id", "outcome", "http_status", "final_url", "fail_reason",
-                  "payload_sha1", "fetched_at", "text_len", "lang")
-# One row per fetched page, the input of the inverted index (docs/RECRAWL.md).
-# A doc may appear in several files; the row with the latest `fetched_at` wins. `doc_id`
-# is unsigned, as in the manifest.
+_TS = pa.timestamp("us", tz="UTC")
+# One row per fetched page, the input of the inverted index (docs/RECRAWL.md). A doc may
+# appear in several files; the row with the latest `fetched_at` wins.
 TEXT_SCHEMA = pa.schema([
-    ("doc_id", pa.uint64()), ("batch_id", pa.int64()), ("url", pa.string()),
-    ("final_url", pa.string()), ("fetched_at", pa.timestamp("us", tz="UTC")),
+    ("doc_id", pa.uint64()), ("source", pa.string()), ("url", pa.string()),
+    ("final_url", pa.string()), ("fetched_at", _TS),
     ("http_status", pa.int16()), ("lang", pa.string()), ("title", pa.string()),
     ("description", pa.string()), ("body", pa.string()), ("text_len", pa.int32()),
     ("payload_sha1", pa.string())])
-_DUE = "state IN ({})".format(", ".join(f"'{s}'" for s in DUE_STATES))
-_OPEN = "state IN ({})".format(", ".join(f"'{s}'" for s in OPEN_JOB_STATES))
-_INT63 = (1 << 63) - 1
+OUTCOME_SCHEMA = pa.schema([
+    ("doc_id", pa.uint64()), ("request_id", pa.string()), ("outcome", pa.string()),
+    ("fail_reason", pa.string()), ("http_status", pa.int16()), ("final_url", pa.string()),
+    ("fetched_at", _TS), ("finished_at", _TS), ("payload_sha1", pa.string()),
+    ("text_len", pa.int32()), ("lang", pa.string())])
+PUSH_SCHEMA = pa.schema([("doc_id", pa.uint64()), ("pushed_at", _TS)])
+RECORD_KEYS = frozenset({"id", "url", "final_url", "status_code", "error", "fetched_at",
+                         "finished_at", "html"})
+GONE_ERRORS = frozenset({"non_html", "http_404", "http_410"})
+REQUEUE_ERRORS = frozenset({"expired", "cancelled"})
 _UINT64 = 1 << 64
+_EMPTY = {
+    "outcome": "SELECT NULL::UBIGINT AS doc_id, NULL::VARCHAR AS request_id, "
+               "NULL::VARCHAR AS outcome, NULL::TIMESTAMPTZ AS finished_at WHERE false",
+    "push": "SELECT NULL::UBIGINT AS doc_id, NULL::TIMESTAMPTZ AS pushed_at WHERE false",
+}
 
 
 class RecrawlError(RuntimeError):
-    """Raised when the frontier or a job's results are inconsistent."""
+    """Raised when the API or the files break the contract."""
 
 
-def host_id(host: str) -> int:
-    """Stable queue id of a hostname: the low 63 bits of `md5_number_lower`."""
-    return md5_number_lower(host) & _INT63
+@dataclass(frozen=True)
+class Layout:
+    """The recrawl files under `recrawl.root`."""
+
+    root: Path
+
+    @property
+    def request_file(self) -> Path:
+        return self.root / "request.json"
+
+    @property
+    def outcome(self) -> Path:
+        return self.root / "outcome"
+
+    @property
+    def text(self) -> Path:
+        return self.root / "text"
+
+    def due(self, request_id: str) -> Path:
+        return self.root / "due" / request_id
+
+    def push(self, request_id: str) -> Path:
+        return self.root / "push" / request_id
 
 
-def pg_doc_id(url: str) -> int:
-    """`doc_id` of a canonical URL as selectdb stores it (two's-complement BIGINT)."""
-    value = md5_number_lower(url)
-    return value - (1 << 64) if value > _INT63 else value
+def layout(cfg: Config) -> Layout:
+    return Layout(Path(cfg.recrawl.root))
 
 
-def classify(item: dict[str, Any]) -> tuple[str, str | None]:
-    """Maps one result record (`NNNNN.json`) to (outcome, fail_reason)."""
-    status, error = item["status_code"], item["error"]
-    if status is not None and 200 <= status < 300:
-        if error is None and item["html_file"]:
-            return "fetched", None
-        if error == NON_HTML:
-            return "gone", "non_html"
-        return "retry", error or "no_html"
-    if status in (404, 410):
-        return "gone", f"http_{status}"
-    if status in (429, 503):
-        return "throttled", f"http_{status}"
-    if status is None and error == "IgnoreRequest":
-        # Raised by robots.txt refusals; other downloader middlewares may raise it too.
-        return "robots", "ignore_request"
-    return "retry", f"http_{status}" if status is not None else (error or "no_response")
+@dataclass(frozen=True)
+class LiveRun:
+    run_id: int
+    label: str
+    run_dir: Path
 
 
-def _instance_lock(conn: psycopg.Connection, name: str) -> None:
-    (ok,) = conn.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_INSTANCE[name],)).fetchone()
-    if not ok:
-        raise RecrawlError(f"another recrawl-{name} holds the instance lock")
+def live_run(cfg: Config, conn: psycopg.Connection) -> LiveRun:
+    """The live run in selectdb and its select-full output under `work_dir`."""
+    rows = conn.execute("SELECT id, run_label FROM public.model_runs WHERE status = 'live'"
+                        ).fetchall()
+    if len(rows) != 1:
+        raise RecrawlError(f"expected one live run, found {len(rows)}")
+    run_id, label = rows[0]
+    return LiveRun(run_id, label, cfg.work_dir / "full" / "selection" / f"run={label}")
 
 
-def _cycle_lock(cur: psycopg.Cursor) -> None:
-    cur.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_CYCLE,))
-
-
-def _refresh_best_rank(cur: psycopg.Cursor, hosts: Iterable[int]) -> None:
-    ids = sorted(set(hosts))
-    if ids:
-        cur.execute(
-            "UPDATE recrawl.host h SET best_rank = (SELECT min(d.rank) FROM recrawl.doc d "
-            f"WHERE d.host_id = h.host_id AND d.rank IS NOT NULL AND d.{_DUE}) "
-            "WHERE h.host_id = ANY(%s::bigint[])", (ids,))
-
-
-def run_loop(cycle: Callable[[], dict[str, Any]], interval_s: float, once: bool,
+def run_loop(cycle: Callable[[], dict[str, Any]], once: bool,
              sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
-    """Runs `cycle` every `interval_s` seconds; prints each result as one JSON line."""
+    """Runs `cycle` until `once`; each result is one JSON line and names its own wait."""
     while True:
         result = cycle()
         if once:
             return result
         print(json.dumps(result, sort_keys=True, default=str), flush=True)
-        sleep(interval_s)
+        sleep(result["wait_s"])
 
 
-# ---------------------------------------------------------------- sync
-
-def sync(cfg: Config, conn: psycopg.Connection,
-         now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> dict[str, Any]:
-    """Makes the frontier match the live run: new docs, new ranks, docs off the list."""
-    at = now()
-    if not swap_allowed(at, cfg.schedule):
-        raise RecrawlError("swap freeze window: the metric may be reading selectdb")
-    _instance_lock(conn, "sync")
-    run_id, label = _live_run(conn)
-    run_dir = cfg.work_dir / "full" / "selection" / f"run={label}"
-    meta = validate_run(run_dir)
-    if meta.get("scope") != "full":
-        raise RecrawlError(f"{run_dir} is not a select-full run")
-    tmp = cfg.work_dir / "duckdb_tmp"
-    con = open_duckdb(cfg, tmp)
-    started = time.monotonic()
-    try:
-        docs = _stage_docs(con, run_dir)
-        csv_path = tmp / "recrawl_sync.csv"
-        for lo in range(0, docs, cfg.recrawl.sync_chunk_rows):
-            con.execute(
-                "COPY (SELECT doc_id, url, host_id, host, rank FROM sync_rows "
-                f"WHERE i > {lo} AND i <= {lo + cfg.recrawl.sync_chunk_rows}) "
-                f"TO {sql_str(str(csv_path))} (FORMAT csv, HEADER false)")
-            try:
-                _load_chunk(cfg, conn, csv_path, run_id, at)
-            finally:
-                csv_path.unlink(missing_ok=True)
-    finally:
-        con.close()
-    with conn.transaction(), conn.cursor() as cur:
-        _cycle_lock(cur)
-        cur.execute("UPDATE recrawl.doc SET rank = NULL WHERE rank IS NOT NULL "
-                    "AND model_run_id IS DISTINCT FROM %s", (run_id,))
-        dropped = cur.rowcount
-        cur.execute(
-            "UPDATE recrawl.host h SET best_rank = m.r FROM (SELECT host_id, min(rank) AS r "
-            f"FROM recrawl.doc WHERE rank IS NOT NULL AND {_DUE} GROUP BY host_id) m "
-            "WHERE h.host_id = m.host_id AND h.best_rank IS DISTINCT FROM m.r")
-        cur.execute(
-            "UPDATE recrawl.host h SET best_rank = NULL WHERE best_rank IS NOT NULL AND "
-            "NOT EXISTS (SELECT 1 FROM recrawl.doc d WHERE d.host_id = h.host_id "
-            f"AND d.rank IS NOT NULL AND d.{_DUE})")
-    conn.execute("ANALYZE recrawl.host")
-    conn.execute("ANALYZE recrawl.doc")
-    (hosts,) = conn.execute("SELECT count(*) FROM recrawl.host WHERE best_rank IS NOT NULL"
-                            ).fetchone()
-    return {"model_run_id": run_id, "run_label": label, "docs": docs, "dropped": dropped,
-            "hosts_due": hosts, "secs": round(time.monotonic() - started, 1)}
-
-
-def _live_run(conn: psycopg.Connection) -> tuple[int, str]:
-    rows = conn.execute("SELECT id, run_label FROM public.model_runs WHERE status = 'live'"
-                        ).fetchall()
-    if len(rows) != 1:
-        raise RecrawlError(f"expected one live run, found {len(rows)}")
-    return rows[0]
-
-
-def _stage_docs(con: Any, run_dir: Path) -> int:
-    """One row per doc_id, at its best rank."""
-    con.execute(f"""
-CREATE OR REPLACE TEMP TABLE sync_rows AS
-WITH best AS (
-  SELECT * FROM read_parquet({sql_str(str(run_dir / 'manifest' / '*.parquet'))})
-  QUALIFY row_number() OVER (PARTITION BY doc_id ORDER BY rank, url) = 1
-)
-SELECT row_number() OVER (ORDER BY rank) AS i,
-       CASE WHEN doc_id > {_INT63}
-            THEN (doc_id - {_INT63 + 1})::BIGINT - {_INT63} - 1
-            ELSE doc_id::BIGINT END AS doc_id,
-       canonical_url AS url, (md5_number_lower(host) & {_INT63})::BIGINT AS host_id,
-       host, rank
-FROM best""")
-    (docs,) = con.execute("SELECT count(*) FROM sync_rows").fetchone()
-    return int(docs)
-
-
-def _load_chunk(cfg: Config, conn: psycopg.Connection, csv_path: Path, run_id: int,
-                at: datetime) -> None:
-    with conn.transaction(), conn.cursor() as cur:
-        _cycle_lock(cur)
-        cur.execute("CREATE TEMP TABLE s (doc_id BIGINT, url TEXT, host_id BIGINT, host TEXT, "
-                    "rank BIGINT) ON COMMIT DROP")
-        with cur.copy("COPY s FROM STDIN (FORMAT csv)") as copy, csv_path.open("rb") as fh:
-            while block := fh.read(cfg.selectdb.copy_block_bytes):
-                copy.write(block)
-        cur.execute("INSERT INTO recrawl.host (host_id, host) SELECT DISTINCT ON (host_id) "
-                    "host_id, host FROM s ORDER BY host_id ON CONFLICT (host_id) DO NOTHING")
-        cur.execute("SELECT count(*) FROM s JOIN recrawl.host h USING (host_id) "
-                    "WHERE h.host <> s.host")
-        (clashes,) = cur.fetchone()
-        if clashes:
-            raise RecrawlError(f"{clashes} docs hit a host_id taken by another hostname")
-        cur.execute(
-            "WITH up AS (INSERT INTO recrawl.doc (doc_id, url, host_id, rank, model_run_id, "
-            "due_at) SELECT doc_id, url, host_id, rank, %s, %s FROM s ON CONFLICT (doc_id) "
-            "DO UPDATE SET rank = EXCLUDED.rank, model_run_id = EXCLUDED.model_run_id "
-            "WHERE (recrawl.doc.rank, recrawl.doc.model_run_id) "
-            "IS DISTINCT FROM (EXCLUDED.rank, EXCLUDED.model_run_id) RETURNING host_id) "
-            + _WAKE.format("(SELECT DISTINCT host_id FROM up)"),
-            (run_id, at, at + timedelta(seconds=cfg.recrawl.host_pause_max_s)))
-
-
-# ---------------------------------------------------------------- plan
+# ---------------------------------------------------------------- API client
 
 @dataclass(frozen=True)
 class Reply:
-    """Outcome of one POST; `status` is None when acceptance is unknown."""
-
-    status: int | None
-    job_id: str | None = None
+    status: int | None                    # None: no answer
+    body: Any = None
+    retry_after: float | None = None
     error: str | None = None
 
 
-class CrawlerApi:
-    """Client of the crawler's `/v1/manual-bulk-crawls` routes (WebCrawler PR #84).
+class CrawlApi:
+    """The crawler's bulk crawl v2 routes (WebCrawler `docs/03`)."""
 
-    `paused_until` is set when the API refused a job for a reason a retry
-    cannot fix soon; the planner claims nothing before then.
-    """
+    def __init__(self, base_url: str, token: str, timeout_s: float) -> None:
+        self.url = f"{base_url}/v1/crawl-requests"
+        self._token = token
+        self._timeout_s = timeout_s
 
-    def __init__(self, base_url: str, timeout_s: float) -> None:
-        self.url = f"{base_url}/v1/manual-bulk-crawls"
-        self.timeout_s = timeout_s
-        self.paused_until: datetime | None = None
-
-    def submit(self, urls: list[str], ttl_days: int) -> Reply:
-        request = urllib.request.Request(
-            self.url, data=json.dumps({"urls": urls, "ttl_days": ttl_days}).encode(),
-            method="POST", headers={"Content-Type": "application/json"})
+    def call(self, method: str, path: str = "", body: Any = None,
+             timeout_s: float | None = None, raw: bool = False) -> Reply:
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(f"{self.url}{path}", data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self._token}")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_s) as resp:
-                job_id = json.load(resp).get("job_id")
+            with urllib.request.urlopen(req, timeout=timeout_s or self._timeout_s) as resp:
+                payload = resp.read()
+                return Reply(resp.status, payload if raw else _json(payload))
         except urllib.error.HTTPError as exc:
-            error = None
-            with contextlib.suppress(ValueError, AttributeError):
-                error = json.load(exc).get("error")
-            return Reply(exc.code, error=error if isinstance(error, str) else None)
-        except (OSError, ValueError, AttributeError):
-            return Reply(None)
-        if not (isinstance(job_id, str) and JOB_ID_RE.match(job_id)):
-            # Accepted, but under an id we cannot use: as good as an unknown answer.
-            return Reply(None, error=f"unexpected job_id {job_id!r}")
-        return Reply(200, job_id)
+            with exc:
+                payload = _json(exc.read())
+                retry = exc.headers.get("Retry-After")
+                error = payload.get("error") if isinstance(payload, dict) else None
+                return Reply(exc.code, payload, float(retry) if _is_number(retry) else None,
+                             error or exc.reason)
+        except (OSError, ValueError) as exc:
+            return Reply(None, error=f"{method} {self.url}{path}: {exc}")
 
-    def status(self, job_id: str) -> tuple[str | None, Any]:
-        """The job's (status, completed_at) at the API.
+    def create(self, name: str, result_quota_gb: float, expires_days: int) -> Reply:
+        return self.call("POST", "", {"name": name, "result_quota_gb": result_quota_gb,
+                                      "expires_days": expires_days})
 
-        status is `pending`, `running`, `completed`, `missing` (404), or None if
-        the API answered but not usably. `completed_at` is the API's value,
-        unchecked. Raises OSError if the API cannot be reached.
-        """
-        try:
-            with urllib.request.urlopen(f"{self.url}/{job_id}", timeout=self.timeout_s) as resp:
-                body = json.load(resp)
-                status, completed_at = body.get("status"), body.get("completed_at")
-        except urllib.error.HTTPError as exc:
-            return ("missing" if exc.code == 404 else None), None
-        except (ValueError, AttributeError):
-            return None, None
-        if status not in ("pending", "running", "completed"):
-            return None, None
-        return status, completed_at
+    def requests(self) -> Reply:
+        return self.call("GET")
 
-    def delete(self, job_id: str) -> bool:
-        """Removes the job and its results; True once the API holds nothing of it."""
-        request = urllib.request.Request(f"{self.url}/{job_id}", method="DELETE")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_s) as resp:
-                return resp.status == 204
-        except urllib.error.HTTPError as exc:
-            return exc.code == 404
-        except OSError:
-            return False
+    def status(self, request_id: str) -> Reply:
+        return self.call("GET", f"/{request_id}")
+
+    def delete(self, request_id: str) -> Reply:
+        return self.call("DELETE", f"/{request_id}")
+
+    def post_urls(self, request_id: str, batch_id: str, items: list[dict[str, Any]]) -> Reply:
+        return self.call("POST", f"/{request_id}/urls", {"batch_id": batch_id, "urls": items})
+
+    def segments(self, request_id: str, wait_s: float) -> Reply:
+        return self.call("GET", f"/{request_id}/segments?wait={int(wait_s)}",
+                         timeout_s=self._timeout_s + wait_s)
+
+    def download(self, request_id: str, name: str) -> Reply:
+        return self.call("GET", f"/{request_id}/segments/{name}", raw=True)
+
+    def ack(self, request_id: str, names: list[str]) -> Reply:
+        return self.call("POST", f"/{request_id}/ack", {"segments": names})
 
 
-def run_planner(cfg: Config, conn: psycopg.Connection, once: bool) -> dict[str, Any]:
-    _instance_lock(conn, "plan")
-    api = CrawlerApi(cfg.recrawl.api_url, cfg.recrawl.api_timeout_s)
-    return run_loop(lambda: plan_cycle(cfg, conn, datetime.now(UTC), api),
-                    cfg.recrawl.plan_interval_s, once)
+def _json(payload: bytes) -> Any:
+    try:
+        return json.loads(payload) if payload else None
+    except ValueError:
+        return None
 
 
-@dataclass
-class Job:
-    """A claimed job: its docs in the order their URLs are sent."""
-
-    batch_id: int
-    doc_ids: list[int]
-    urls: list[str]
+def _is_number(value: str | None) -> bool:
+    try:
+        return value is not None and float(value) >= 0
+    except ValueError:
+        return False
 
 
-def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
-               api: CrawlerApi) -> dict[str, Any]:
-    """One planning pass; returns counts.
+def open_api(cfg: Config) -> CrawlApi:
+    r = cfg.recrawl
+    token = Path(r.api_token_file).read_text(encoding="utf-8").strip()
+    if not token:
+        raise RecrawlError(f"{r.api_token_file} is empty")
+    return CrawlApi(r.api_url, token, r.api_timeout_s)
 
-    1. Recover: a job whose POST got no answer is lost after `claim_timeout_s`.
-    2. Poll: every unapplied job is asked for its status every `status_poll_s`.
-       A submitted job the API reports done becomes `completed`; a job the API
-       no longer knows is lost (its TTL passed).
-    3. Delete the results of applied jobs at the API.
-    4. Stop if any job is in `error` (the API broke its contract), if a
-       completed job's results are not mounted, if the API asked for a pause,
-       if `max_jobs_inflight` jobs are at the crawler or wait for the archive,
-       or if the text disk is short.
-    5. Claim jobs, commit, then send them.
+
+# ---------------------------------------------------------------- due
+
+def _scan(path: Path, kind: str) -> str:
+    """A DuckDB relation over the Parquet files under `path`, or an empty one of that kind."""
+    if next(path.glob("**/*.parquet"), None) is None:
+        return f"({_EMPTY[kind]})"
+    return (f"read_parquet({sql_str(str(path / '**' / '*.parquet'))}, "
+            "hive_partitioning=false, union_by_name=true)")
+
+
+def _seconds(value: float) -> str:
+    return f"to_microseconds({int(value * 1_000_000)}::BIGINT)"
+
+
+def due_query(r: RecrawlCfg, lay: Layout, manifest: Path, request_id: str,
+              now: datetime) -> str:
+    """The docs of the live list to send now, by rank (docs/RECRAWL.md §4)."""
+    at = f"{sql_str(now.isoformat())}::TIMESTAMPTZ"
+    backoff = (f"CASE WHEN a.n >= {r.max_attempts} THEN {_seconds(r.stale_days * 86400)} "
+               f"ELSE to_microseconds(CAST(least({r.retry_base_s} * pow(2, a.n - 1), "
+               f"{r.retry_max_s}) * 1000000 AS BIGINT)) END")
+    return f"""
+WITH list AS (
+  SELECT doc_id, canonical_url AS url, rank
+  FROM read_parquet({sql_str(str(manifest / '*.parquet'))})
+  QUALIFY row_number() OVER (PARTITION BY doc_id ORDER BY rank, canonical_url) = 1),
+out AS (SELECT DISTINCT doc_id, request_id, outcome, finished_at
+        FROM {_scan(lay.outcome, 'outcome')}),
+last AS (SELECT doc_id, arg_max(outcome, finished_at) AS outcome, max(finished_at) AS at
+         FROM out GROUP BY doc_id),
+ok AS (SELECT doc_id, max(finished_at) AS at FROM out WHERE outcome = 'fetched'
+       GROUP BY doc_id),
+attempts AS (SELECT o.doc_id, count(*) AS n FROM out o LEFT JOIN ok USING (doc_id)
+             WHERE o.outcome = 'retry' AND (ok.at IS NULL OR o.finished_at > ok.at)
+             GROUP BY o.doc_id),
+pushed AS (SELECT doc_id, max(pushed_at) AS at FROM {_scan(lay.push(request_id), 'push')}
+           GROUP BY doc_id),
+inflight AS (
+  SELECT p.doc_id FROM pushed p WHERE NOT EXISTS (
+    SELECT 1 FROM out o WHERE o.doc_id = p.doc_id AND o.request_id = {sql_str(request_id)}
+      AND o.finished_at >= p.at - {_seconds(r.clock_skew_s)}))
+SELECT l.doc_id, l.url, l.rank
+FROM list l
+LEFT JOIN last ON last.doc_id = l.doc_id
+LEFT JOIN attempts a ON a.doc_id = l.doc_id
+ANTI JOIN inflight i ON i.doc_id = l.doc_id
+WHERE last.outcome IS NULL OR last.outcome = 'requeue'
+   OR (last.outcome = 'fetched' AND last.at + {_seconds(r.stale_days * 86400)} <= {at})
+   OR (last.outcome = 'robots' AND last.at + {_seconds(r.robots_retry_days * 86400)} <= {at})
+   OR (last.outcome = 'retry' AND last.at + {backoff} <= {at})
+ORDER BY l.rank, l.doc_id"""
+
+
+def compute_due(cfg: Config, lay: Layout, live: LiveRun, request_id: str,
+                now: datetime) -> tuple[Path, int]:
+    """Writes `due-{ts}.parquet` for the request; returns it and its row count."""
+    path = lay.due(request_id) / f"due-{utc_id(now)}.parquet"
+    con = open_duckdb(cfg, lay.root / "duckdb_tmp")
+    try:
+        rows = copy_atomic(con, due_query(cfg.recrawl, lay, live.run_dir / "manifest",
+                                          request_id, now), path)
+    finally:
+        con.close()
+    return path, rows
+
+
+# ---------------------------------------------------------------- push
+
+def _wait(stats: dict[str, Any], seconds: float, **flags: Any) -> dict[str, Any]:
+    return {**stats, **flags, "wait_s": max(1.0, float(seconds))}
+
+
+def _ensure_request(cfg: Config, lay: Layout, api: CrawlApi, live: LiveRun,
+                    stats: dict[str, Any]) -> str | None:
+    """The request of the live run; a new live run replaces the old request."""
+    r = cfg.recrawl
+    current = read_json(lay.request_file)
+    if current and current["model_run_id"] == live.run_id:
+        return current["request_id"]
+    meta = validate_run(live.run_dir)
+    if meta.get("scope") != "full":
+        raise RecrawlError(f"{live.run_dir} is not a select-full run")
+    if current:
+        reply = api.delete(current["request_id"])
+        if reply.status not in (202, 404):
+            stats["api_error"] = f"DELETE {current['request_id']}: {reply.status} {reply.error}"
+            return None
+        stats["cancelled"] = current["request_id"]
+    reply = api.create(f"isel-run-{live.run_id}", r.result_quota_gb, r.expires_days)
+    if reply.status != 201:
+        if reply.status in (None, 503) or (reply.status or 0) >= 500:
+            stats["api_error"] = f"POST create: {reply.status} {reply.error}"
+            return None
+        raise RecrawlError(f"POST {api.url} answered {reply.status}: {reply.error}")
+    request_id = reply.body["request_id"]
+    atomic_write_json(lay.request_file, {"request_id": request_id, "model_run_id": live.run_id,
+                                         "run_label": live.label,
+                                         "created_at": datetime.now(UTC).isoformat()})
+    stats["created"] = request_id
+    return request_id
+
+
+def _batch_no(path: Path) -> int:
+    return int(path.stem.rsplit("-", 1)[1])
+
+
+def push_cycle(cfg: Config, lay: Layout, api: CrawlApi, live: LiveRun,
+               clock: Callable[[], datetime] = lambda: datetime.now(UTC)) -> dict[str, Any]:
+    """Sends the current due file batch by batch; computes the next one when it is time.
+
+    Stops for a guard window, a 503 or a lost answer, and names how long to wait.
     """
     r = cfg.recrawl
-    stats: dict[str, Any] = {"lost": 0, "orphans": 0, "swept": 0, "checked": 0,
-                             "completed": 0, "deleted": 0, "open": 0, "jobs": 0, "docs": 0,
-                             "invalid": 0, "refused": 0, "unknown": 0,
-                             "halted": False, "unmounted": False, "paused": False,
-                             "archive_lag": False, "disk_full": False}
-    with conn.transaction(), conn.cursor() as cur:
-        _cycle_lock(cur)
-        cur.execute("UPDATE recrawl.job SET state = 'lost', finished_at = %s, "
-                    "error = 'no reply to the POST' WHERE state = 'claimed' AND claimed_at < %s "
-                    "RETURNING batch_id", (now, now - timedelta(seconds=r.claim_timeout_s)))
-        lost = [b for (b,) in cur.fetchall()]
-        stats["lost"] = len(lost)
-        _release(cur, lost)
-        stats["orphans"] = _release_orphans(cur)
-        cur.execute(
-            "UPDATE recrawl.doc SET state = 'pending' WHERE doc_id IN (SELECT doc_id "
-            "FROM recrawl.doc WHERE state = 'fetched' AND rank IS NOT NULL AND due_at <= %s "
-            "LIMIT %s) RETURNING host_id", (now, r.sweep_rows))
-        swept = [h for (h,) in cur.fetchall()]
-        stats["swept"] = len(swept)
-        _wake(cur, swept, now, r.host_pause_max_s)
-        _refresh_best_rank(cur, swept)
-    _check_jobs(cfg, conn, api, now, stats)
-    _delete_applied(conn, api, now, stats)
-
-    counts = dict(conn.execute("SELECT state, count(*) FROM recrawl.job "
-                               f"WHERE {_OPEN} GROUP BY state").fetchall())
-    stats["open"] = counts.get("claimed", 0) + counts.get("submitted", 0)
-    room = min(r.plan_max_jobs, r.max_jobs_inflight - stats["open"])
-    text_root = Path(r.text_root)
-    text_root.mkdir(parents=True, exist_ok=True)
-    if counts.get("error"):
-        stats["halted"] = True
-    elif stats["unmounted"]:
-        pass                              # config_error names the job
-    elif api.paused_until is not None and now < api.paused_until:
-        stats["paused"] = True
-    elif counts.get("completed", 0) >= r.max_jobs_inflight:
-        stats["archive_lag"] = True
-    elif shutil.disk_usage(text_root).free < r.min_free_gb * 1e9:
-        stats["disk_full"] = True
-    elif room > 0:
-        with conn.transaction(), conn.cursor() as cur:
-            _cycle_lock(cur)
-            jobs = _claim(cfg, cur, now, room)
-        _send(cfg, conn, api, jobs, stats, now)
-    return stats
-
-
-def _release(cur: psycopg.Cursor, batches: list[int]) -> None:
-    """Puts the docs of these jobs back in line and frees their hosts."""
-    if not batches:
-        return
-    cur.execute("UPDATE recrawl.doc SET state = 'pending' WHERE state = 'dispatched' "
-                "AND batch_id = ANY(%s::bigint[]) RETURNING host_id", (batches,))
-    hosts = [h for (h,) in cur.fetchall()]
-    cur.execute("UPDATE recrawl.host SET batch_id = NULL WHERE batch_id = ANY(%s::bigint[]) "
-                "RETURNING host_id", (batches,))
-    _refresh_best_rank(cur, hosts + [h for (h,) in cur.fetchall()])
-
-
-def _release_orphans(cur: psycopg.Cursor) -> int:
-    """Safety net: docs and hosts held by a job that is no longer open."""
-    alive = f"EXISTS (SELECT 1 FROM recrawl.job j WHERE j.batch_id = {{}}.batch_id AND j.{_OPEN})"
-    cur.execute("UPDATE recrawl.doc d SET state = 'pending' WHERE d.state = 'dispatched' "
-                f"AND NOT {alive.format('d')} RETURNING host_id")
-    hosts = [h for (h,) in cur.fetchall()]
-    cur.execute("UPDATE recrawl.host h SET batch_id = NULL WHERE h.batch_id IS NOT NULL "
-                f"AND NOT {alive.format('h')} RETURNING host_id")
-    freed = [h for (h,) in cur.fetchall()]
-    _refresh_best_rank(cur, hosts + freed)
-    return len(hosts)
-
-
-def _check_jobs(cfg: Config, conn: psycopg.Connection, api: CrawlerApi, now: datetime,
-                stats: dict[str, Any]) -> None:
-    """Asks the API about each unapplied job at most every `status_poll_s`.
-
-    Only the API knows when a job is done (docs/03 §3.7). A submitted job it
-    reports `completed` becomes `completed` once its results dir is mounted; if
-    the dir is missing the mount is wrong for every job, so claims stop. A job
-    the API no longer knows is lost: it expired, or its results were deleted.
-    That also covers a completed or `error` job left unapplied past its TTL. A
-    job whose answer is unusable is skipped, so it cannot hold back the others;
-    the first query that cannot reach the API ends the round, so a dead API
-    costs one timeout.
-    """
-    r = cfg.recrawl
-    rows = conn.execute(
-        "SELECT batch_id, job_id, state FROM recrawl.job "
-        "WHERE state IN ('submitted', 'completed', 'error') "
-        "AND coalesce(checked_at, submitted_at) <= %s ORDER BY batch_id",
-        (now - timedelta(seconds=r.status_poll_s),)).fetchall()
-    for batch, job_id, state in rows:
-        try:
-            status, completed_at = api.status(job_id)
-        except OSError as exc:
-            stats["api_error"] = f"GET {api.url}/{job_id}: {exc}"
-            return
-        if status is None:
-            stats["api_error"] = f"GET {api.url}/{job_id} gave no usable answer"
+    stats: dict[str, Any] = {"batches": 0, "docs": 0, "invalid": 0, "duplicate": 0}
+    request_id = _ensure_request(cfg, lay, api, live, stats)
+    if request_id is None:
+        return _wait(stats, r.api_backoff_s, paused=True)
+    now = clock()
+    dues = sorted(lay.due(request_id).glob("due-*.parquet"))
+    due = dues[-1] if dues else None
+    if due is not None and due.with_suffix(".done").exists():
+        made = datetime.strptime(due.stem.removeprefix("due-"), "%Y%m%dT%H%M%S%fZ"
+                                 ).replace(tzinfo=UTC)
+        ready = made + timedelta(hours=r.due_interval_h)
+        if now < ready:
+            return _wait(stats, (ready - now).total_seconds(), idle=True)
+        due = None
+    if due is None:
+        due, stats["due"] = compute_due(cfg, lay, live, request_id, now)
+        for old in dues:                  # sent in full; their push files stay
+            old.unlink()
+            old.with_suffix(".done").unlink(missing_ok=True)
+    ts = due.stem.removeprefix("due-")
+    pushes = lay.push(request_id)
+    sent = [_batch_no(p) for p in pushes.glob(f"{ts}-*.parquet")]
+    start = max(sent) if sent else 0      # the last batch may lack its answer: send it again
+    batches = pq.ParquetFile(due).iter_batches(batch_size=r.batch_urls,
+                                               columns=["doc_id", "url", "rank"])
+    for n, batch in enumerate(batches):
+        if n < start:
             continue
-        stats["checked"] += 1
-        if status == "missing":
-            with conn.transaction(), conn.cursor() as cur:
-                _cycle_lock(cur)
-                cur.execute("UPDATE recrawl.job SET state = 'lost', finished_at = %s, "
-                            "error = 'the API does not know it' WHERE batch_id = %s "
-                            "AND state IN ('submitted', 'completed', 'error')", (now, batch))
-                if cur.rowcount:
-                    _release(cur, [batch])
-                    stats["lost"] += 1
-            continue
-        if status == "completed" and state == "submitted":
-            if not (Path(r.result_root) / job_id).is_dir():
-                stats["unmounted"] = True
-                stats["config_error"] = f"job {job_id} is completed but not under {r.result_root}"
-                continue
-            try:
-                done = _timestamp(completed_at, "completed_at")
-            except ValueError as exc:
-                stats["api_error"] = f"GET {api.url}/{job_id}: {exc}"
-                continue
-            conn.execute("UPDATE recrawl.job SET state = 'completed', completed_at = %s, "
-                         "checked_at = %s WHERE batch_id = %s AND state = 'submitted'",
-                         (done, now, batch))
-            stats["completed"] += 1
-            continue
-        conn.execute("UPDATE recrawl.job SET checked_at = %s WHERE batch_id = %s",
-                     (now, batch))
+        begin = next_allowed_start(clock(), r.api_timeout_s, cfg.guard)
+        if begin > clock():
+            return _wait(stats, (begin - clock()).total_seconds(), guarded=True)
+        stop = _send(cfg, lay, api, request_id, f"{ts}-{n:06d}", batch, clock(), stats)
+        if stop is not None:
+            return stop
+    due.with_suffix(".done").touch()
+    return _wait(stats, 1.0, sent=ts)
 
 
-def _delete_applied(conn: psycopg.Connection, api: CrawlerApi, now: datetime,
-                    stats: dict[str, Any]) -> None:
-    """Deletes applied jobs at the API; a failure stops here and is tried next cycle."""
-    rows = conn.execute("SELECT batch_id, job_id FROM recrawl.job WHERE state = 'applied' "
-                        "AND deleted_at IS NULL ORDER BY batch_id").fetchall()
-    for batch, job_id in rows:
-        if not api.delete(job_id):
-            stats["api_error"] = f"DELETE {api.url}/{job_id} failed"
-            return
-        conn.execute("UPDATE recrawl.job SET deleted_at = %s WHERE batch_id = %s",
-                     (now, batch))
-        stats["deleted"] += 1
-
-
-# A throttle pause ends within host_pause_max_s, so a later next_at was set by _claim for
-# docs in backoff; it must not hold back docs that are due now.
-_WAKE = ("UPDATE recrawl.host h SET next_at = NULL FROM {} AS w(host_id) "
-         "WHERE h.host_id = w.host_id AND h.next_at > %s")
-
-
-def _wake(cur: psycopg.Cursor, hosts: Iterable[int], now: datetime, pause_max_s: int) -> None:
-    """Clears the backoff `next_at` of hosts that have a doc due now."""
-    ids = sorted(set(hosts))
-    if ids:
-        cur.execute(_WAKE.format("unnest(%s::bigint[])"),
-                    (ids, now + timedelta(seconds=pause_max_s)))
-
-
-def _ready_hosts(cfg: Config, cur: psycopg.Cursor, now: datetime,
-                 want: int) -> Iterable[tuple[int, list[tuple[int, str]]]]:
-    """Ready hosts by best rank with up to `host_docs_per_job` due docs each.
-
-    Pages through `host_ready` so a cycle reads about the hosts it needs. A
-    ready host with no doc due now (all in backoff) waits for its earliest one,
-    or leaves the ready set.
-    """
+def _send(cfg: Config, lay: Layout, api: CrawlApi, request_id: str, batch_id: str,
+          batch: pa.RecordBatch, now: datetime, stats: dict[str, Any]) -> dict[str, Any] | None:
+    """POSTs one batch; returns the cycle's result when sending must stop."""
     r = cfg.recrawl
-    page = max(100, want // r.host_docs_per_job + 1)
-    last = (-1, -1)
-    while True:
-        cur.execute(
-            "SELECT host_id, best_rank FROM recrawl.host WHERE batch_id IS NULL "
-            "AND best_rank IS NOT NULL AND (next_at IS NULL OR next_at <= %s) "
-            "AND (best_rank, host_id) > (%s, %s) ORDER BY best_rank, host_id LIMIT %s",
-            (now, *last, page))
-        hosts = cur.fetchall()
-        if not hosts:
-            return
-        last = hosts[-1][1], hosts[-1][0]
-        cur.execute(
-            "SELECT h.host_id, d.doc_id, d.url FROM unnest(%s::bigint[]) "
-            "WITH ORDINALITY AS h(host_id, o) CROSS JOIN LATERAL (SELECT doc_id, url, rank "
-            f"FROM recrawl.doc WHERE host_id = h.host_id AND rank IS NOT NULL AND {_DUE} "
-            "AND due_at <= %s ORDER BY rank LIMIT %s) d ORDER BY h.o, d.rank",
-            ([h for h, _ in hosts], now, r.host_docs_per_job))
-        docs: dict[int, list[tuple[int, str]]] = {}
-        for h, doc_id, url in cur.fetchall():
-            docs.setdefault(h, []).append((doc_id, url))
-        idle = [h for h, _ in hosts if h not in docs]
-        if idle:
-            cur.execute(
-                "UPDATE recrawl.host h SET next_at = m.n, best_rank = CASE WHEN m.n IS NULL "
-                "THEN NULL ELSE h.best_rank END FROM (SELECT u.host_id, (SELECT min(d.due_at) "
-                "FROM recrawl.doc d WHERE d.host_id = u.host_id AND d.rank IS NOT NULL "
-                f"AND d.{_DUE}) AS n FROM unnest(%s::bigint[]) AS u(host_id)) m "
-                "WHERE h.host_id = m.host_id", (idle,))
-        for h, _ in hosts:
-            if h in docs:
-                yield h, docs[h]
+    ids = batch.column("doc_id").to_pylist()
+    push_file = lay.push(request_id) / f"{batch_id}.parquet"
+    # A batch sent again keeps its first time: its docs may already have results since.
+    if not push_file.exists():
+        write_parquet_atomic(pa.table({"doc_id": pa.array(ids, pa.uint64()),
+                                       "pushed_at": pa.array([now] * len(ids), _TS)}),
+                             push_file)
+    items = [{"id": str(d), "url": u, "priority": int(k)}
+             for d, u, k in zip(ids, batch.column("url").to_pylist(),
+                                batch.column("rank").to_pylist(), strict=True)]
+    reply = api.post_urls(request_id, batch_id, items)
+    if reply.status == 202:
+        skipped = reply.body.get("skipped", [])
+        invalid = [ids[s["index"]] for s in skipped if s["reason"] == "invalid"]
+        if invalid:
+            write_parquet_atomic(_outcomes([{
+                "doc_id": d, "request_id": request_id, "outcome": "gone",
+                "fail_reason": "invalid_url", "finished_at": now} for d in invalid]),
+                lay.outcome / f"fetch_date={now:%Y%m%d}" / f"push-{request_id}-{batch_id}.parquet")
+        stats["batches"] += 1
+        stats["docs"] += reply.body["accepted"]
+        stats["invalid"] += len(invalid)
+        stats["duplicate"] += len(skipped) - len(invalid)
+        return None
+    if reply.status is None or reply.status == 503 or reply.status >= 500:
+        stats["api_error"] = f"POST {batch_id}: {reply.status} {reply.error}"
+        return _wait(stats, reply.retry_after or r.api_backoff_s, paused=True)
+    # Refused for good: the batch never reached the crawler, so its docs are not in flight.
+    push_file.unlink(missing_ok=True)
+    raise RecrawlError(f"POST {api.url}/{request_id}/urls answered {reply.status}: "
+                       f"{reply.error}")
 
 
-def _claim(cfg: Config, cur: psycopg.Cursor, now: datetime, n_jobs: int) -> list[Job]:
-    """Packs ready hosts into up to `n_jobs` jobs and marks their docs `dispatched`.
-
-    Hosts fill each job in rank order, each host's docs in rank order. The order
-    across hosts does not matter: the crawler regroups a job's URLs by host.
-    """
-    r = cfg.recrawl
-    packed: list[list[tuple[int, list[tuple[int, str]]]]] = [[]]
-    size = 0
-    hosts = _ready_hosts(cfg, cur, now, n_jobs * r.job_size)
-    for h, docs in hosts:
-        if size == r.job_size:
-            if len(packed) == n_jobs:
-                break
-            packed.append([])
-            size = 0
-        take = docs[:r.job_size - size]
-        packed[-1].append((h, take))
-        size += len(take)
-    hosts.close()
-    packed = [p for p in packed if p]
-    if not packed:
-        return []
-    cur.execute("SELECT nextval('recrawl.batch_seq') FROM generate_series(1, %s)",
-                (len(packed),))
-    jobs = []
-    for (batch,), groups in zip(cur.fetchall(), packed, strict=True):
-        order = [d for _, docs in groups for d in docs]
-        jobs.append(Job(batch, [d for d, _ in order], [u for _, u in order]))
-    cur.executemany("INSERT INTO recrawl.job (batch_id, doc_ids, state, claimed_at) "
-                    "VALUES (%s, %s, 'claimed', %s)",
-                    [(j.batch_id, j.doc_ids, now) for j in jobs])
-    cur.execute(
-        "UPDATE recrawl.doc d SET state = 'dispatched', batch_id = u.batch_id "
-        "FROM unnest(%s::bigint[], %s::bigint[]) AS u(doc_id, batch_id) "
-        "WHERE d.doc_id = u.doc_id",
-        ([d for j in jobs for d in j.doc_ids],
-         [j.batch_id for j in jobs for _ in j.doc_ids]))
-    # next_at stays as it is: the open job alone holds the host back.
-    rows = [(h, j.batch_id) for j, groups in zip(jobs, packed, strict=True) for h, _ in groups]
-    cur.execute(
-        "UPDATE recrawl.host h SET batch_id = u.batch_id "
-        "FROM unnest(%s::bigint[], %s::bigint[]) AS u(host_id, batch_id) "
-        "WHERE h.host_id = u.host_id", tuple(map(list, zip(*rows, strict=True))))
-    _refresh_best_rank(cur, [h for h, _ in rows])
-    return jobs
+def run_pusher(cfg: Config, api: CrawlApi, live: Callable[[], LiveRun], once: bool,
+               sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+    lay = layout(cfg)
+    return run_loop(lambda: push_cycle(cfg, lay, api, live()), once, sleep)
 
 
-def _send(cfg: Config, conn: psycopg.Connection, api: CrawlerApi, jobs: list[Job],
-          stats: dict[str, Any], now: datetime) -> None:
-    """POSTs claimed jobs in order and records each answer (docs/03 §3.6).
+# ---------------------------------------------------------------- pull
 
-    - 200: the job is `submitted` under its `job_id`.
-    - 400 "... at index N": that URL is unfetchable; it becomes `gone` and the
-      rest is sent again, at most `max_resend` times.
-    - Any other 4xx or 5xx: the API accepted nothing. The job is released,
-      sending stops, and the planner pauses `api_backoff_s`.
-    - No answer: acceptance is unknown, so the job stays `claimed` (the claim
-      timeout recovers it) and sending stops.
-    Jobs not sent are released.
-    """
-    r = cfg.recrawl
-    dropped: list[Job] = []
-    for n, job in enumerate(jobs):
-        for _ in range(r.max_resend + 1):
-            reply = api.submit(job.urls, r.result_ttl_days)
-            bad = BAD_INDEX_RE.search(reply.error or "") if reply.status == 400 else None
-            if bad is None or int(bad.group(1)) >= len(job.urls):
-                break
-            _drop_invalid(conn, job, int(bad.group(1)))
-            stats["invalid"] += 1
-            if not job.urls:
-                break
-        if reply.status == 200 and job.urls:
-            with conn.transaction(), conn.cursor() as cur:
-                cur.execute("UPDATE recrawl.job SET state = 'submitted', job_id = %s, "
-                            "submitted_at = %s WHERE batch_id = %s",
-                            (reply.job_id, now, job.batch_id))
-            stats["jobs"] += 1
-            stats["docs"] += len(job.urls)
-            continue
-        if reply.status is None:
-            stats["unknown"] += 1
-            if reply.error:
-                stats["api_error"] = reply.error
-            dropped += jobs[n + 1:]
-            break
-        dropped.append(job)
-        if job.urls and not (reply.status == 400 and bad is not None):
-            stats["api_error"] = f"POST {api.url} answered {reply.status}: {reply.error}"
-            api.paused_until = now + timedelta(seconds=r.api_backoff_s)
-            dropped += jobs[n + 1:]
-            break
-    stats["refused"] = len(dropped)
-    if dropped:
-        with conn.transaction(), conn.cursor() as cur:
-            _cycle_lock(cur)
-            batches = [j.batch_id for j in dropped]
-            cur.execute("UPDATE recrawl.job SET state = 'lost', finished_at = %s, "
-                        "error = 'not accepted' WHERE batch_id = ANY(%s::bigint[])",
-                        (now, batches))
-            _release(cur, batches)
-
-
-def _drop_invalid(conn: psycopg.Connection, job: Job, index: int) -> None:
-    """The API judged this URL invalid; asking again would repeat the answer."""
-    doc_id = job.doc_ids.pop(index)
-    job.urls.pop(index)
-    with conn.transaction(), conn.cursor() as cur:
-        _cycle_lock(cur)
-        cur.execute("UPDATE recrawl.doc SET state = 'gone', fail_reason = 'invalid_url' "
-                    "WHERE doc_id = %s AND state = 'dispatched' AND batch_id = %s "
-                    "RETURNING host_id", (doc_id, job.batch_id))
-        hosts = [h for (h,) in cur.fetchall()]
-        cur.execute("UPDATE recrawl.job SET doc_ids = %s WHERE batch_id = %s",
-                    (job.doc_ids, job.batch_id))
-        # A host with nothing left in this job need not wait for it.
-        cur.execute("UPDATE recrawl.host h SET batch_id = NULL WHERE h.host_id = ANY(%s) "
-                    "AND h.batch_id = %s AND NOT EXISTS (SELECT 1 FROM recrawl.doc d "
-                    "WHERE d.host_id = h.host_id AND d.state = 'dispatched' "
-                    "AND d.batch_id = h.batch_id)", (hosts, job.batch_id))
-        _refresh_best_rank(cur, hosts)
-
-
-def _days(left: int, per_day: int) -> float | None:
-    return round(left / per_day, 1) if per_day else None
-
-
-def capacity_report(conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
-    """Progress of the live list, measured: docs left and docs fetched in the last day.
-
-    No rate is assumed: the crawler's pace shows in `fetched_at`. Days left are the
-    docs left over the last day's fetches, for the list and for its largest host.
-    """
-    rows = conn.execute(
-        "SELECT count(*), count(*) FILTER (WHERE state <> 'fetched'), "
-        "count(*) FILTER (WHERE fetched_at > %s) FROM recrawl.doc "
-        "WHERE rank IS NOT NULL AND state <> 'gone' GROUP BY host_id",
-        (now - timedelta(days=1),)).fetchall()
-    docs, left, day = (np.array(c, dtype=np.int64) for c in zip(*rows, strict=True)) \
-        if rows else (np.zeros(0, dtype=np.int64),) * 3
-    states = dict(conn.execute("SELECT state, count(*) FROM recrawl.doc "
-                               "WHERE rank IS NOT NULL GROUP BY state").fetchall())
-    report = {"docs": int(docs.sum()), "hosts": int(docs.size), "states": states,
-              "max_host_docs": int(docs.max()) if docs.size else 0,
-              "left": int(left.sum()), "fetched_1d": int(day.sum()),
-              "days_left": _days(int(left.sum()), int(day.sum())), "largest_left": None}
-    if left.size:
-        i = int(left.argmax())
-        report["largest_left"] = {"left": int(left[i]), "fetched_1d": int(day[i]),
-                                  "days_left": _days(int(left[i]), int(day[i]))}
-    return report
-
-
-# ---------------------------------------------------------------- archive
-
-def run_archiver(cfg: Config, conn: psycopg.Connection, once: bool) -> dict[str, Any]:
-    _instance_lock(conn, "archive")
-    return run_loop(lambda: archive_cycle(cfg, conn, datetime.now(UTC)),
-                    cfg.recrawl.archive_interval_s, once)
-
-
-@dataclass(frozen=True)
-class JobInput:
-    """What a worker needs to read one job's results: the docs and URLs as sent."""
-
-    batch_id: int
-    job_id: str
-    doc_ids: list[int]
-    urls: list[str]
-    completed_at: datetime                # the API's; names the day the results land in
-
-
-@dataclass(frozen=True)
-class PreparedJob:
-    """The file work for one job; `status` is ok, error or io_error."""
-
-    status: str
-    records: list[dict[str, Any]] = field(default_factory=list)
-    text_file: str | None = None
-    texts: int = 0
-    error: str | None = None
-
-
-def archive_cycle(cfg: Config, conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
-    """Applies every completed job; never changes `result_root` and never calls the API.
-
-    Candidates are completed jobs and jobs in `error`, which are tried again so
-    a code fix resumes them. A job whose dir is gone (expired, deleted) is left
-    for the planner, which loses it once the API stops knowing it.
-    """
-    r = cfg.recrawl
-    totals: dict[str, Any] = dict.fromkeys(
-        ("jobs", "records", "applied", "texts", "errors", "io_error"), 0)
-    rows = conn.execute(
-        "SELECT batch_id, job_id, doc_ids, completed_at FROM recrawl.job "
-        "WHERE state IN ('completed', 'error') ORDER BY batch_id").fetchall()
-    rows = [row for row in rows if (Path(r.result_root) / row[1]).is_dir()]
-    if not rows:
-        return totals
-    urls = dict(conn.execute("SELECT doc_id, url FROM recrawl.doc WHERE doc_id = ANY(%s)",
-                             ([d for row in rows for d in row[2]],)).fetchall())
-    todo = [JobInput(b, j, ids, [urls[d] for d in ids], done) for b, j, ids, done in rows]
-    if r.archive_workers == 1 or len(todo) < 2:
-        _finish_jobs(cfg, conn, todo, (prepare_job(r, j) for j in todo), now, totals)
-    else:
-        context = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(min(r.archive_workers, len(todo)), mp_context=context) as pool:
-            futures = [pool.submit(prepare_job, r, j) for j in todo]
-            _finish_jobs(cfg, conn, todo, (f.result() for f in futures), now, totals)
-    return totals
-
-
-def _finish_jobs(cfg: Config, conn: psycopg.Connection, todo: list[JobInput],
-                 prepared: Iterable[PreparedJob], now: datetime,
-                 totals: dict[str, Any]) -> None:
-    for job, done in zip(todo, prepared, strict=True):
-        if done.status == "ok":
-            totals["jobs"] += 1
-            totals["records"] += len(done.records)
-            totals["texts"] += done.texts
-            totals["applied"] += _apply(cfg, conn, job, done, now)
-        elif done.status == "error":
-            # The results break the contract. The job keeps its docs and halts the
-            # planner until a fix lets a later cycle apply it, or its TTL passes.
-            totals["errors"] += 1
-            totals["last_error"] = done.error
-            with conn.transaction(), conn.cursor() as cur:
-                _cycle_lock(cur)
-                cur.execute("UPDATE recrawl.job SET state = 'error', error = %s "
-                            "WHERE batch_id = %s AND state IN ('completed', 'error')",
-                            (done.error, job.batch_id))
-        else:
-            # An unreadable file: the job is tried again next cycle.
-            totals["io_error"] += 1
-            totals["last_error"] = done.error
-
-
-def _is_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+def classify(error: str | None, html: str | None) -> tuple[str, str | None]:
+    """Maps a record's `error` to (outcome, fail_reason) (docs/RECRAWL.md §5)."""
+    if error is None:
+        return ("fetched", None) if html else ("retry", "no_html")
+    if error in GONE_ERRORS:
+        return "gone", error
+    if error == "robots":
+        return "robots", error
+    if error in REQUEUE_ERRORS:
+        return "requeue", error
+    return "retry", error
 
 
 def _timestamp(value: Any, key: str) -> datetime:
     if not isinstance(value, str):
-        raise ValueError(f"{key} must be an ISO 8601 string")
+        raise RecrawlError(f"{key} must be an ISO 8601 string")
     at = datetime.fromisoformat(value)
     if at.tzinfo is None:
-        raise ValueError(f"{key} has no UTC offset")
+        raise RecrawlError(f"{key} has no UTC offset")
     return at
 
 
-def read_item(part: Path, index: int, url: str) -> dict[str, Any]:
-    """Reads and type-checks `NNNNN.json` in its crawler's partition `part`.
-
-    Raises ValueError if the record breaks the contract.
-    """
-    name = f"{part.name}/{index:05d}.json"
-    item = json.loads((part / f"{index:05d}.json").read_text(encoding="utf-8"))
-    if not isinstance(item, dict) or not set(item) >= ITEM_KEYS:
-        raise ValueError(f"{name} lacks a result key")
-    if item["url"] != url:
-        raise ValueError(f"{name} is for another URL than request.json lists")
-    status = item["status_code"]
-    if status is not None and not (_is_int(status) and 100 <= status <= 599):
-        raise ValueError(f"{name}: status_code must be an HTTP status or null")
-    for key in ("final_url", "error"):
-        if item[key] is not None and not isinstance(item[key], str):
-            raise ValueError(f"{name}: {key} must be a string or null")
-    if item["html_file"] not in (None, f"{index:05d}.html"):
-        raise ValueError(f"{name}: html_file must be {index:05d}.html or null")
-    item["fetched_at"] = _timestamp(item["fetched_at"], f"{name} fetched_at")
-    return item
-
-
-def map_results(sent: list[str], listed: list[str]) -> list[tuple[int, int]]:
-    """Pairs (position sent, position in `request.json`) for every doc with a result.
-
-    The API keeps the order and may only canonicalize a URL or drop a later
-    duplicate (docs/03 §3.6). With nothing dropped, position i is doc i; a URL
-    that differs there but equals another URL we sent means the order changed,
-    which would attach one page's text to another doc. With duplicates dropped,
-    only URLs that came back unchanged are paired; the rest are retried alone.
-    """
-    if len(listed) > len(sent):
-        raise RecrawlError(f"request.json lists {len(listed)} URLs; we sent {len(sent)}")
-    if len(listed) == len(sent):
-        ours = set(sent)
-        moved = [i for i, (a, b) in enumerate(zip(sent, listed, strict=True))
-                 if a != b and b in ours]
-        if moved:
-            raise RecrawlError(f"request.json is not in the order sent (position {moved[0]})")
-        return [(i, i) for i in range(len(sent))]
-    where = {u: n for n, u in enumerate(listed)}
-    return [(i, where[u]) for i, u in enumerate(sent) if u in where]
-
-
-def prepare_job(r: RecrawlCfg, job: JobInput) -> PreparedJob:
-    """Maps one job's results to its docs and writes its text and results; no DB."""
-    d = Path(r.result_root) / job.job_id
-    try:
-        try:
-            request = json.loads((d / "request.json").read_text(encoding="utf-8"))
-            listed, owners = request["urls"], request["crawler_ids"]
-            if not (isinstance(listed, list) and all(isinstance(u, str) for u in listed)):
-                raise ValueError("request.json urls must be a list of strings")
-            if not (isinstance(owners, list) and len(owners) == len(listed)
-                    and all(_is_int(c) and c >= 0 for c in owners)):
-                raise ValueError("request.json crawler_ids must be one crawler per URL")
-            parts = [d / f"crawler_{c:02d}" for c in owners]
-            items = [read_item(parts[n], n, u) for n, u in enumerate(listed)]
-            paired = dict(map_results(job.urls, listed))
-            records, rows, lines = [], [], []
-            for i, doc_id in enumerate(job.doc_ids):
-                n = paired.get(i)
-                item = items[n] if n is not None else None
-                rec = _record(r, parts[n] if n is not None else d, job, i, item, rows)
-                records.append(rec)
-                lines.append(json.dumps({
-                    "batch_id": job.batch_id, "job_id": job.job_id, "doc_id": doc_id,
-                    "url": job.urls[i], "index": n,
-                    **({k: str(v) if k == "fetched_at" else v for k, v in item.items()}
-                       if item else {}),
-                    "outcome": rec["outcome"], "fail_reason": rec["fail_reason"]},
-                    ensure_ascii=False))
-        except FileNotFoundError as exc:
-            # A completed job's files are all written, so a missing file breaks the
-            # contract, unless the whole dir went away meanwhile.
-            if not d.is_dir():
-                return PreparedJob("io_error", error=f"{job.job_id} vanished")
-            return PreparedJob("error", error=f"{job.job_id}: missing {Path(exc.filename).name}")
-        except (ValueError, KeyError, TypeError, RecrawlError) as exc:
-            return PreparedJob("error", error=f"{job.job_id}: {exc}")
-        day = f"{job.completed_at.astimezone(UTC):%Y%m%d}"
-        rel = f"fetch_date={day}/job-{job.batch_id}.parquet"
-        if rows:
-            write_parquet_atomic(pa.Table.from_pylist(rows, schema=TEXT_SCHEMA),
-                                 Path(r.text_root) / rel)
-        dest = Path(r.log_root) / day
-        dest.mkdir(parents=True, exist_ok=True)
-        gz_tmp = dest / f"job-{job.batch_id}.jsonl.gz{TMP_SUFFIX}"
-        with gzip.open(gz_tmp, "wt", encoding="utf-8") as out:
-            out.writelines(line + "\n" for line in lines)
-        commit_file(gz_tmp, dest / f"job-{job.batch_id}.jsonl.gz")
-    except OSError as exc:
-        return PreparedJob("io_error", error=f"{job.job_id}: {exc}")
-    return PreparedJob("ok", records, rel if rows else None, len(rows))
-
-
-def _record(r: RecrawlCfg, part: Path, job: JobInput, i: int, item: dict[str, Any] | None,
-            rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """The result of doc i, read from its crawler's partition `part`.
-
-    Appends its text row when the page was fetched. An OSError reading the HTML
-    propagates, so the whole job is tried again instead of losing its pages.
-    """
-    rec = dict.fromkeys(RESULT_COLUMNS)
-    rec["doc_id"] = job.doc_ids[i]
-    if item is None:
-        rec["outcome"], rec["fail_reason"] = "retry", "unmatched"
-        return rec
-    rec["outcome"], rec["fail_reason"] = classify(item)
-    rec.update(http_status=item["status_code"], final_url=item["final_url"],
-               fetched_at=item["fetched_at"])
-    if rec["outcome"] != "fetched":
-        return rec
-    payload = (part / item["html_file"]).read_bytes()
-    try:
-        doc = extract(payload, None, r.max_body_chars)
-    except Exception:
-        # Hostile HTML must not stop the archive.
-        rec["outcome"], rec["fail_reason"] = "retry", "extract_error"
-        return rec
-    rec.update(payload_sha1=hashlib.sha1(payload).hexdigest(), text_len=len(doc.body),
-               lang=doc.lang)
-    rows.append({"doc_id": rec["doc_id"] % _UINT64, "batch_id": job.batch_id,
-                 "url": job.urls[i], "final_url": item["final_url"],
-                 "fetched_at": item["fetched_at"], "http_status": item["status_code"],
-                 "lang": doc.lang, "title": doc.title, "description": doc.description,
-                 "body": doc.body, "text_len": len(doc.body), "payload_sha1": rec["payload_sha1"]})
+def read_record(line: str) -> dict[str, Any]:
+    """Parses and type-checks one segment line; raises RecrawlError on a contract break."""
+    rec = json.loads(line)
+    if not isinstance(rec, dict) or not set(rec) >= RECORD_KEYS:
+        raise RecrawlError("a record lacks a contract key")
+    doc_id = rec["id"]
+    if not (isinstance(doc_id, str) and doc_id.isdecimal() and int(doc_id) < _UINT64):
+        raise RecrawlError(f"record id {doc_id!r} is not a doc_id")
+    status = rec["status_code"]
+    if status is not None and not (isinstance(status, int) and not isinstance(status, bool)
+                                   and 100 <= status <= 599):
+        raise RecrawlError("status_code must be an HTTP status or null")
+    for key in ("url", "final_url", "error", "html"):
+        if rec[key] is not None and not isinstance(rec[key], str):
+            raise RecrawlError(f"{key} must be a string or null")
+    rec["doc_id"] = int(doc_id)
+    rec["fetched_at"] = (None if rec["fetched_at"] is None
+                         else _timestamp(rec["fetched_at"], "fetched_at"))
+    rec["finished_at"] = _timestamp(rec["finished_at"], "finished_at")
     return rec
 
 
-def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJob,
-           now: datetime) -> int:
-    """Applies one job's results idempotently; returns the number of docs changed.
+def _outcomes(rows: list[dict[str, Any]]) -> pa.Table:
+    return pa.Table.from_pylist([{c: row.get(c) for c in OUTCOME_SCHEMA.names} for row in rows],
+                                schema=OUTCOME_SCHEMA)
 
-    Only a `completed` or `error` job is applied; a job lost meanwhile has had
-    its docs put back in line. A fetched page counts whenever it is newer than
-    the doc's last one. A failure counts only while the doc still waits on
-    this job.
+
+def _extract_all(max_body_chars: int, pages: list[tuple[int, str]]) -> list[tuple]:
+    """(doc_id, doc or None, sha1) per page; runs in a worker process."""
+    out = []
+    for doc_id, html in pages:
+        payload = html.encode("utf-8")
+        try:
+            doc = extract(payload, "utf-8", max_body_chars)
+        except Exception:      # hostile HTML must not stop the pull
+            doc = None
+        out.append((doc_id, doc, hashlib.sha1(payload).hexdigest()))
+    return out
+
+
+def _extract(r: RecrawlCfg, pages: list[tuple[int, str]]) -> dict[int, tuple]:
+    if r.archive_workers == 1 or len(pages) < 2 * r.archive_workers:
+        return {d: (doc, sha) for d, doc, sha in _extract_all(r.max_body_chars, pages)}
+    size = -(-len(pages) // r.archive_workers)
+    chunks = [pages[i:i + size] for i in range(0, len(pages), size)]
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(len(chunks), mp_context=context) as pool:
+        done = pool.map(_extract_all, [r.max_body_chars] * len(chunks), chunks)
+        return {d: (doc, sha) for part in done for d, doc, sha in part}
+
+
+def apply_segments(cfg: Config, lay: Layout, request_id: str,
+                   segments: list[tuple[str, bytes]], now: datetime) -> dict[str, int]:
+    """Writes the text and outcome rows of these segments; same segments, same files."""
+    records = [(name, read_record(line)) for name, data in segments
+               for line in gzip.decompress(data).decode("utf-8").splitlines() if line]
+    pages = [(rec["doc_id"], rec["html"]) for _, rec in records
+             if rec["error"] is None and rec["html"]]
+    docs = _extract(cfg.recrawl, pages)
+    texts, outcomes = [], []
+    for name, rec in records:
+        outcome, reason = classify(rec["error"], rec["html"])
+        row = {"doc_id": rec["doc_id"], "request_id": request_id, "outcome": outcome,
+               "fail_reason": reason, "http_status": rec["status_code"],
+               "final_url": rec["final_url"], "fetched_at": rec["fetched_at"],
+               "finished_at": rec["finished_at"]}
+        if outcome == "fetched":
+            doc, sha = docs[rec["doc_id"]]
+            if doc is None:
+                row.update(outcome="retry", fail_reason="extract_error")
+            else:
+                row.update(payload_sha1=sha, text_len=len(doc.body), lang=doc.lang)
+                texts.append({"doc_id": rec["doc_id"], "source": f"{request_id}/{name}",
+                              "url": rec["url"], "final_url": rec["final_url"],
+                              "fetched_at": rec["fetched_at"] or rec["finished_at"],
+                              "http_status": rec["status_code"], "lang": doc.lang,
+                              "title": doc.title, "description": doc.description,
+                              "body": doc.body, "text_len": len(doc.body),
+                              "payload_sha1": sha})
+        outcomes.append(row)
+    key = hashlib.sha1("\n".join(sorted(n for n, _ in segments)).encode()).hexdigest()[:20]
+    name = f"pull-{request_id}-{key}.parquet"
+    day = f"fetch_date={now:%Y%m%d}"
+    if texts:
+        write_parquet_atomic(pa.Table.from_pylist(texts, schema=TEXT_SCHEMA),
+                             lay.text / day / name)
+    # The outcome file goes last: a doc is fetched only once its text is on disk.
+    write_parquet_atomic(_outcomes(outcomes), lay.outcome / day / name)
+    return {"records": len(records), "texts": len(texts)}
+
+
+class Puller:
+    """Reads closed segments of every request of this tenant, stores them, acks them."""
+
+    def __init__(self, cfg: Config, api: CrawlApi,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.cfg = cfg
+        self.lay = layout(cfg)
+        self.api = api
+        self.clock = clock
+        self.first_seen: dict[tuple[str, str], float] = {}
+
+    def cycle(self, force: bool, now: datetime | None = None) -> dict[str, Any]:
+        r = self.cfg.recrawl
+        stats: dict[str, Any] = {"segments": 0, "records": 0, "texts": 0}
+        self.lay.root.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(self.lay.root).free < r.min_free_gb * 1e9:
+            return _wait(stats, r.long_poll_s, disk_full=True)
+        reply = self.api.requests()
+        if reply.status != 200:
+            stats["api_error"] = f"GET requests: {reply.status} {reply.error}"
+            return _wait(stats, r.api_backoff_s, paused=True)
+        current = (read_json(self.lay.request_file) or {}).get("request_id")
+        ids = [q["request_id"] for q in reply.body["requests"]
+               if q["unacked_segments"] or q["request_id"] == current]
+        for request_id in ids:
+            wait = r.long_poll_s if request_id == current and len(ids) == 1 else 0
+            listed = self.api.segments(request_id, wait)
+            if listed.status != 200:
+                stats["api_error"] = f"GET segments {request_id}: {listed.status} {listed.error}"
+                return _wait(stats, r.api_backoff_s, paused=True)
+            names = [s["name"] for s in listed.body["segments"]][:r.pull_batch_segments]
+            if not names:
+                continue
+            seen = min(self.first_seen.setdefault((request_id, n), self.clock()) for n in names)
+            if not (force or len(names) >= r.pull_batch_segments
+                    or self.clock() - seen >= r.pull_batch_s):
+                continue
+            segments = []
+            for name in names:
+                got = self.api.download(request_id, name)
+                if got.status != 200:
+                    stats["api_error"] = f"GET {name}: {got.status} {got.error}"
+                    return _wait(stats, r.api_backoff_s, paused=True)
+                segments.append((name, got.body))
+            done = apply_segments(self.cfg, self.lay, request_id, segments,
+                                  now or datetime.now(UTC))
+            acked = self.api.ack(request_id, names)
+            if acked.status != 200:
+                # The files are written; the segments come again and rewrite the same rows.
+                stats["api_error"] = f"POST ack {request_id}: {acked.status} {acked.error}"
+                return _wait(stats, r.api_backoff_s, paused=True)
+            for name in names:
+                self.first_seen.pop((request_id, name), None)
+            stats["segments"] += len(names)
+            stats["records"] += done["records"]
+            stats["texts"] += done["texts"]
+        return _wait(stats, 1.0 if stats["segments"] else min(r.pull_batch_s, r.long_poll_s))
+
+
+def run_puller(cfg: Config, api: CrawlApi, once: bool,
+               sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+    puller = Puller(cfg, api)
+    return run_loop(lambda: puller.cycle(force=once), once, sleep)
+
+
+# ---------------------------------------------------------------- compact
+
+def _old_files(root: Path, before: str) -> list[Path]:
+    return sorted(p for p in root.glob("fetch_date=*/*.parquet")
+                  if p.parent.name.removeprefix("fetch_date=") < before)
+
+
+def _files_sql(files: Iterable[Path]) -> str:
+    return "[" + ", ".join(sql_str(str(p)) for p in files) + "]"
+
+
+def compact(cfg: Config, now: datetime) -> dict[str, Any]:
+    """Rewrites the files of days before yesterday into one file each; due stays the same.
+
+    Outcome keeps each doc's latest `fetched` row and every row after it, which is all
+    `due_query` reads. Text keeps each doc's newest row. Push files of requests other than
+    the current one go: only the current request's pushes decide what is in flight.
     """
     r = cfg.recrawl
-    args = {"now": now, "stale": r.stale_days, "robots": r.robots_retry_days,
-            "base": r.retry_base_s, "max": r.retry_max_s, "attempts": r.max_attempts,
-            "pause": r.host_pause_max_s, "text_file": done.text_file, "batch": job.batch_id,
-            "n": len(done.records)}
-    changed = 0
-    with conn.transaction(), conn.cursor() as cur:
-        _cycle_lock(cur)
-        cur.execute("SELECT state FROM recrawl.job WHERE batch_id = %(batch)s FOR UPDATE", args)
-        if cur.fetchone() not in (("completed",), ("error",)):
-            return 0
-        cur.execute("CREATE TEMP TABLE r (doc_id BIGINT, outcome TEXT, http_status SMALLINT, "
-                    "final_url TEXT, fail_reason TEXT, payload_sha1 TEXT, "
-                    "fetched_at TIMESTAMPTZ, text_len INTEGER, lang TEXT) ON COMMIT DROP")
-        with cur.copy(f"COPY r ({', '.join(RESULT_COLUMNS)}) FROM STDIN") as copy:
-            for rec in done.records:
-                copy.write_row([rec[c] for c in RESULT_COLUMNS])
-        cur.execute(
-            "UPDATE recrawl.doc d SET state = 'fetched', fetched_at = r.fetched_at, "
-            "http_status = r.http_status, final_url = r.final_url, fail_reason = NULL, "
-            "payload_sha1 = r.payload_sha1, text_file = %(text_file)s, text_len = r.text_len, "
-            "lang = r.lang, attempts = 0, "
-            "due_at = r.fetched_at + make_interval(days => %(stale)s) FROM r "
-            "WHERE r.outcome = 'fetched' AND d.doc_id = r.doc_id "
-            "AND (d.fetched_at IS NULL OR d.fetched_at < r.fetched_at)", args)
-        changed += cur.rowcount
-        # Fetched here, but the doc already holds a newer page: it is fetched, not failed.
-        cur.execute("UPDATE recrawl.doc d SET state = 'fetched' FROM r WHERE r.outcome = 'fetched' "
-                    "AND d.doc_id = r.doc_id AND d.state = 'dispatched' "
-                    "AND d.batch_id = %(batch)s", args)
-        current = ("FROM r WHERE r.outcome = {} AND d.doc_id = r.doc_id "
-                   "AND d.state = 'dispatched' AND d.batch_id = %(batch)s")
-        cur.execute(
-            "UPDATE recrawl.doc d SET state = 'gone', http_status = r.http_status, "
-            "final_url = r.final_url, fail_reason = r.fail_reason " + current.format("'gone'"),
-            args)
-        changed += cur.rowcount
-        cur.execute(
-            "UPDATE recrawl.doc d SET state = 'failed', http_status = r.http_status, "
-            "final_url = r.final_url, fail_reason = r.fail_reason, "
-            "due_at = %(now)s + make_interval(days => %(robots)s) "
-            + current.format("'robots'"), args)
-        changed += cur.rowcount
-        cur.execute(
-            "UPDATE recrawl.host h SET next_at = greatest(coalesce(h.next_at, %(now)s), "
-            "%(now)s + make_interval(secs => least(%(base)s, %(pause)s))) "
-            "FROM (SELECT DISTINCT d.host_id FROM r JOIN recrawl.doc d USING (doc_id) "
-            "WHERE r.outcome = 'throttled' AND d.state = 'dispatched' "
-            "AND d.batch_id = %(batch)s) p WHERE h.host_id = p.host_id", args)
-        backoff = ("state = 'failed', attempts = d.attempts + 1, due_at = %(now)s + CASE "
-                   "WHEN d.attempts + 1 >= %(attempts)s THEN make_interval(days => %(stale)s) "
-                   "ELSE make_interval(secs => least(%(base)s * power(2, d.attempts), %(max)s)) "
-                   "END")
-        cur.execute(
-            f"UPDATE recrawl.doc d SET {backoff}, http_status = r.http_status, "
-            "final_url = r.final_url, fail_reason = r.fail_reason "
-            "FROM r WHERE r.outcome IN ('throttled', 'retry') AND d.doc_id = r.doc_id "
-            "AND d.state = 'dispatched' AND d.batch_id = %(batch)s", args)
-        changed += cur.rowcount
-        # A doc of this job with no record at all: never expected, never left waiting.
-        cur.execute(f"UPDATE recrawl.doc d SET {backoff}, fail_reason = 'no_result' "
-                    "WHERE d.state = 'dispatched' AND d.batch_id = %(batch)s", args)
-        changed += cur.rowcount
-        cur.execute("UPDATE recrawl.host SET batch_id = NULL WHERE batch_id = %(batch)s "
-                    "RETURNING host_id", args)
-        freed = [h for (h,) in cur.fetchall()]
-        cur.execute("SELECT DISTINCT d.host_id FROM r JOIN recrawl.doc d USING (doc_id)")
-        _refresh_best_rank(cur, freed + [h for (h,) in cur.fetchall()])
-        # Last, so a crash before here leaves the job to be applied again.
-        cur.execute("UPDATE recrawl.job SET state = 'applied', finished_at = %(now)s, "
-                    "records = %(n)s, error = NULL WHERE batch_id = %(batch)s", args)
-    return changed
+    lay = layout(cfg)
+    before = f"{now - timedelta(days=1):%Y%m%d}"
+    stats: dict[str, Any] = {"outcome_files": 0, "text_files": 0, "push_dirs": 0, "due_dirs": 0}
+    con = open_duckdb(cfg, lay.root / "duckdb_tmp")
+    try:
+        for kind, root, query in (
+            ("outcome", lay.outcome,
+             "SELECT * FROM read_parquet({f}, hive_partitioning=false, union_by_name=true) "
+             "QUALIFY row_number() OVER (PARTITION BY doc_id, request_id, outcome, "
+             "finished_at) = 1 AND finished_at >= coalesce(max(CASE WHEN outcome = 'fetched' "
+             "THEN finished_at END) OVER (PARTITION BY doc_id), '-infinity'::TIMESTAMPTZ)"),
+            ("text", lay.text,
+             "SELECT * EXCLUDE (filename) FROM read_parquet({f}, filename=true, "
+             "hive_partitioning=false, union_by_name=true) "
+             "QUALIFY row_number() OVER (PARTITION BY doc_id ORDER BY fetched_at DESC, "
+             "filename DESC) = 1"),
+        ):
+            files = _old_files(root, before)
+            if len(files) < 2:
+                continue
+            need = sum(p.stat().st_size for p in files) + r.min_free_gb * 1e9
+            if shutil.disk_usage(lay.root).free < need:
+                stats[f"{kind}_skipped"] = "disk"
+                continue
+            day = max(p.parent.name for p in files)
+            final = root / day / f"compact-{utc_id(now)}.parquet"
+            copy_atomic(con, query.format(f=_files_sql(files)), final)
+            for p in files:
+                p.unlink()
+            stats[f"{kind}_files"] = len(files)
+    finally:
+        con.close()
+    current = (read_json(lay.request_file) or {}).get("request_id")
+    for kind in ("push", "due"):
+        for d in (lay.root / kind).glob("*"):
+            if d.is_dir() and d.name != current:
+                for p in d.glob("*"):
+                    p.unlink()
+                d.rmdir()
+                stats[f"{kind}_dirs"] = stats.get(f"{kind}_dirs", 0) + 1
+    return stats
+
+
+# ---------------------------------------------------------------- report
+
+def report(cfg: Config, api: CrawlApi, live: LiveRun, now: datetime) -> dict[str, Any]:
+    """Progress of the live list: the crawler's counts and the outcome files' view."""
+    r = cfg.recrawl
+    lay = layout(cfg)
+    current = read_json(lay.request_file) or {}
+    out: dict[str, Any] = {"request": current}
+    if current.get("request_id"):
+        reply = api.status(current["request_id"])
+        out["crawler"] = reply.body if reply.status == 200 else {"error": reply.error}
+    con = open_duckdb(cfg, lay.root / "duckdb_tmp")
+    try:
+        fresh = f"{sql_str((now - timedelta(days=r.stale_days)).isoformat())}::TIMESTAMPTZ"
+        day = f"{sql_str((now - timedelta(days=1)).isoformat())}::TIMESTAMPTZ"
+        rows = con.execute(f"""
+WITH list AS (SELECT DISTINCT doc_id FROM read_parquet(
+                {sql_str(str(live.run_dir / 'manifest' / '*.parquet'))})),
+out AS (SELECT DISTINCT doc_id, outcome, finished_at FROM {_scan(lay.outcome, 'outcome')}),
+last AS (SELECT doc_id, arg_max(outcome, finished_at) AS outcome, max(finished_at) AS at
+         FROM out GROUP BY doc_id)
+SELECT count(*), count(*) FILTER (WHERE last.outcome IS NULL),
+       count(*) FILTER (WHERE last.outcome = 'fetched' AND last.at >= {fresh}),
+       count(*) FILTER (WHERE last.outcome = 'retry'),
+       count(*) FILTER (WHERE last.outcome = 'gone'),
+       count(*) FILTER (WHERE last.outcome = 'robots'),
+       (SELECT count(*) FROM out WHERE outcome = 'fetched' AND finished_at >= {day})
+FROM list LEFT JOIN last USING (doc_id)""").fetchone()
+    finally:
+        con.close()
+    docs, never, fetched, retry, gone, robots, fetched_1d = (int(v) for v in rows)
+    left = docs - fetched - gone
+    out.update(docs=docs, never_fetched=never, fetched_fresh=fetched, retry=retry, gone=gone,
+               robots=robots, left=left, fetched_1d=fetched_1d,
+               days_left=round(left / fetched_1d, 1) if fetched_1d else None)
+    return out

@@ -30,7 +30,7 @@ NEW = datetime(2026, 10, 20, tzinfo=UTC)
 
 
 def _row(doc_id: int, fetched_at: datetime = NEW, title: str | None = "t", body: str = "b"):
-    return {"doc_id": doc_id, "batch_id": 1, "url": f"https://h{doc_id}.example/",
+    return {"doc_id": doc_id, "source": "r/s", "url": f"https://h{doc_id}.example/",
             "final_url": None, "fetched_at": fetched_at, "http_status": 200, "lang": "en",
             "title": title, "description": None, "body": body, "text_len": len(body),
             "payload_sha1": "x"}
