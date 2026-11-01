@@ -688,31 +688,34 @@ def _drop_invalid(conn: psycopg.Connection, job: Job, index: int) -> None:
         _refresh_best_rank(cur, hosts)
 
 
-def capacity_report(cfg: Config, conn: psycopg.Connection) -> dict[str, Any]:
-    """Per-hostname capacity of the live list at the planned 1 / `plan_s_per_url` req/s.
+def _days(left: int, per_day: int) -> float | None:
+    return round(left / per_day, 1) if per_day else None
 
-    A planning figure: the crawler's slot sets the real rate, which is not lower.
+
+def capacity_report(conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
+    """Progress of the live list, measured: docs left and docs fetched in the last day.
+
+    No rate is assumed: the crawler's pace shows in `fetched_at`. Days left are the
+    docs left over the last day's fetches, for the list and for its largest host.
     """
-    r = cfg.recrawl
-    rows = conn.execute("SELECT count(*) FROM recrawl.doc WHERE rank IS NOT NULL "
-                        "AND state <> 'gone' GROUP BY host_id").fetchall()
-    counts = np.array([n for (n,) in rows], dtype=np.int64)
+    rows = conn.execute(
+        "SELECT count(*), count(*) FILTER (WHERE state <> 'fetched'), "
+        "count(*) FILTER (WHERE fetched_at > %s) FROM recrawl.doc "
+        "WHERE rank IS NOT NULL AND state <> 'gone' GROUP BY host_id",
+        (now - timedelta(days=1),)).fetchall()
+    docs, left, day = (np.array(c, dtype=np.int64) for c in zip(*rows, strict=True)) \
+        if rows else (np.zeros(0, dtype=np.int64),) * 3
     states = dict(conn.execute("SELECT state, count(*) FROM recrawl.doc "
                                "WHERE rank IS NOT NULL GROUP BY state").fetchall())
-    per_day = 86400 / r.plan_s_per_url
-    total = int(counts.sum())
-    horizons = []
-    for days in r.report_days:
-        cap = per_day * days
-        covered = int(np.minimum(counts, cap).sum())
-        horizons.append({"days": days, "covered": covered,
-                         "share": round(covered / total, 4) if total else 0.0,
-                         "hosts_unfinished": int((counts > cap).sum()),
-                         "mean_req_s": round(covered / (days * 86400), 1)})
-    return {"docs": total, "hosts": int(counts.size), "states": states,
-            "max_host_docs": int(counts.max()) if counts.size else 0,
-            "days_for_largest_host": round(int(counts.max()) / per_day, 1) if counts.size
-            else 0.0, "horizons": horizons}
+    report = {"docs": int(docs.sum()), "hosts": int(docs.size), "states": states,
+              "max_host_docs": int(docs.max()) if docs.size else 0,
+              "left": int(left.sum()), "fetched_1d": int(day.sum()),
+              "days_left": _days(int(left.sum()), int(day.sum())), "largest_left": None}
+    if left.size:
+        i = int(left.argmax())
+        report["largest_left"] = {"left": int(left[i]), "fetched_1d": int(day[i]),
+                                  "days_left": _days(int(left[i]), int(day[i]))}
+    return report
 
 
 # ---------------------------------------------------------------- archive

@@ -163,7 +163,6 @@ class FullCfg:
     agg_share: float
     agg_salt: str
     kept_share_max_z: float
-    max_host_days: float
 
 
 @dataclass(frozen=True)
@@ -220,8 +219,6 @@ class RecrawlCfg:
     min_free_gb: int
     max_body_chars: int
     sync_chunk_rows: int
-    plan_s_per_url: float
-    report_days: list[int]
 
 
 @dataclass(frozen=True)
@@ -498,9 +495,9 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
     need(r.job_size <= 10000, "recrawl.job_size must be <= 10000, the API's max_urls")
     need(r.host_docs_per_job <= r.job_size, "recrawl.host_docs_per_job must be <= job_size")
     need(r.max_resend >= 0, "recrawl.max_resend must be >= 0")
-    need(min(r.plan_interval_s, r.archive_interval_s, r.plan_s_per_url, r.api_timeout_s,
+    need(min(r.plan_interval_s, r.archive_interval_s, r.api_timeout_s,
              r.api_backoff_s) > 0,
-         "recrawl.plan_interval_s, archive_interval_s, plan_s_per_url, api_timeout_s and "
+         "recrawl.plan_interval_s, archive_interval_s, api_timeout_s and "
          "api_backoff_s must be > 0")
     need(r.claim_timeout_s > r.api_timeout_s,
          "recrawl.claim_timeout_s must be > api_timeout_s, or a slow reply looks lost")
@@ -511,8 +508,6 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "result_ttl_days")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
-    need(bool(r.report_days) and all(d > 0 for d in r.report_days),
-         "recrawl.report_days must be non-empty and > 0")
 
 
 def _field_weight(spec: str) -> float | None:
@@ -563,7 +558,6 @@ def _validate_full(cfg: Config, need: Any) -> None:
     need(f.chunk_retries >= 0, "full.chunk_retries must be >= 0")
     need(f.min_free_gb >= 0, "full.min_free_gb must be >= 0")
     need(f.parse_threads > 0, "full.parse_threads must be > 0")
-    need(f.max_host_days > 0, "full.max_host_days must be > 0")
     need(f.connections > 0 and f.max_heap_mb_s > 0,
          "full.connections and full.max_heap_mb_s must be > 0")
     need(all(cfg.crawlerdb.session.get(k) == v for k, v in CSV_SESSION.items()),

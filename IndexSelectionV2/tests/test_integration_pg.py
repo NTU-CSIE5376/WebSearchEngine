@@ -538,7 +538,9 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         _go_live(cfg, admin, tmp_path, "r1", [A1, A2, "https://a.example/x/../2", A3, B1, C1])
         synced = sync(cfg, admin, now=lambda: OPEN)
         assert (synced["docs"], synced["dropped"], synced["hosts_due"]) == (5, 0, 3)
-        assert capacity_report(cfg, admin)["docs"] == 5
+        report = capacity_report(admin, OPEN)
+        assert (report["docs"], report["left"], report["fetched_1d"]) == (5, 5, 0)
+        assert report["days_left"] is None and report["largest_left"]["left"] == 3
 
         first = plan_cycle(cfg, admin, T0, api)
         assert (first["jobs"], first["docs"], first["refused"], first["unknown"]) == (1, 4, 0, 0)
@@ -590,6 +592,10 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
             (A1, 0, "fetched"), (A2, 1, "throttled"), (B1, 2, "fetched"), (C1, 3, "robots")]
         assert _jobs(admin)[0][2] == "applied"
         assert archive_cycle(cfg, admin, done)["jobs"] == 0      # applied once only
+        # Progress is measured from fetched_at: A1 and B1 in the last day, 3 docs left.
+        report = capacity_report(admin, done + timedelta(seconds=10))
+        assert (report["left"], report["fetched_1d"], report["days_left"]) == (3, 2, 1.5)
+        assert report["largest_left"] == {"left": 2, "fetched_1d": 1, "days_left": 2.0}
 
         # The next plan deletes the applied job's results at the API. The throttled host,
         # in no job now, waits out its pause, then gets its retry and the doc it had no

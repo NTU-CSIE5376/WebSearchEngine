@@ -218,10 +218,6 @@ agg_share = 0.5                          # share of the sample that only feeds d
 agg_salt = "agg-v1"                      # splits the sample into those two halves
 kept_share_max_z = 6.0                   # score-full stops when its kept rows differ from
                                          # the sample's estimate by more than this many SDs
-max_host_days = 13.44                    # select-full keeps at most this many days of recrawl
-                                         # per hostname at recrawl.plan_s_per_url: 241,920;
-                                         # the rest of 14 d covers the waits between a host's
-                                         # jobs (docs/RECRAWL.md §3)
 
 [selectdb]                               # OUR selectdb (:5445), the only database isel writes
 admin_dsn_env = "ISEL_SELECTDB_ADMIN_DSN"
@@ -279,11 +275,6 @@ min_free_gb = 800                        # no new jobs below this free space und
                                          # Host2 /data has ~2 TB free while the crawler runs
 max_body_chars = 200000                  # extracted body text kept per page
 sync_chunk_rows = 1000000                # docs per recrawl-sync transaction
-plan_s_per_url = 4.8                     # planning only: seconds per URL a hostname is assumed
-                                         # to take, for select-full's cap and the capacity
-                                         # report. The planner waits none of it; the crawler's
-                                         # AutoThrottle slot paces every host
-report_days = [1, 7, 14, 28]             # capacity report horizons
 
 [text_index]                             # full-text index of the recrawl text; docs/TEXT_INDEX.md
 url = "http://127.0.0.1:9200"            # OpenSearch (deploy/compose.opensearch.yaml locally)

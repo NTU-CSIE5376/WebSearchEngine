@@ -12,7 +12,7 @@ from isel.backtest import select_sample, train_frozen
 from isel.features import FeatureStore, open_store
 from isel.io import atomic_write_json, read_json, write_parquet_atomic
 from isel.pull import FULL_SCHEMA
-from isel.score import SCORED_SCHEMA, NotEnoughCandidates, host_cap, score_full, select_full
+from isel.score import SCORED_SCHEMA, NotEnoughCandidates, score_full, select_full
 from isel.urlnorm import md5_number_lower
 
 
@@ -203,7 +203,7 @@ def test_select_full_is_the_exact_top_k_with_ties_and_duplicates(tmp_path):
     assert run["boundary_score"] == 2.0 and run["candidates"] == 6 and run["scope"] == "full"
 
 
-def test_select_full_caps_each_hostname_and_gives_its_places_to_the_next_urls(tmp_path):
+def test_select_full_lets_one_hostname_fill_the_list(tmp_path):
     def row(url, score):
         return {"url": url, "shard": 0, "h": md5_number_lower(url), "score": score}
 
@@ -211,18 +211,10 @@ def test_select_full_caps_each_hostname_and_gives_its_places_to_the_next_urls(tm
     small = ["https://small.example/0", "https://small.example/1", "https://small.example/2"]
     _write_scored(tmp_path, 5, {0: [row(u, 9.0 - i) for i, u in enumerate(big)]
                                 + [row(u, 3.0 - i) for i, u in enumerate(small)]})
-    # One day at one request per 12 h: a hostname keeps its best 2 URLs.
-    cfg = replace(replace(small_cfg(tmp_path), "full", max_host_days=1.0), "recrawl", plan_s_per_url=43200.0)
-    run = select_full(cfg, tmp_path, 4)
-    assert _manifest(tmp_path, run).column("url").to_pylist() == big[:2] + small[:2]
-    assert run["host_cap"] == 2
-    with pytest.raises(NotEnoughCandidates, match="2 per hostname"):
-        select_full(cfg, tmp_path, 5)
-
-
-def test_default_host_cap_is_two_weeks_at_a_fifth_of_a_request_per_second(base_cfg):
-    # plan_s_per_url and max_host_days move together: the 64M list was chosen at this cap.
-    assert host_cap(base_cfg) == 241_920
+    # No hostname cap: the crawler's pace decides how far the recrawl gets on big.example.
+    run = select_full(small_cfg(tmp_path), tmp_path, 4)
+    assert _manifest(tmp_path, run).column("url").to_pylist() == big + small[:1]
+    assert "host_cap" not in run
 
 
 def test_select_full_refuses_too_few_candidates_or_a_larger_k(tmp_path):

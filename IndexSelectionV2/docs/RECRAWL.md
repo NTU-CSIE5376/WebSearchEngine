@@ -39,15 +39,18 @@ the batch-20 list.
 
 - The top 64M are 64,000,005 URLs on 1,204,079 hostnames. 14 days need 52.9 req/s,
   9.4 % of the crawler's ~560 req/s since 2026-10-29.
-- The list is sized at a planning rate of 1 / `recrawl.plan_s_per_url` (4.8 s, 0.208
-  req/s) per hostname. `www.espn.com` alone has 638,981 URLs and would need 37 days at it.
-- So `select-full` keeps at most `full.max_host_days` × 86,400 / `plan_s_per_url` = 13.44
-  × 86,400 / 4.8 = 241,920 URLs per hostname. The rest of the 14 days covers the waits
-  between a host's jobs. The cap hits 23 hostnames, and the next URLs take their places.
-- The planning rate is a floor, not a pace: isel waits no interval. A host's cycle is
-  its job's lifetime, the status poll, the archive and the next plan. Earlier isel also
-  held each host for `docs × 4.8 s` from the claim, so a cycle was the larger of the
-  two; no host is slower now.
+- isel assumes no rate. `select-full` takes the top 64M by score with no per-hostname
+  cap, and the crawler's pace decides how far the recrawl gets on each host. A host's
+  cycle is its job's lifetime, the status poll, the archive and the next plan.
+- Until 2026-11-01 isel sized the list at 0.208 req/s per hostname (4.8 s): at most
+  13.44 × 86,400 / 4.8 = 241,920 URLs each, which cut 23 hostnames. It also held each
+  host for `docs × 4.8 s` from the claim. Both are gone: the crawler cannot be read
+  ahead of the crawl (the API returns no slot delay or latency, and crawlerdb keeps
+  none), and latency would give only the slot's ceiling, about 2 / latency at
+  AutoThrottle's target 2.0, not what the share and the normal crawl leave.
+- `recrawl-plan --dry-run` reports progress from `fetched_at` instead: docs left, docs
+  fetched in the last day, and the days left at that pace, for the list and for its
+  largest host.
 - Round 6 (2026-11-01, `index-selection` experiment 2026-10-29, with that isel wait):
   two capped hosts got 0.196–0.202 req/s (13.8–14.5 days). One whose simulated slot is
   0.33 req/s got 0.159–0.171 (16.4–17.6 days), held back by its slot. Host2's capped
@@ -57,6 +60,8 @@ the batch-20 list.
   959 s against the 1,152 s wait. The wait held only the last capped hosts, once the
   share had room. Without it such a host is estimated at 0.35–0.8 req/s: 240 docs in a
   cycle of 240 ÷ (slot × 0.71) + ~60 s. That is an estimate; round 8 measures it.
+- `www.espn.com`, the largest, has 638,981 URLs: 14 days need 0.53 req/s. Below that,
+  its lowest-ranked URLs are fetched after the 14 days, not dropped.
 - Batch-20 golden coverage (the official `indexed_rate`):
 
   | List | head | random |
@@ -65,9 +70,14 @@ the batch-20 list.
   | 64M, no cap | 23.69 % | 21.99 % |
   | 64M, 241,920 per hostname | 23.58 % | 21.85 % |
 
-- Each of the 20 capped hostnames with normal traffic has at least 0.34 req/s of slot
-  rate left, more than the planning rate of 0.208, so the cap is reachable. Per process,
-  the recrawl needs 2.75–3.96 req/s, 8–12 % of the process's ~33 req/s.
+- The cap's cost and gain, if every listed URL is fetched: no cap holds 8 more head
+  golden URLs (23.69 against 23.58 %). Without a cap, the 23 largest hosts' tails may
+  still be unfetched at a golden batch; the cap would have swapped them for URLs that
+  are. No cap is better while fewer than 8 head golden URLs sit unfetched in those
+  tails. The `largest_left` days in the report show it.
+- Each of the 20 largest hostnames with normal traffic has at least 0.34 req/s of slot
+  rate left. Per process, the recrawl needs 2.75–3.96 req/s, 8–12 % of the process's
+  ~33 req/s.
 
 ## 4. Architecture: the crawler's job API
 
@@ -91,7 +101,7 @@ the batch-20 list.
   2.19.0 (`requirements.txt` pins only `>=2.13`).
 - A follow-up fixes the starvation that §11 describes: WebCrawler PR #106 (open), branch
   `pr84-weighted-dispatch` (`6d23789`, tests in `f5a7b93`; a per-host interval added in
-  `e1ae98d` and `f24189c` was dropped in `498a195`). It changes four rules and adds logs:
+  `e1ae98d` and `f24189c` was dropped in `498a195`). It changes three rules and adds logs:
   - `weighted`, the new default policy: while both queues have requests, API requests get
     `MANUAL_BULK_CRAWL_SHARE_PERCENT` (1–99, default 50) of the dispatches. A queue with
     nothing to send gives its turns away and does not bank them.
@@ -99,8 +109,10 @@ the batch-20 list.
     (default 1) API requests. AutoThrottle keeps the delay at least latency /
     `TARGET_CONCURRENCY`, so the cap follows the target: 3 at Host2's 2.0, 5 at 4.0.
     Few of them wait for the delay.
-  - a host's priority adds the seconds its oldest job has waited, so newer, larger hosts
-    cannot pass over the small hosts of an old job forever.
+  - the priority stays #84's longest remaining time. A wait term (`6d23789`) was
+    dropped (`018a0da`): it only moved first sends from mid and big hosts to small ones,
+    with the same job lifetime and rates; a host at its cap leaves the queue, so small
+    hosts get the free slots anyway (round 7).
   - no per-host interval. A fixed interval (4.8 s, `e1ae98d`) was dropped after review
     (`498a195`): it capped fast hosts below what their slot allows. A batch now goes out
     at the slot's rate, so a host's busiest minute can reach that rate (`www.espn.com`'s
@@ -234,7 +246,8 @@ committed, then sent.
 
 An unknown job may have been accepted. isel never learns its `job_id`, so the TTL
 removes its results. Its docs go out again after the claim timeout; if the crawler took
-the first job too, the crawler's per-host cap still spans both. `--dry-run` only prints the per-host capacity report.
+the first job too, the crawler's per-host cap still spans both. `--dry-run` only prints
+the progress report (§3).
 
 ## 8. `recrawl-archive`
 
@@ -321,7 +334,7 @@ Loki against the audit row of §2.
 | R0 | schema, sync, plan, archive, extraction, tests, local end-to-end runs (done) | this repository only |
 | R1 (Hard Stop) | check `:5445` is at 0002, migrate to 0003; `recrawl-sync` on the live run; `recrawl-plan --dry-run` | the batch-20 swap is done; Host1 has space for the schema |
 | R2 | the follow-up of §4 deployed with `MANUAL_BULK_CRAWL_SHARE_PERCENT=20`. #84 alone runs since 2026-10-29 under `manual_first`, so isel must not send jobs before this | crawler running |
-| R3 (Hard Stop) | start both loops; a trial on process 03 first, then 1–5M pages; measure HTML and text size, the time from POST to results, and both sources' rates (§11) | R2 |
+| R3 (Hard Stop) | start both loops; a trial on process 03 first, then 1–5M pages; measure HTML and text size, the time from POST to results, both sources' rates (§11), and the report's `days_left` for the list and its largest host | R2 |
 | R4 | the full list, then only new, due and unfinished pages each period | R3's measurements |
 
 To remove the recrawl: `git revert`, then `alembic downgrade 0002`, which drops the
@@ -373,6 +386,9 @@ Known risks:
 | The default 14-day TTL | unapplied results would stay 14 days on `/data`; 3 days covers a job under FIFO, and a longer archive outage only costs a refetch |
 | Wait for a whole wave of jobs before the next | the slowest host holds the wave |
 | Permanent raw HTML | 5–6 TB against ~2 TB free; the index needs only text |
+| A per-host wait between a host's jobs (`docs × min_gap_s`) | a second fixed rate on top of the crawler's slot; the open job already holds a host back |
+| A per-hostname list cap from an assumed rate (241,920 at 4.8 s) | the rate is the crawler's to decide and is unknown before the crawl; it saves at most the tails of 23 hosts and costs 8 head golden URLs if they finish |
+| `download_latency` or slot delay from the API to size the cap | latency gives only the slot's ceiling (about 2 / latency), not the share and normal traffic; `fetched_at` already shows the pace that results |
 
 ## 13. Inverted index
 
