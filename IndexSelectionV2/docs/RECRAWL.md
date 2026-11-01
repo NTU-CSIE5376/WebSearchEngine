@@ -25,7 +25,7 @@
 | Unit | the full hostname; `en.wikipedia.org` and `zh.wikipedia.org` count separately |
 | Crawler limit | the production crawler runs AutoThrottle (target concurrency 2, delay 0.25–10 s, 16 per hostname). API and normal requests for a hostname share one downloader slot, so the recrawl adds no second rate |
 | Recrawl rate | isel adds at most 0.208 requests per second per hostname on average: a host's next job waits `docs × min_gap_s` (4.8 s) |
-| Crawler pacing | the crawler hands a host's API requests to its scheduler every `CRAWLER_MANUAL_BULK_CRAWL_HOST_INTERVAL` (4.8 s, the same as `min_gap_s`), so a 240-doc batch cannot burst. Needs the WebCrawler follow-up of §4 |
+| Crawler pacing | the crawler sends a host's batch at its AutoThrottle slot rate, as it does normal URLs. It has no per-host interval, so the 0.208 req/s is an average over a job cycle, not a cap on any one minute (§4) |
 | Audit | per hostname, a 10-minute rate of at most the normal crawl's rate + 0.22 req/s, and at most 67 requests in any 60 s (1.2 × the 56 seen on 2026-10-30) |
 | robots.txt | always honoured |
 
@@ -48,7 +48,8 @@ the batch-20 list.
   capped host needed 14.6–15.3 days. At 4.8 s a host sends 241,920 in 13.44 days of
   sending. In the round-5 simulation (2026-10-31, `index-selection` experiment
   2026-10-29, §9.8) capped hosts got 0.193–0.200 req/s: 14.0–14.5 days. 0.208 qps stays
-  within the audit's 0.22. The cap hits 23 hostnames, and the next URLs take their
+  within the audit's 0.22. Round 5 ran with the crawler's per-host interval, which is
+  now removed; round 6 measures the same list without it. The cap hits 23 hostnames, and the next URLs take their
   places.
 - Batch-20 golden coverage (the official `indexed_rate`):
 
@@ -89,17 +90,18 @@ the batch-20 list.
     `MANUAL_BULK_CRAWL_SHARE_PERCENT` (1–99, default 50) of the dispatches. A queue with
     nothing to send gives its turns away and does not bank them.
   - a host holds at most `ceil(latency / delay)` + `MANUAL_BULK_CRAWL_HOST_HEADROOM`
-    (default 1) API requests. Under AutoThrottle that is about 3, so few of them wait for
-    the delay.
+    (default 1) API requests. AutoThrottle keeps the delay at least latency /
+    `TARGET_CONCURRENCY`, so the cap follows the target: 3 at Host2's 2.0, 5 at 4.0.
+    Few of them wait for the delay.
   - a host's priority adds the seconds its oldest job has waited, so newer, larger hosts
     cannot pass over the small hosts of an old job forever.
-  - `CRAWLER_MANUAL_BULK_CRAWL_HOST_INTERVAL` (default 0 = off) spaces a host's API
-    requests on a fixed grid. At 4.8 s a host's recrawl stayed at 15–16 requests in any
-    60 s in the round-5 simulation; without it a 120-doc batch went out at the slot's rate.
-    Each redirect hop and retry of a URL moves the host's next request one interval later
-    (`f24189c`), so they count against the same 0.208 req/s. A host that redirects gets
-    fewer docs a day: at 0.378 extra requests per doc (`www.cnnbrasil.com.br` on the
-    normal crawl), its 241,920 docs take about 18.6 days.
+  - no per-host interval. A fixed interval (4.8 s, `e1ae98d`) was dropped after review
+    (`498a195`): it capped fast hosts below what their slot allows. A batch now goes out
+    at the slot's rate, so a host's busiest minute can reach that rate (`www.espn.com`'s
+    slot is about 83 a minute). Redirect hops and retries stay on the original slot and
+    are not counted in `min_gap_s`: at 0.378 extra requests per doc
+    (`www.cnnbrasil.com.br` on the normal crawl) that host sees about 0.29 req/s on
+    average, and its 241,920 docs still fit the 13.44 days.
   - `request.start`, `request.end` and `request.fail` carry `source` (`normal` or
     `manual`). The heartbeat adds `dequeued_normal`, `dequeued_manual`, `manual_active`
     and `manual_save_ms`.
