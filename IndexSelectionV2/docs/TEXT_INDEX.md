@@ -8,7 +8,7 @@ Status: engine decided (OpenSearch, see [Decision](#decision)); built and measur
 locally on 2026-10-23. The query and a URL field were then tuned on golden batch 20's
 own pages ([Golden batch 20 with its own pages](#golden-batch-20-with-its-own-pages)).
 Not deployed. A real Recall@10 needs the list's page text, which arrives only after
-WebCrawler#84 is deployed and `recrawl-archive` runs (`docs/RECRAWL.md`). A review the
+the crawler's bulk crawl v2 API is deployed and `recrawl-pull` runs (`docs/RECRAWL.md`). A review the
 same evening indexed the body without positions, fixed the build's disk peak and its
 failure handling, added the Host2 services, and measured batch 20 as the official
 metric would count it ([Golden batch 20 as the official metric counts
@@ -25,7 +25,7 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
 
 ## Design
 
-- **Input.** The text Parquet that `recrawl-archive` writes (`TEXT_SCHEMA`). A first
+- **Input.** The text Parquet that `recrawl-pull` writes (`TEXT_SCHEMA`). A first
   DuckDB pass picks each doc's newest row from (`doc_id`, `fetched_at`, file name)
   alone, so 128M page bodies are never sorted; a second pass reads only the winners.
 - **Document.** `_id` is the doc id in decimal. `url` and `lang` are stored; `title`,

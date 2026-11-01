@@ -55,27 +55,26 @@ flowchart LR
   and random sets of one batch see the same list.
 - It has no scheduler. Each command is one container run, except the two opt-in recrawl
   services below.
-- It never writes `/data/ipc` or `/data/manual_bulk_crawls`. Recrawl jobs go through the
-  crawler's API, the crawler's result files are read-only for us, and we delete them
-  through the same API.
+- It never writes `/data/ipc` or `/data/manual_bulk_crawls`. The recrawl talks to the
+  crawler only over its HTTP API.
 
 ## Recrawl (not deployed)
 
 The list needs page text to build an inverted index, but `crawl_result` keeps HTML for
 only 8 hours and the crawler never re-fetches a page. `recrawl.py` re-fetches the list
-through the manual bulk crawl API of NTU-CSIE5376/WebCrawler#84 (`bd40191` or later,
-checked against `cc96500`):
+through the crawler's bulk crawl v2 API (WebCrawler `bulk-crawl-v2`). The crawler
+schedules the fetches; isel keeps no database for it, only files with one writer each:
 
 | Command | Does |
 |---|---|
-| `recrawl-sync` | loads the live run into the `recrawl` schema of selectdb (one row per host and per doc) |
-| `recrawl-plan` | loop: packs due docs of the best-ranked hosts into jobs of up to 3,000 URLs (at most 120 per hostname) and sends them to `POST /v1/manual-bulk-crawls` with `ttl_days: 3`; polls each job's status with `GET` until it is `completed`; deletes each applied job with `DELETE` |
-| `recrawl-archive` | loop: reads each completed `results/{job_id}/` read-only, one `crawler_NN/` partition per crawler, keeps the extracted text as Parquet under `/data/isel/text`, and updates the frontier |
+| `recrawl-push` | loop: computes the live list's due docs from the manifest and the outcome files, and sends them by rank in batches of 10,000 until the API answers 503 |
+| `recrawl-pull` | loop: downloads the crawler's result segments, keeps the extracted text as Parquet and one outcome row per URL, then acks the segments |
+| `recrawl-compact` | merges old outcome and text files, so each doc keeps what `due_query` and the text index read |
+| `recrawl-report` | progress of the live list, from the outcome files and the crawler's counts |
 
-The two loops run only with `--profile recrawl`, and only after WebCrawler#84 is merged
-and deployed. `tests/recrawl_fakes.py` holds a stub of that API and a fake crawler that
-writes per-crawler partitions the way #84 does; the integration tests run the whole loop
-against them.
+The two loops run only with `--profile recrawl`, and only after the crawler serves the
+v2 API. `tests/recrawl_fakes.py` serves that contract over HTTP; the tests run push,
+pull and compact against it.
 
 ## Text index (not deployed)
 
@@ -110,5 +109,5 @@ and both commands (service `text-index`); the steps are in TEXT_INDEX.md, "Befor
 | 6 | full scoring, exact top-K |
 | 7 | selectdb schema, publish, swap, rollback, verify-live |
 | 8 | container image, compose files, runbook |
-| 9 | recrawl frontier, crawler API client, text extraction (not deployed) |
+| 9 | recrawl client (files only), crawler API v2 client, text extraction (not deployed) |
 | 10 | text index: OpenSearch build, golden Recall@10 eval, engine trial (not deployed) |
