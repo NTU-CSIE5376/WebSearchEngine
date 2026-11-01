@@ -220,7 +220,7 @@ class RecrawlCfg:
     min_free_gb: int
     max_body_chars: int
     sync_chunk_rows: int
-    min_gap_s: float
+    plan_s_per_url: float
     report_days: list[int]
 
 
@@ -498,9 +498,9 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
     need(r.job_size <= 10000, "recrawl.job_size must be <= 10000, the API's max_urls")
     need(r.host_docs_per_job <= r.job_size, "recrawl.host_docs_per_job must be <= job_size")
     need(r.max_resend >= 0, "recrawl.max_resend must be >= 0")
-    need(min(r.plan_interval_s, r.archive_interval_s, r.min_gap_s, r.api_timeout_s,
+    need(min(r.plan_interval_s, r.archive_interval_s, r.plan_s_per_url, r.api_timeout_s,
              r.api_backoff_s) > 0,
-         "recrawl.plan_interval_s, archive_interval_s, min_gap_s, api_timeout_s and "
+         "recrawl.plan_interval_s, archive_interval_s, plan_s_per_url, api_timeout_s and "
          "api_backoff_s must be > 0")
     need(r.claim_timeout_s > r.api_timeout_s,
          "recrawl.claim_timeout_s must be > api_timeout_s, or a slow reply looks lost")

@@ -212,7 +212,7 @@ def test_select_full_caps_each_hostname_and_gives_its_places_to_the_next_urls(tm
     _write_scored(tmp_path, 5, {0: [row(u, 9.0 - i) for i, u in enumerate(big)]
                                 + [row(u, 3.0 - i) for i, u in enumerate(small)]})
     # One day at one request per 12 h: a hostname keeps its best 2 URLs.
-    cfg = replace(replace(small_cfg(tmp_path), "full", max_host_days=1.0), "recrawl", min_gap_s=43200.0)
+    cfg = replace(replace(small_cfg(tmp_path), "full", max_host_days=1.0), "recrawl", plan_s_per_url=43200.0)
     run = select_full(cfg, tmp_path, 4)
     assert _manifest(tmp_path, run).column("url").to_pylist() == big[:2] + small[:2]
     assert run["host_cap"] == 2
@@ -221,7 +221,7 @@ def test_select_full_caps_each_hostname_and_gives_its_places_to_the_next_urls(tm
 
 
 def test_default_host_cap_is_two_weeks_at_a_fifth_of_a_request_per_second(base_cfg):
-    # min_gap_s and max_host_days move together: the 64M list was chosen at this cap.
+    # plan_s_per_url and max_host_days move together: the 64M list was chosen at this cap.
     assert host_cap(base_cfg) == 241_920
 
 

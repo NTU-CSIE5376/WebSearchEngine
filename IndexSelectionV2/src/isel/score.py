@@ -60,7 +60,7 @@ class NotEnoughCandidates(RuntimeError):
 
 def host_cap(cfg: Config) -> int:
     """URLs a hostname may hold in the list: its recrawl in `full.max_host_days`."""
-    return int(cfg.full.max_host_days * 86400 / cfg.recrawl.min_gap_s)
+    return int(cfg.full.max_host_days * 86400 / cfg.recrawl.plan_s_per_url)
 
 
 def _scored(model: TrainedModel, frame: pa.Table) -> tuple[pa.Table, np.ndarray]:
