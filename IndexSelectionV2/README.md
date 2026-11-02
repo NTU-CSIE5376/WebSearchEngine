@@ -62,16 +62,18 @@ flowchart LR
 
 The list needs page text to build an inverted index, but `crawl_result` keeps HTML for
 only 8 hours and the crawler never re-fetches a page. `recrawl.py` re-fetches the list
-through the manual bulk crawl API of NTU-CSIE5376/WebCrawler#84 (`bd40191`):
+through the manual bulk crawl API of NTU-CSIE5376/WebCrawler#84 as Host2 runs it
+(`cc96500` code): isel sets no rate, and the crawler's AutoThrottle paces every host.
 
 | Command | Does |
 |---|---|
 | `recrawl-sync` | loads the live run into the `recrawl` schema of selectdb (one row per host and per doc) |
-| `recrawl-plan` | loop: packs due docs of the best-ranked hosts into jobs of up to 3,000 URLs (at most 120 per hostname) and sends them to `POST /v1/manual-bulk-crawls` with `ttl_days: 3`; polls each job's status with `GET` until it is `completed`; deletes each applied job with `DELETE` |
+| `recrawl-plan` | loop: packs due docs of the best-ranked hosts into jobs of up to 10,000 URLs (at most 240 per hostname) and sends them to `POST /v1/manual-bulk-crawls` with `ttl_days: 3`; polls each job's status with `GET` until it is `completed`; deletes each applied job with `DELETE` |
 | `recrawl-archive` | loop: reads each completed `results/{job_id}/` read-only, one `crawler_NN/` partition per crawler, keeps the extracted text as Parquet under `/data/isel/text`, and updates the frontier |
 
-The two loops run only with `--profile recrawl`, and only after WebCrawler#84 is merged
-and deployed. `tests/recrawl_fakes.py` holds a stub of that API and a fake crawler that
+The two loops run only with `--profile recrawl`. Their sizes are the API's limits:
+10,000 URLs per job and 64 jobs at the crawler (`docs/RECRAWL.md` §11).
+`tests/recrawl_fakes.py` holds a stub of that API and a fake crawler that
 writes per-crawler partitions the way #84 does; the integration tests run the whole loop
 against them.
 

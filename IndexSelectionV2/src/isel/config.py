@@ -214,8 +214,6 @@ class RecrawlCfg:
     min_free_gb: int
     max_body_chars: int
     sync_chunk_rows: int
-    min_gap_s: float
-    report_days: list[int]
 
 
 @dataclass(frozen=True)
@@ -454,11 +452,13 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
              r.host_pause_max_s, r.sync_chunk_rows, r.max_body_chars, r.archive_workers) > 0,
          "recrawl sizes, counts and intervals must be > 0")
     need(r.job_size <= 10000, "recrawl.job_size must be <= 10000, the API's max_urls")
+    need(r.max_jobs_inflight <= 64,
+         "recrawl.max_jobs_inflight must be <= 64, the jobs a crawler process admits")
     need(r.host_docs_per_job <= r.job_size, "recrawl.host_docs_per_job must be <= job_size")
     need(r.max_resend >= 0, "recrawl.max_resend must be >= 0")
-    need(min(r.plan_interval_s, r.archive_interval_s, r.min_gap_s, r.api_timeout_s,
+    need(min(r.plan_interval_s, r.archive_interval_s, r.api_timeout_s,
              r.api_backoff_s) > 0,
-         "recrawl.plan_interval_s, archive_interval_s, min_gap_s, api_timeout_s and "
+         "recrawl.plan_interval_s, archive_interval_s, api_timeout_s and "
          "api_backoff_s must be > 0")
     need(r.claim_timeout_s > r.api_timeout_s,
          "recrawl.claim_timeout_s must be > api_timeout_s, or a slow reply looks lost")
@@ -469,8 +469,6 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "result_ttl_days")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
-    need(bool(r.report_days) and all(d > 0 for d in r.report_days),
-         "recrawl.report_days must be non-empty and > 0")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:

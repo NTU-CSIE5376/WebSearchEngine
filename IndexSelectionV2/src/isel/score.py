@@ -211,12 +211,13 @@ def select_full(cfg: Config, work_dir: Path, k: int) -> dict[str, Any]:
     """Writes the exact top-K distinct URLs as a manifest run under `full/selection/`.
 
     Order: `RANK_ORDER`, the same order as the backtest boundary. A URL found
-    in two shards keeps its best score and that row's shard. The crawler's
-    `domain_id` comes from the export shard the row was scored in, so a
-    consumer can route the page to the crawler process that owns the domain.
+    in two shards keeps its best score and that row's shard. No hostname has a
+    cap: the crawler's pace decides how far the recrawl gets on each. The
+    crawler's `domain_id` comes from the export shard the row was scored in, so
+    a consumer can route the page to the crawler process that owns the domain.
 
     Raises:
-        NotEnoughCandidates: If fewer than K distinct URLs were kept.
+        NotEnoughCandidates: If fewer than K distinct URLs scored at or above tau.
     """
     scored = work_dir / "full" / "scored"
     meta = read_json(scored / "_meta.json") or {}

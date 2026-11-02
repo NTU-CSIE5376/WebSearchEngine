@@ -10,6 +10,7 @@ import json
 import logging
 import sys
 from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -84,7 +85,6 @@ def cmd_pull_dims(cfg: Config, args: argparse.Namespace) -> Any:
 
 def cmd_pull_full(cfg: Config, args: argparse.Namespace) -> Any:
     import shutil
-    from datetime import UTC, datetime
 
     from isel.pg import next_allowed_start, next_forbidden_window, open_crawlerdb
     from isel.pull import estimate_full, pull_full
@@ -309,7 +309,8 @@ def cmd_recrawl_plan(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.recrawl import capacity_report, run_planner
 
     if args.dry_run:
-        return _recrawl(cfg, lambda conn: capacity_report(cfg, conn), read_only=True)
+        return _recrawl(cfg, lambda conn: capacity_report(conn, datetime.now(UTC)),
+                        read_only=True)
     return _recrawl(cfg, lambda conn: run_planner(cfg, conn, args.once))
 
 
