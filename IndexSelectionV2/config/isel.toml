@@ -168,7 +168,7 @@ verbose = -1
 [eval]
 test_batches = [6, 7, 8, 18, 19]
 k_values = [32000000, 64000000, 128000000]
-k_headline = 128000000
+k_headline = 64000000                    # TY Huang 2026-10-27: 64M fits the crawl bandwidth
 fractions = [0.019, 0.039, 0.077]        # K as a share of the pool at each batch's as_of
 gain_curve_k = [1000000, 2000000, 4000000, 8000000, 16000000, 32000000, 64000000,
                 128000000, 256000000, 512000000]
