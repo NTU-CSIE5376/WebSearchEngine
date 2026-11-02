@@ -303,6 +303,28 @@ def _list_constraints(table):
     return [(f"{table}_pkey", "p", None), (f"{table}_run_id_fkey", "f", "r")]
 
 
+@pytest.mark.parametrize("read_only", [False, True])
+def test_selectdb_connections_find_a_dead_peer_within_a_minute(selectdb, read_only):
+    # On 2026-11-02 Host1 reset the planner's connection mid-result; the reset never
+    # reached Host2, so recrawl-plan waited in poll() on a socket with the OS default
+    # keepalive (2 h idle). Both ends must probe; the server's end holds our locks.
+    s = selectdb.selectdb
+    conn = connect(selectdb, s.admin_dsn_env, read_only=read_only)
+    try:
+        params = conn.info.get_parameters()
+        assert (params["keepalives"], params["keepalives_idle"],
+                params["keepalives_interval"], params["keepalives_count"]) == (
+            "1", str(s.keepalives_idle_s), str(s.keepalives_interval_s),
+            str(s.keepalives_count))
+        server = [conn.execute(f"SHOW {g}").fetchone()[0] for g in (
+            "tcp_keepalives_idle", "tcp_keepalives_interval", "tcp_keepalives_count",
+            "default_transaction_read_only")]
+        assert server == [str(s.keepalives_idle_s), str(s.keepalives_interval_s),
+                          str(s.keepalives_count), "on" if read_only else "off"]
+    finally:
+        conn.close()
+
+
 def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
     cfg = selectdb
     admin = _admin(cfg)

@@ -168,6 +168,9 @@ class SelectDbCfg:
     reader_password_env: str
     forbidden_ports: list[int]
     connect_timeout_s: int
+    keepalives_idle_s: int
+    keepalives_interval_s: int
+    keepalives_count: int
     copy_block_bytes: int
     maintenance_work_mem: str
     swap_lock_timeout: str
@@ -503,7 +506,8 @@ def _validate_selectdb(cfg: Config, need: Any) -> None:
          "selectdb DSN env vars must differ from each other and from the read-only DBs")
     need(bool(s.forbidden_ports), "selectdb.forbidden_ports must not be empty")
     need(min(s.copy_block_bytes, s.swap_retry_attempts, s.max_db_bytes, s.est_bytes_per_row,
-             s.verify_chunk, s.connect_timeout_s) > 0,
+             s.verify_chunk, s.connect_timeout_s, s.keepalives_idle_s,
+             s.keepalives_interval_s, s.keepalives_count) > 0,
          "selectdb sizes, counts and timeouts must be > 0")
     need(s.swap_retry_backoff_s >= 0, "selectdb.swap_retry_backoff_s must be >= 0")
     w = cfg.schedule.swap_freeze_window

@@ -222,6 +222,12 @@ reader_role = "select"                   # WebSearchEngine measure.py hardcodes 
 reader_password_env = "ISEL_SELECTDB_READER_PASSWORD"   # only init-selectdb needs it
 forbidden_ports = [5432, 5433, 5444]     # crawlerdb, metricdb, V1 selectdb
 connect_timeout_s = 10
+# TCP keepalive on both ends of every selectdb connection: a peer that vanished
+# without a reset (Host1 -> Host2, 2026-11-02) is found after idle + interval x count
+# (60 s), not the OS default of 2 h 11 min. The server end holds our advisory locks.
+keepalives_idle_s = 30
+keepalives_interval_s = 10
+keepalives_count = 3
 copy_block_bytes = 8388608
 maintenance_work_mem = "4GB"             # primary key build on 128M URLs
 swap_lock_timeout = "5s"                 # readers wait at most this long for a swap

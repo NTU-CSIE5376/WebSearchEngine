@@ -346,6 +346,15 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
   that gave 208 threads per process, and 9 processes broke the pool 39 times in 40
   minutes. `OPENBLAS_NUM_THREADS=1` caps the numpy that pyarrow loads. A test checks the
   worker imports.
+- Dead connections: a selectdb connection can die on one end only. On 2026-11-02 Host1
+  reset the planner's connection while sending a large `_drain` result (11:48 and
+  17:30); the second time the reset never reached Host2, and `recrawl-plan` waited in
+  `poll()` for 16 minutes until restarted by hand. `selectdb.connect` sets TCP keepalive
+  on both ends (`[selectdb] keepalives_*`): the client finds a dead server in 60 s and
+  exits for `restart: unless-stopped`; the server drops a dead client in 60 s, which
+  frees its instance lock for the restarted loop. libpq's own default keeps the OS
+  idle time of 2 h. `tcp_user_timeout` is left at the OS default (about 15 min of
+  retransmits) so a long publish `COPY` survives a server that stalls for a minute.
 - Both: profile `recrawl`, `restart: unless-stopped`, `/data/manual_bulk_crawls/results`
   read-only, `/data/isel` read-write. Run `mkdir -p /data/isel` as the isel user before
   `up`, or Docker creates it as root.
