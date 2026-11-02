@@ -1,8 +1,8 @@
 """Recrawl frontier: hands the live selection to the crawler and stores the text it fetched.
 
 The frontier lives in selectdb's `recrawl` schema (`isel.schema`). The crawler
-side is the manual-bulk-crawl job API of WebCrawler PR #84 at bd40191
-(`docs/RECRAWL.md`): POST a URL list with a `ttl_days`, get a
+side is the manual-bulk-crawl job API of WebCrawler PR #84 at cc96500, the same
+as at bd40191 (`docs/RECRAWL.md`): POST a URL list with a `ttl_days`, get a
 `job_id`, and poll the job's status until the API reports it `completed`. Only
 the API decides that: the results dir `result_root/{job_id}` exists from the
 POST on, and each crawler fills its own `crawler_NN/` partition. The TTL is the
@@ -38,7 +38,6 @@ from __future__ import annotations
 import contextlib
 import gzip
 import hashlib
-import itertools
 import json
 import multiprocessing
 import re
@@ -568,8 +567,8 @@ def _ready_hosts(cfg: Config, cur: psycopg.Cursor, now: datetime,
 def _claim(cfg: Config, cur: psycopg.Cursor, now: datetime, n_jobs: int) -> list[Job]:
     """Packs ready hosts into up to `n_jobs` jobs and marks their docs `dispatched`.
 
-    Hosts fill each job in rank order; inside a job their URLs alternate, so the
-    crawler's prefetch window spans many hosts instead of one.
+    Hosts fill each job in rank order, each host's docs in rank order. The order
+    across hosts does not matter: the crawler regroups a job's URLs by host.
     """
     r = cfg.recrawl
     packed: list[list[tuple[int, list[tuple[int, str]]]]] = [[]]
@@ -592,8 +591,7 @@ def _claim(cfg: Config, cur: psycopg.Cursor, now: datetime, n_jobs: int) -> list
                 (len(packed),))
     jobs = []
     for (batch,), groups in zip(cur.fetchall(), packed, strict=True):
-        order = [d for row in itertools.zip_longest(*(docs for _, docs in groups))
-                 for d in row if d is not None]
+        order = [d for _, docs in groups for d in docs]
         jobs.append(Job(batch, [d for d, _ in order], [u for _, u in order]))
     cur.executemany("INSERT INTO recrawl.job (batch_id, doc_ids, state, claimed_at) "
                     "VALUES (%s, %s, 'claimed', %s)",
