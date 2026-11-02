@@ -3,9 +3,17 @@
 - Code (implemented, tested, not deployed): `src/isel/recrawl.py`, `src/isel/extract.py`,
   `src/isel/schema.py`. Parameters: `[recrawl]` in `config/isel.toml`.
 - Crawler side: the manual bulk crawl API of
-  [WebCrawler PR #84](https://github.com/NTU-CSIE5376/WebCrawler/pull/84) at `bd40191`,
-  used as is. The one open crawler-side problem, API requests on busy hosts, is
-  [WebCrawler#85](https://github.com/NTU-CSIE5376/WebCrawler/issues/85).
+  [WebCrawler PR #84](https://github.com/NTU-CSIE5376/WebCrawler/pull/84) at `cc96500`,
+  used as is. Its HTTP API and result files are the same as at `bd40191`; the later
+  commits change only how each crawler dispatches API requests (§4). That dispatch
+  answers both problems of
+  [WebCrawler#85](https://github.com/NTU-CSIE5376/WebCrawler/issues/85), and opens two
+  new risks (§11).
+- Run decision (2026-11-02): isel calls the API as Host2 runs it, under `manual_first`,
+  and does not wait for the follow-up of §4. isel sets no rate; the crawler's
+  AutoThrottle paces every host. Its sizes are the server's limits: `job_size` 10,000
+  (the API's `max_urls`) and `max_jobs_inflight` 64 (the jobs a process admits). §11
+  measures the normal crawl, and a stop rule ends the run.
 
 ## 1. Why recrawl
 
@@ -20,30 +28,116 @@
 | Rule | Value |
 |---|---|
 | Unit | the full hostname; `en.wikipedia.org` and `zh.wikipedia.org` count separately |
-| Rate | at most 0.2 requests per second per host, so requests at least 5 s apart |
-| Scope | the sum of every fetcher: the crawler (normal and API requests), sitemap patrol, golden patrol |
-| robots.txt | always honoured; its requests count against the same budget |
+| Crawler limit | the production crawler runs AutoThrottle (target concurrency 2, delay 0.25–10 s, 16 per hostname). API and normal requests for a hostname share one downloader slot, so the recrawl adds no second rate |
+| Recrawl rate | isel sets no rate. A host is in at most one open job of up to `host_docs_per_job` (240) docs; its next job goes out once that one is applied (§7) |
+| Crawler pacing | the crawler sends a host's docs at its AutoThrottle slot rate, as it does normal URLs, with at most the slot concurrency (16) of them outstanding (§4) |
+| Audit | the normal crawl of each process stays at 80 % of its baseline or more (§11). Per hostname the slot is the bound, and isel cannot raise it. The earlier per-host checks (a 10-minute rate of at most normal + 0.22 req/s, at most 67 requests in 60 s) assumed an isel interval and are dropped |
+| robots.txt | always honoured |
+
+`domain_qps.json` (default delay 5 s) applies only when `CRAWLER_USE_AUTOTHROTTLE` is
+off. Every production process sets it on in `supervisord.conf`.
 
 ## 3. Capacity
 
-- The list spans 1,677,068 hosts; a host allows 17,280 requests a day. The largest,
-  `www.espn.com`, has 656,637 URLs and needs 38 days.
-- At a full 0.2 qps everywhere, 14 days would cover 123.0M URLs (96.1 %). A real cycle
-  is max(5 s, latency) with a 6.6 s median latency, so about 0.15 qps. With robots.txt
-  requests and ~10 % failures, that gives ~108M pages in 14 days.
-- 93.8 % of the normal crawl's requests hit listed hosts, and API requests yield to them
-  on a shared host (WebCrawler#85). Large hosts are the bottleneck, not bandwidth.
-- So 128M cannot finish in 14 days. The goal is as many pages as possible, best rank
-  first.
+The list is 64M (`eval.k_headline`), as TY Huang asked on 2026-10-27. Figures are for
+the batch-20 list.
+
+- The top 64M are 64,000,005 URLs on 1,204,079 hostnames. 14 days need 52.9 req/s,
+  9.4 % of the crawler's ~560 req/s since 2026-10-29.
+- isel assumes no rate. `select-full` takes the top 64M by score with no per-hostname
+  cap, and the crawler's pace decides how far the recrawl gets on each host. A host's
+  cycle is its job's lifetime, the status poll, the archive and the next plan.
+- Until 2026-11-01 isel sized the list at 0.208 req/s per hostname (4.8 s): at most
+  13.44 × 86,400 / 4.8 = 241,920 URLs each, which cut 23 hostnames. It also held each
+  host for `docs × 4.8 s` from the claim. Both are gone: the crawler cannot be read
+  ahead of the crawl (the API returns no slot delay or latency, and crawlerdb keeps
+  none), and latency would give only the slot's ceiling, about 2 / latency at
+  AutoThrottle's target 2.0, not what the share and the normal crawl leave.
+- `recrawl-plan --dry-run` reports progress from `fetched_at` instead: docs left, docs
+  fetched in the last day, and the days left at that pace, for the list and for its
+  largest host.
+- Round 6 (2026-11-01, `index-selection` experiment 2026-10-29, with that isel wait):
+  two capped hosts got 0.196–0.202 req/s (13.8–14.5 days). One whose simulated slot is
+  0.33 req/s got 0.159–0.171 (16.4–17.6 days), held back by its slot. Host2's capped
+  hostnames have slots of 0.54–1.39 req/s. Recrawl used its whole 20 % share (7.6 req/s
+  per process against 3.78 needed) and normal kept 91 %.
+- In that run the share, not the isel wait, bounded the recrawl: job lifetime p50 was
+  959 s against the 1,152 s wait. The wait held only the last capped hosts, once the
+  share had room. Without it such a host is estimated at 0.35–0.8 req/s: 240 docs in a
+  cycle of 240 ÷ (slot × 0.71) + ~60 s. That is an estimate; round 8 measures it.
+- `www.espn.com`, the largest, has 638,981 URLs: 14 days need 0.53 req/s. Below that,
+  its lowest-ranked URLs are fetched after the 14 days, not dropped.
+- Batch-20 golden coverage (the official `indexed_rate`):
+
+  | List | head | random |
+  |---|---|---|
+  | 128M | 24.75 % | 23.06 % |
+  | 64M, no cap | 23.69 % | 21.99 % |
+  | 64M, 241,920 per hostname | 23.58 % | 21.85 % |
+
+- The cap's cost and gain, if every listed URL is fetched: no cap holds 8 more head
+  golden URLs (23.69 against 23.58 %). Without a cap, the 23 largest hosts' tails may
+  still be unfetched at a golden batch; the cap would have swapped them for URLs that
+  are. No cap is better while fewer than 8 head golden URLs sit unfetched in those
+  tails. The `largest_left` days in the report show it.
+- Each of the 20 largest hostnames with normal traffic has at least 0.34 req/s of slot
+  rate left. Per process, the recrawl needs 2.75–3.96 req/s, 8–12 % of the process's
+  ~33 req/s.
 
 ## 4. Architecture: the crawler's job API
 
 - Recrawl is not a second crawler. isel hands URL lists to the production crawler's job
-  API, and the crawler fetches them with its normal spider at priority 0. Each crawler
-  process keeps at most 128 API requests in flight (`max_concurrency_ratio` 0.5 of 256),
-  queued requests included. That is a ceiling, not a floor.
-- Politeness stays with the crawler's AutoThrottle. On its own side, isel keeps the
-  recrawl within 0.2 qps per host: a host's next job waits `docs × min_gap_s` (5 s).
+  API, and the crawler fetches them with its normal spider and downloader. Each crawler
+  process (PR #84 `docs/03` §3.7):
+  - keeps API requests in a second scheduler queue. The crawler env
+    `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` picks between the queues: `manual_first` (the
+    default as merged) dispatches API requests before normal ones, `balanced` alternates,
+    and `normal_first` does the reverse. Jobs carry no policy.
+  - admits up to 64 jobs (`MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`) in submission order and
+    groups their URLs by hostname. A host's URLs keep submission order, by job and index.
+  - holds at most the host's slot concurrency of API requests per host (16 in
+    production), and at most `CONCURRENT_REQUESTS` in all (256; 384 on the canary
+    process 07). Requests that wait for a host's delay count.
+  - feeds first the host with the longest estimated remaining time: its URLs left ÷ its
+    estimated QPS.
+- PR #84 was merged on 2026-10-29 (`5485bcd`) with the rules above. Host2 runs it since
+  2026-10-29 17:29Z (`39e1363`): the `api` container listens on `127.0.0.1:4000`, and the
+  policy env is unset, so `manual_first` applies. The image rebuild also moved Scrapy to
+  2.19.0 (`requirements.txt` pins only `>=2.13`).
+- On 2026-11-02 Host2 runs upstream `a289368`. Its API, IPC and crawler code for manual
+  jobs is the same as `cc96500`. The API has 4 workers and `max_urls` 10000. Other teams
+  also send jobs to it (about 100 on 2026-10-30), and they share each process's 64
+  active jobs.
+- Each process runs its normal crawl near its 256 slots (process 03: 215–234 in flight,
+  109–121 of them waiting for a delay). Under `manual_first`, each outstanding API
+  request takes a slot from the normal crawl, so §11 ramps up slowly.
+- A follow-up fixes the starvation that §11 describes: WebCrawler PR #106 (open, not
+  deployed; isel does not wait for it), branch
+  `pr84-weighted-dispatch` (`6d23789`, tests in `f5a7b93`; a per-host interval added in
+  `e1ae98d` and `f24189c` was dropped in `498a195`). It changes three rules and adds logs:
+  - `weighted`, the new default policy: while both queues have requests, API requests get
+    `MANUAL_BULK_CRAWL_SHARE_PERCENT` (1–99, default 50) of the dispatches. A queue with
+    nothing to send gives its turns away and does not bank them.
+  - a host holds at most `ceil(latency / delay)` + `MANUAL_BULK_CRAWL_HOST_HEADROOM`
+    (default 1) API requests. AutoThrottle keeps the delay at least latency /
+    `TARGET_CONCURRENCY`, so the cap follows the target: 3 at Host2's 2.0, 5 at 4.0.
+    Few of them wait for the delay.
+  - the priority stays #84's longest remaining time. A wait term (`6d23789`) was
+    dropped (`018a0da`): it only moved first sends from mid and big hosts to small ones,
+    with the same job lifetime and rates; a host at its cap leaves the queue, so small
+    hosts get the free slots anyway (round 7).
+  - no per-host interval. A fixed interval (4.8 s, `e1ae98d`) was dropped after review
+    (`498a195`): it capped fast hosts below what their slot allows. A batch now goes out
+    at the slot's rate, so a host's busiest minute can reach that rate (`www.espn.com`'s
+    slot is about 83 a minute). Redirect hops and retries stay on the original slot, so
+    they take its time: at 0.378 extra requests per doc (`www.cnnbrasil.com.br` on the
+    normal crawl) that host's doc rate is 1 / 1.378 of its request rate.
+  - `request.start`, `request.end` and `request.fail` carry `source` (`normal` or
+    `manual`). The heartbeat adds `dequeued_normal`, `dequeued_manual`, `manual_active`
+    and `manual_save_ms`.
+- Politeness stays with the crawler: AutoThrottle and robots.txt. isel adds no rate of
+  its own. It decides only which docs a host's one open job carries, and pauses a host
+  after a 429 or 503.
 - isel never writes crawlerdb, `/data/ipc` or `/data/manual_bulk_crawls`. It reads
   results read-only and deletes them only through the API.
 
@@ -83,7 +177,7 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 
 | Table | One row per | Main columns |
 |---|---|---|
-| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank`, `next_at`, `batch_id` (its open job) |
+| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank`, `next_at` (end of a 429/503 pause, or its next due doc), `batch_id` (its open job) |
 | `recrawl.doc` | `doc_id` (signed BIGINT) | `url` (canonical), `host_id`, `rank`, `model_run_id`, `state`, `due_at`, `attempts`, `batch_id`, fetch fields, `text_file`, `text_len`, `lang` |
 | `recrawl.job` | job sent to the API | `batch_id`, `job_id`, `doc_ids` (in the order sent), `state`, timestamps, `deleted_at`, `records`, `error` |
 | `recrawl.batch_seq` | (sequence) | source of `batch_id` |
@@ -128,7 +222,8 @@ committed, then sent.
    released. Up to `sweep_rows` (100,000) `fetched` docs past `due_at` return to
    `pending`.
 2. **Poll.** Each `submitted`, `completed` or `error` job gets a `GET` at most every
-   `status_poll_s` (60 s); 48 jobs make about one request a second.
+   `status_poll_s` (15 s); 128 jobs (64 at the crawler, 64 completed) make about 8.5
+   requests a second.
    - `completed` while the job is `submitted`: mark it `completed` with the API's
      `completed_at`.
    - `completed` but no results directory: the job stays `submitted`; report
@@ -144,16 +239,16 @@ committed, then sent.
    `deleted_at`; anything else reports `api_error` and is tried next cycle. This runs even
    while the planner is halted.
 4. **Stop** claiming if a job is in `error`, if a completed job's results are not
-   mounted, during the `api_backoff_s` (300 s) pause, if `max_jobs_inflight` (48) jobs are
+   mounted, during the `api_backoff_s` (300 s) pause, if `max_jobs_inflight` (64) jobs are
    at the crawler (`claimed` + `submitted`), if as many `completed` jobs wait for the
    archive (`archive_lag`), or if less than `min_free_gb` (800 GB) is free under
    `text_root`.
 5. **Claim.** Ready hosts (no open job, `next_at` passed) by `best_rank`. Each gives up to
-   `host_docs_per_job` (120) due docs by rank; jobs hold up to `job_size` (3,000) URLs,
-   at most `plan_max_jobs` (8) per cycle. Inside a job the hosts' URLs alternate, so the
-   crawler's 128 API slots per process spread over many hosts. Docs become `dispatched`,
-   each host gets `batch_id` and `next_at = now + docs × min_gap_s`, and the claim
-   commits.
+   `host_docs_per_job` (240) due docs by rank; jobs hold up to `job_size` (10,000) URLs,
+   at most `plan_max_jobs` (8) per cycle. A job lists one host's docs after another; the
+   crawler regroups them by host anyway. Docs become `dispatched`, each host gets
+   `batch_id`, its `next_at` stays as it is, and the claim commits. The host is ready
+   again once that job is applied or lost.
 6. **Send** each job and record the answer:
 
 | Response | Verdict |
@@ -164,11 +259,13 @@ committed, then sent.
 | no reply, or 200 without a usable `job_id` | unknown: the job stays `claimed` until the claim timeout; unsent jobs released |
 
 An unknown job may have been accepted. isel never learns its `job_id`, so the TTL
-removes its results. `--dry-run` only prints the per-host capacity report.
+removes its results. Its docs go out again after the claim timeout; if the crawler took
+the first job too, the crawler's per-host cap still spans both. `--dry-run` only prints
+the progress report (§3).
 
 ## 8. `recrawl-archive`
 
-A loop, every 60 s. It never changes `result_root`. A spawn pool of `archive_workers`
+A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_workers`
 (8) processes does each job's file work; the main process applies results in order.
 
 1. Take each `completed` or `error` job whose `result_root/{job_id}` exists. The archive
@@ -190,7 +287,9 @@ A loop, every 60 s. It never changes `result_root`. A spawn pool of `archive_wor
    the main-content body (full text if all boilerplate; at most 200,000 chars) and the
    language, from the raw bytes or their `<meta charset>`.
 6. Write one zstd Parquet per job under `text_root` and a gzipped copy of the per-URL
-   results under `log_root`, dated by the job's `completed_at`, so a rerun
+   results under `log_root`. Each log line has its `crawler_id` from `request.json`, so
+   §11 can count the API requests of each process. Both files are dated by the job's
+   `completed_at`, so a rerun
    overwrites the same files. Then apply in one transaction, marking the job `applied`
    last:
 
@@ -215,7 +314,7 @@ A loop, every 60 s. It never changes `result_root`. A spawn pool of `archive_wor
 | Data | Size | Location | Kept |
 |---|---|---|---|
 | Pending job files | one manifest per open job, plus one marker per crawler in it | Host2 `/data/manual_bulk_crawls/pending` | a marker until its crawler finishes; the manifest until DELETE or the TTL |
-| Raw HTML + per-URL JSON | 128M pages are 5–6 TB even gzipped; ≤ ~288k pages at once (48 jobs at the crawler, 48 waiting for the archive) | Host2 `/data/manual_bulk_crawls/results` | deleted by isel once applied; the 3-day TTL removes the rest |
+| Raw HTML + per-URL JSON | 128M pages are 5–6 TB even gzipped; ≤ ~1.28M pages at once (64 jobs at the crawler, 64 waiting for the archive), about 256 GB at the normal crawl's ~200 KB per page | Host2 `/data/manual_bulk_crawls/results` | deleted by isel once applied; the 3-day TTL removes the rest |
 | Text Parquet | ~0.35–0.4 TB | Host2 `/data/isel/text` | permanent |
 | Gzipped per-URL results | ~8 GB | Host2 `/data/isel/log` | permanent; selectdb has no backup |
 | `recrawl` schema | ~37 GB (not measured) | Host1 selectdb `:5445` | resident |
@@ -232,26 +331,46 @@ A loop, every 60 s. It never changes `result_root`. A spawn pool of `archive_wor
 - `recrawl-archive`: 8 CPUs for `archive_workers`, 8 GB.
 - Both: profile `recrawl`, `restart: unless-stopped`, `/data/manual_bulk_crawls/results`
   read-only, `/data/isel` read-write. Run `mkdir -p /data/isel` as the isel user before
-  `up`, or Docker creates it as root. Start them only after WebCrawler#84 (`bd40191` or
-  later) is merged and deployed.
+  `up`, or Docker creates it as root.
 - `tests/recrawl_fakes.py` holds a stub of the API and a fake crawler that write
   per-crawler partitions like PR #84; the integration tests run the whole loop against
-  them. A separate local run against PR #84's own FastAPI app and partition writer at
-  `bd40191`, with two crawlers, also passed. It covered a job that only one crawler had
-  finished, which was not applied.
+  them. A separate local run against PR #84's own FastAPI app, with its pinned
+  requirements (w3lib 2.3.1), and its partition writer at `cc96500`, with two crawlers,
+  also passed. It covered a URL the API refused by index, a job that only one crawler
+  had finished, which was not applied, and the `DELETE` after the apply.
 
 ## 11. Rollout
 
 A **Hard Stop** phase needs the owner's approval before it starts. The R3 audit checks
-Loki: at most 120 requests per host in any 10 minutes.
+Loki against the audit row of §2.
 
 | Phase | Content | Precondition |
 |---|---|---|
 | R0 | schema, sync, plan, archive, extraction, tests, local end-to-end runs (done) | this repository only |
-| R1 (Hard Stop) | check `:5445` is at 0002, migrate to 0003; `recrawl-sync` on the live run; `recrawl-plan --dry-run` | the batch-20 swap is done; Host1 has space for the schema |
-| R2 | WebCrawler#84 merged and deployed | crawler running |
-| R3 (Hard Stop) | start both loops; trial of 1–5M pages; measure HTML and text size and the time from POST to results | R2 |
-| R4 | the full list, then only new, due and unfinished pages each period | R3's measurements |
+| R1 (Hard Stop) | check `:5445` is at 0002, migrate to 0003; `recrawl-sync` on the live run; `recrawl-plan --dry-run` | the 64M list is live; Host1 has space for the schema |
+| R2 | measure each process's normal `request.end` rate over the 24 h before R3: the baseline | crawler running |
+| R3 (Hard Stop) | start both loops at the server's limits (`job_size` 10,000, `max_jobs_inflight` 64); watch for 24 h | R2 |
+| R4 | the full list, then only new, due and unfinished pages each period | R3 without a stop |
+
+Measured during R3:
+
+- Normal crawl per process: `sum by (worker_id) (count_over_time({event="request.end"}
+  [10m]))` in Loki, minus the API requests of that process in the same window (the
+  lines of `log_root` with its `crawler_id`, by `fetched_at`). Host2's crawler logs have
+  no `source` field; that comes only with the follow-up of §4.
+- Slots: `inflight`, `slot_queue` and `scheduler_size` of `spider.heartbeat`, per worker.
+- Recrawl: pages fetched per hour, job lifetime (`submitted_at` to `completed_at`),
+  `archive_lag`, and the rate of the 20 largest hosts.
+- Politeness: the share of 429 and 503, and robots.txt refusals.
+- Disk: `/data/manual_bulk_crawls/results`, `/data/isel` and free space on `/data`.
+
+Stop rule. If one of these is true, run `stop recrawl-plan`. The archive goes on, and
+the TTL removes what is left.
+
+- The normal crawl of one process is below 80 % of its baseline for 30 minutes.
+- The 429 and 503 share is more than twice that of the normal crawl in the same window.
+- Host2 `/data` has less than 1.5 TB free.
+- Another team's job stays `pending` behind ours for more than 1 hour.
 
 To remove the recrawl: `git revert`, then `alembic downgrade 0002`, which drops the
 `recrawl` schema. The text Parquet is not touched.
@@ -259,17 +378,30 @@ To remove the recrawl: `git revert`, then `alembic downgrade 0002`, which drops 
 Known risks:
 
 - **A stopped crawler.** A job's URLs span many crawlers, so nearly every job waits for
-  it. Once 48 jobs are open, the planner claims nothing. If the crawler is back within
+  it. Once 64 jobs are open, the planner claims nothing. If the crawler is back within
   the TTL, the jobs complete. If not, they become `lost`, and the results the other
   partitions already fetched are dropped with them.
-- **Head-of-line in the API.** The 128 slots count requests queued in the scheduler,
-  fill by job and index order, and have no per-host cap. By rank, each of the first 50
-  jobs holds only ~29 hosts, about 2 per crawler over 16 crawlers. If AutoThrottle holds
-  a large host near 0.3 qps, the total is about 10 req/s, far below the 106 req/s that
-  14 days need. A smaller `host_docs_per_job` alone leaves the large hosts unfinished
-  under the rule of one open job per host. The candidate fix lets a host sit in several
-  jobs, paced by `next_at`; it waits for Loki or trial measurements.
-- **Lane allocation** between normal and API requests is WebCrawler#85.
+- **Slots held by waiting requests (fix proposed, not adopted).** As merged, a host may
+  hold 16 API requests, but AutoThrottle starts one per delay, so most of them wait. 16
+  such hosts fill a process's 256. In a local simulation of one process with production
+  settings, 88 % of the slots waited and API requests ran at 6.1 req/s. The per-host cap
+  of §4 cut the waiting share to 13 % and raised API requests to 28.3 req/s.
+- **Normal crawl starvation (fix proposed, not adopted; R3 measures it).** Under `manual_first`, a
+  process dispatches a normal request only when no API request waits in its scheduler.
+  In the simulation the normal crawl fell to 1 % of its rate; under `balanced` it fell
+  to 13 %, because waiting API requests held the slots. On PR #84 the TA asked that
+  neither side starve. With the follow-up at a share of 50, the normal crawl kept 56 %
+  and API requests got 50.0 % of the dispatches. The simulation and its numbers are in
+  index-selection `docs/experiments/2026-10-29-pr84-starvation.md`.
+- **One open job per host is not a rate.** A PR #84 job is `completed` only when all of
+  its URLs are done. If a host were in every open job, each job would wait for that host,
+  and the recrawl would fall to about 12.5 times the slowest host's rate. So the rule
+  stays. Its cost: a fast host waits for the slowest host of its job. R3 measures that
+  as job lifetime against `host_docs_per_job` ÷ the host's rate.
+- **Next steps after R3.** If the normal crawl starves: the `balanced` policy (a crawler
+  env the TA sets) or the follow-up of §4, both on the server side. If fast hosts wait
+  for slow ones: smaller jobs, or jobs grouped by measured host rate. If the rate is
+  below the 52.9 req/s that 64M in 14 days needs: a larger `host_docs_per_job`.
 
 ## 12. Rejected alternatives
 
@@ -277,9 +409,9 @@ Known risks:
 |---|---|
 | `crawl-requests` for recrawl | ~128,000 calls, each writing crawlerdb; HTML deleted after 8 h; nothing to track |
 | Map results by URL string | the API canonicalizes URLs, so strings miss docs; map by position and check the order |
-| A threshold on rewritten URLs to detect a new order | one host fills 120 of 3,000 URLs (4 %), so a fully rewritten host trips it; an exact check is used |
+| A threshold on rewritten URLs to detect a new order | one host fills 240 of 10,000 URLs (2.4 %), so a fully rewritten host trips a low threshold; an exact check is used |
 | Read each partition's `progress.json` to decide completion | a copy of the API's `job_status`; PR #84 says only the API decides, the format changed twice in one week, and it would miss the API's expiry check |
-| Download results over HTTP | ~6,000 GETs per 3,000-URL job, ~60 MB/s through FastAPI at full rate, and the archive would need the API; isel sits next to the files |
+| Download results over HTTP | ~20,000 GETs per 10,000-URL job, ~60 MB/s through FastAPI at full rate, and the archive would need the API; isel sits next to the files |
 | Scan `crawler_*` directories for result files | they also hold `.json.tmp` and `progress.json`, and crawler ids above 99 have 3 digits; `crawler_ids` in `request.json` locates each file, as the API's download route does |
 | Count `completed` jobs in `max_jobs_inflight` | they no longer hold the crawler, so the archive's delay would slow dispatch; a separate cap of the same size is used |
 | Our own job timeout plus `DELETE` to cancel | two deadlines to keep in step; the server's TTL already stops a job and answers 404 |
@@ -287,6 +419,9 @@ Known risks:
 | The default 14-day TTL | unapplied results would stay 14 days on `/data`; 3 days covers a job under FIFO, and a longer archive outage only costs a refetch |
 | Wait for a whole wave of jobs before the next | the slowest host holds the wave |
 | Permanent raw HTML | 5–6 TB against ~2 TB free; the index needs only text |
+| A per-host wait between a host's jobs (`docs × min_gap_s`) | a second fixed rate on top of the crawler's slot; the open job already holds a host back |
+| A per-hostname list cap from an assumed rate (241,920 at 4.8 s) | the rate is the crawler's to decide and is unknown before the crawl; it saves at most the tails of 23 hosts and costs 8 head golden URLs if they finish |
+| `download_latency` or slot delay from the API to size the cap | latency gives only the slot's ceiling (about 2 / latency), not the share and normal traffic; `fetched_at` already shows the pace that results |
 
 ## 13. Inverted index (planned)
 

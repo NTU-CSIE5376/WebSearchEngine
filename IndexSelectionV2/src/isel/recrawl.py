@@ -12,12 +12,12 @@ isel puts its docs back in line.
 - `sync` (after each swap): loads the live run's manifest. A doc is on the
   list while `rank` is set; sync writes only `rank` and `model_run_id`.
 - `plan` (loop): packs the due docs of the best-ranked ready hosts into jobs
-  and POSTs them. A host is in at most one open job, and its next job waits
-  `min_gap_s` per doc it was sent, so the recrawl alone stays within 0.2 qps
-  per host. A job is recorded `claimed` before it is sent, so no HTTP call
-  runs inside a transaction. Plan also polls each unapplied job's status and
-  marks it `completed` with the API's `completed_at`. Once a job is applied,
-  plan DELETEs its results.
+  and POSTs them. A host is in at most one open job; its next job goes out
+  once this one is applied. The crawler's AutoThrottle slot sets how fast a
+  host's docs go out; isel adds no rate of its own. A job is recorded
+  `claimed` before it is sent, so no HTTP call runs inside a transaction. Plan
+  also polls each unapplied job's status and marks it `completed` with the
+  API's `completed_at`. Once a job is applied, plan DELETEs its results.
 - `archive` (loop): reads each completed job's directory without changing it
   and without calling the API. Worker processes extract each page's text into
   Parquet and keep a gzipped copy of the per-URL results; the main process then
@@ -602,16 +602,13 @@ def _claim(cfg: Config, cur: psycopg.Cursor, now: datetime, n_jobs: int) -> list
         "WHERE d.doc_id = u.doc_id",
         ([d for j in jobs for d in j.doc_ids],
          [j.batch_id for j in jobs for _ in j.doc_ids]))
-    # The next job of a host waits min_gap_s per doc sent: 0.2 qps on average.
-    rows = [(h, j.batch_id, len(docs)) for j, groups in zip(jobs, packed, strict=True)
-            for h, docs in groups]
+    # next_at stays as it is: the open job alone holds the host back.
+    rows = [(h, j.batch_id) for j, groups in zip(jobs, packed, strict=True) for h, _ in groups]
     cur.execute(
-        "UPDATE recrawl.host h SET batch_id = u.batch_id, "
-        "next_at = %s + make_interval(secs => u.n * %s) "
-        "FROM unnest(%s::bigint[], %s::bigint[], %s::int[]) AS u(host_id, batch_id, n) "
-        "WHERE h.host_id = u.host_id",
-        (now, r.min_gap_s, *map(list, zip(*rows, strict=True))))
-    _refresh_best_rank(cur, [h for h, _, _ in rows])
+        "UPDATE recrawl.host h SET batch_id = u.batch_id "
+        "FROM unnest(%s::bigint[], %s::bigint[]) AS u(host_id, batch_id) "
+        "WHERE h.host_id = u.host_id", tuple(map(list, zip(*rows, strict=True))))
+    _refresh_best_rank(cur, [h for h, _ in rows])
     return jobs
 
 
@@ -691,28 +688,34 @@ def _drop_invalid(conn: psycopg.Connection, job: Job, index: int) -> None:
         _refresh_best_rank(cur, hosts)
 
 
-def capacity_report(cfg: Config, conn: psycopg.Connection) -> dict[str, Any]:
-    """Per-hostname capacity of the live list at 1 / `min_gap_s` requests per second."""
-    r = cfg.recrawl
-    rows = conn.execute("SELECT count(*) FROM recrawl.doc WHERE rank IS NOT NULL "
-                        "AND state <> 'gone' GROUP BY host_id").fetchall()
-    counts = np.array([n for (n,) in rows], dtype=np.int64)
+def _days(left: int, per_day: int) -> float | None:
+    return round(left / per_day, 1) if per_day else None
+
+
+def capacity_report(conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
+    """Progress of the live list, measured: docs left and docs fetched in the last day.
+
+    No rate is assumed: the crawler's pace shows in `fetched_at`. Days left are the
+    docs left over the last day's fetches, for the list and for its largest host.
+    """
+    rows = conn.execute(
+        "SELECT count(*), count(*) FILTER (WHERE state <> 'fetched'), "
+        "count(*) FILTER (WHERE fetched_at > %s) FROM recrawl.doc "
+        "WHERE rank IS NOT NULL AND state <> 'gone' GROUP BY host_id",
+        (now - timedelta(days=1),)).fetchall()
+    docs, left, day = (np.array(c, dtype=np.int64) for c in zip(*rows, strict=True)) \
+        if rows else (np.zeros(0, dtype=np.int64),) * 3
     states = dict(conn.execute("SELECT state, count(*) FROM recrawl.doc "
                                "WHERE rank IS NOT NULL GROUP BY state").fetchall())
-    per_day = 86400 / r.min_gap_s
-    total = int(counts.sum())
-    horizons = []
-    for days in r.report_days:
-        cap = per_day * days
-        covered = int(np.minimum(counts, cap).sum())
-        horizons.append({"days": days, "covered": covered,
-                         "share": round(covered / total, 4) if total else 0.0,
-                         "hosts_unfinished": int((counts > cap).sum()),
-                         "mean_req_s": round(covered / (days * 86400), 1)})
-    return {"docs": total, "hosts": int(counts.size), "states": states,
-            "max_host_docs": int(counts.max()) if counts.size else 0,
-            "days_for_largest_host": round(int(counts.max()) / per_day, 1) if counts.size
-            else 0.0, "horizons": horizons}
+    report = {"docs": int(docs.sum()), "hosts": int(docs.size), "states": states,
+              "max_host_docs": int(docs.max()) if docs.size else 0,
+              "left": int(left.sum()), "fetched_1d": int(day.sum()),
+              "days_left": _days(int(left.sum()), int(day.sum())), "largest_left": None}
+    if left.size:
+        i = int(left.argmax())
+        report["largest_left"] = {"left": int(left[i]), "fetched_1d": int(day[i]),
+                                  "days_left": _days(int(left[i]), int(day[i]))}
+    return report
 
 
 # ---------------------------------------------------------------- archive
@@ -881,6 +884,7 @@ def prepare_job(r: RecrawlCfg, job: JobInput) -> PreparedJob:
                 lines.append(json.dumps({
                     "batch_id": job.batch_id, "job_id": job.job_id, "doc_id": doc_id,
                     "url": job.urls[i], "index": n,
+                    "crawler_id": owners[n] if n is not None else None,
                     **({k: str(v) if k == "fetched_at" else v for k, v in item.items()}
                        if item else {}),
                     "outcome": rec["outcome"], "fail_reason": rec["fail_reason"]},

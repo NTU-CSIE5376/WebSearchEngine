@@ -538,7 +538,9 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         _go_live(cfg, admin, tmp_path, "r1", [A1, A2, "https://a.example/x/../2", A3, B1, C1])
         synced = sync(cfg, admin, now=lambda: OPEN)
         assert (synced["docs"], synced["dropped"], synced["hosts_due"]) == (5, 0, 3)
-        assert capacity_report(cfg, admin)["docs"] == 5
+        report = capacity_report(admin, OPEN)
+        assert (report["docs"], report["left"], report["fetched_1d"]) == (5, 5, 0)
+        assert report["days_left"] is None and report["largest_left"]["left"] == 3
 
         first = plan_cycle(cfg, admin, T0, api)
         assert (first["jobs"], first["docs"], first["refused"], first["unknown"]) == (1, 4, 0, 0)
@@ -547,8 +549,9 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         ((batch, job_id, state, doc_ids),) = _jobs(admin)
         assert (state, doc_ids) == ("submitted", [pg_doc_id(u) for u in (A1, A2, B1, C1)])
         assert stub.jobs() == [job_id]
-        assert _host(admin, "a.example") == (batch, T0 + timedelta(seconds=2 * r.min_gap_s))
-        assert _host(admin, "b.example") == (batch, T0 + timedelta(seconds=r.min_gap_s))
+        # The open job alone holds a host back: the claim sets no next_at.
+        assert _host(admin, "a.example") == (batch, None)
+        assert _host(admin, "b.example") == (batch, None)
         assert plan_cycle(cfg, admin, T0, api)["jobs"] == 0        # A3's host is in a job
 
         done = T0 + timedelta(minutes=1)
@@ -587,14 +590,22 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
             log = [json.loads(line) for line in fh]
         assert [(x["url"], x["index"], x["outcome"]) for x in log] == [
             (A1, 0, "fetched"), (A2, 1, "throttled"), (B1, 2, "fetched"), (C1, 3, "robots")]
+        # The crawler of each result, to count API requests per process.
+        assert [x["crawler_id"] for x in log] == [crawler_of(u) for u in (A1, A2, B1, C1)]
         assert _jobs(admin)[0][2] == "applied"
         assert archive_cycle(cfg, admin, done)["jobs"] == 0      # applied once only
+        # Progress is measured from fetched_at: A1 and B1 in the last day, 3 docs left.
+        report = capacity_report(admin, done + timedelta(seconds=10))
+        assert (report["left"], report["fetched_1d"], report["days_left"]) == (3, 2, 1.5)
+        assert report["largest_left"] == {"left": 2, "fetched_1d": 1, "days_left": 2.0}
 
-        # The next plan deletes the applied job's results at the API. The throttled host
-        # waits, then gets its retry and the doc it had no room for.
+        # The next plan deletes the applied job's results at the API. The throttled host,
+        # in no job now, waits out its pause, then gets its retry and the doc it had no
+        # room for.
         later = done + timedelta(seconds=r.retry_base_s)
-        got = plan_cycle(cfg, admin, later, api)
-        assert (got["deleted"], got["jobs"]) == (1, 1) and not out.exists()
+        paused = plan_cycle(cfg, admin, later - timedelta(seconds=1), api)
+        assert (paused["deleted"], paused["jobs"]) == (1, 0) and not out.exists()
+        assert plan_cycle(cfg, admin, later, api)["jobs"] == 1
         assert stub.ttls == [r.result_ttl_days] * 2 and stub.posts[-1] == [A2, A3]
         crawler.web.update({A2: ENGLISH, A3: ENGLISH})
         crawler.take(later)
@@ -626,7 +637,7 @@ def test_recrawl_sync_takes_docs_off_the_list_and_plan_skips_them(selectdb, tmp_
         admin.close()
 
 
-def test_recrawl_plan_caps_open_jobs_and_spaces_a_hosts_jobs(selectdb, tmp_path, stub):
+def test_recrawl_plan_caps_open_jobs_and_sends_a_hosts_next_job_once_applied(selectdb, tmp_path, stub):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub, job_size=2, host_docs_per_job=1)
     D1, E1 = "https://d.example/1", "https://e.example/1"
     _setup(cfg)
@@ -643,10 +654,11 @@ def test_recrawl_plan_caps_open_jobs_and_spaces_a_hosts_jobs(selectdb, tmp_path,
         assert (full["jobs"], full["open"]) == (0, 3)
         FakeCrawler(stub, {}).finish(_jobs(admin)[0][1], T0)
         _poll(cfg, admin, stub, T0)
+        # Completed but not applied: A is still in that job, so A2 waits.
+        assert plan_cycle(cfg, admin, T0, api)["jobs"] == 0
         archive_cycle(cfg, admin, T0 + timedelta(seconds=1))
-        # A's next job waits min_gap_s per doc it was sent.
-        assert plan_cycle(cfg, admin, T0 + timedelta(seconds=2), api)["jobs"] == 0
-        assert plan_cycle(cfg, admin, T0 + timedelta(seconds=5), api)["jobs"] == 1
+        # Applied: A's next job goes out at the next plan, with no interval of isel's own.
+        assert plan_cycle(cfg, admin, T0 + timedelta(seconds=1), api)["jobs"] == 1
         assert stub.posts[-1] == [A2]
     finally:
         admin.close()
@@ -1044,7 +1056,10 @@ def test_recrawl_a_completed_job_the_api_forgot_is_lost(selectdb, tmp_path, stub
         stub.status_codes[job_id] = 404                       # expired before the archive ran
         got = plan_cycle(cfg, admin, T0 + timedelta(seconds=1), api)
         assert got["lost"] == 1 and _jobs(admin)[0][2] == "lost"
-        assert _doc(admin, A1, "state") == ("pending",) and _host(admin, "a.example")[0] is None
+        # Released, A1 goes out again in the same cycle: no interval holds its host back.
+        assert got["jobs"] == 1 and stub.posts == [[A1], [A1]]
+        assert _doc(admin, A1, "state") == ("dispatched",)
+        assert _host(admin, "a.example")[0] == _jobs(admin)[1][0]
         assert archive_cycle(cfg, admin, T0 + timedelta(seconds=1))["jobs"] == 0
     finally:
         admin.close()
@@ -1126,7 +1141,6 @@ host_docs_per_job = 2
 plan_max_jobs = 2
 min_free_gb = 0
 archive_workers = 2
-min_gap_s = 0.001
 status_poll_s = 0
 """)
         cli = ["--config", str(Path(__file__).resolve().parents[1] / "config" / "isel.toml"),
