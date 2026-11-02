@@ -71,6 +71,7 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 BAD_INDEX_RE = re.compile(r"\bat index (\d+)$")
 NON_HTML = "NonHTML content-type"       # the crawler's error for a 2xx without HTML
 ITEM_KEYS = frozenset({"url", "final_url", "status_code", "error", "html_file", "fetched_at"})
+HTTP_STATUS = range(100, 1000)          # three digits (RFC 9110 §15); fits SMALLINT
 RESULT_COLUMNS = ("doc_id", "outcome", "http_status", "final_url", "fail_reason",
                   "payload_sha1", "fetched_at", "text_len", "lang")
 # One row per fetched page, the input of the inverted index (docs/RECRAWL.md).
@@ -892,6 +893,11 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _http_status(value: int | None) -> int | None:
+    """The status as stored: anything but three digits is kept only in `fail_reason`."""
+    return value if value in HTTP_STATUS else None
+
+
 def _timestamp(value: Any, key: str) -> datetime:
     if not isinstance(value, str):
         raise ValueError(f"{key} must be an ISO 8601 string")
@@ -912,9 +918,9 @@ def read_item(part: Path, index: int, url: str) -> dict[str, Any]:
         raise ValueError(f"{name} lacks a result key")
     if item["url"] != url:
         raise ValueError(f"{name} is for another URL than request.json lists")
-    status = item["status_code"]
-    if status is not None and not (_is_int(status) and 100 <= status <= 599):
-        raise ValueError(f"{name}: status_code must be an HTTP status or null")
+    # Only the type: the value is whatever integer the site sent (781, 901, ...).
+    if item["status_code"] is not None and not _is_int(item["status_code"]):
+        raise ValueError(f"{name}: status_code must be an integer or null")
     for key in ("final_url", "error"):
         if item[key] is not None and not isinstance(item[key], str):
             raise ValueError(f"{name}: {key} must be a string or null")
@@ -1012,7 +1018,7 @@ def _record(r: RecrawlCfg, part: Path, job: JobInput, i: int, item: dict[str, An
         rec["outcome"], rec["fail_reason"] = "retry", "unmatched"
         return rec
     rec["outcome"], rec["fail_reason"] = classify(item)
-    rec.update(http_status=item["status_code"], final_url=item["final_url"],
+    rec.update(http_status=_http_status(item["status_code"]), final_url=item["final_url"],
                fetched_at=item["fetched_at"])
     if rec["outcome"] != "fetched":
         return rec

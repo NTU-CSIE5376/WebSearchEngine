@@ -15,6 +15,7 @@ from recrawl_fakes import ApiStub, FakeCrawler, Page
 from isel.config import ConfigError, load_config
 from isel.recrawl import (
     CrawlerApi,
+    JobInput,
     RecrawlError,
     Reply,
     classify,
@@ -24,6 +25,7 @@ from isel.recrawl import (
     read_item,
     run_loop,
 )
+from isel.recrawl import _record as record_of
 from isel.urlnorm import md5_number_lower
 
 URL = "https://a.example/x"
@@ -64,6 +66,7 @@ def test_ids_match_duckdb_and_fit_postgres():
      ("retry", "TimeoutError")),
     ({"status_code": 500, "error": "HTTP 500"}, ("retry", "http_500")),
     ({"status_code": 301, "error": "HTTP 301", "html_file": None}, ("retry", "http_301")),
+    ({"status_code": 781, "error": "HTTP 781"}, ("retry", "http_781")),
 ])
 def test_classify(kw, expected):
     assert classify(item(**kw)) == expected
@@ -94,7 +97,7 @@ def _item_file(tmp_path, **kw):
 @pytest.mark.parametrize(("kw", "message"), [
     ({"url": "https://other.example/"}, "another URL"),
     ({"status_code": "200"}, "status_code"),
-    ({"status_code": 99999}, "status_code"),
+    ({"status_code": True}, "status_code"),
     ({"error": 5}, "error must be"),
     ({"final_url": 5}, "final_url must be"),
     ({"html_file": "../../etc/passwd"}, "html_file"),
@@ -115,6 +118,24 @@ def test_read_item_ignores_new_keys_and_parses_the_time(tmp_path):
     (tmp_path / "00000.json").write_text(json.dumps({"url": URL}))
     with pytest.raises(ValueError, match="lacks a result key"):
         read_item(tmp_path, 0, URL)
+
+
+@pytest.mark.parametrize("status", [781, 901, 0, 99999])
+def test_read_item_passes_any_integer_status_through(tmp_path, status):
+    # The crawler copies whatever integer the site sent (Twisted only calls int()).
+    # A 781 from one site once put a whole job in `error` and halted the planner.
+    _item_file(tmp_path, status_code=status, error=f"HTTP {status}")
+    assert read_item(tmp_path, 0, URL)["status_code"] == status
+
+
+@pytest.mark.parametrize(("status", "stored"), [(781, 781), (99999, None), (0, None)])
+def test_record_keeps_only_three_digit_statuses(tmp_path, status, stored):
+    job = JobInput(1, "1" * 32, [7], [URL], datetime(2026, 11, 2, tzinfo=UTC))
+    got = item(status_code=status, error=f"HTTP {status}",
+               fetched_at=datetime(2026, 11, 2, tzinfo=UTC))
+    rec = record_of(load_config([BASE]).recrawl, tmp_path, job, 0, got, [])
+    assert (rec["outcome"], rec["fail_reason"], rec["http_status"]) == (
+        "retry", f"http_{status}", stored)
 
 
 def test_archive_workers_do_not_import_duckdb():

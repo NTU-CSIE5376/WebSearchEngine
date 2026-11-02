@@ -280,7 +280,10 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 2. Read `request.json` (`urls` and `crawler_ids`, one crawler per URL) and, for every
    listed position N, `NNNNN.json` in partition `crawler_{crawler_ids[N]:02d}`. Check
    each record: required keys and types, `url` equal to `request.json`'s N-th URL,
-   `html_file` only `NNNNN.html`, timestamps with a UTC offset.
+   `html_file` only `NNNNN.html`, timestamps with a UTC offset. `status_code` is checked
+   for type only (integer or null): the crawler passes on whatever integer the site sent
+   (781 and 901 were seen), so a value is never a breach. A status outside 100–999 is
+   stored as NULL `http_status`; its number stays in `fail_reason` (`http_<n>`).
 3. Map results to docs (`map_results`):
    - Same length: result i is doc i. If a URL differs and equals another sent URL, the
      order changed: a contract breach. Canonicalization alone is fine (PR #84's w3lib
