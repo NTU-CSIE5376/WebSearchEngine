@@ -94,7 +94,7 @@ recrawl_host = sa.Table(
     sa.Column("host", sa.Text, nullable=False),
     sa.Column("best_rank", sa.BigInteger),          # min rank of its due docs; NULL: none
     _tstz("next_at"),                               # no job before this (pacing, backoff)
-    sa.Column("batch_id", sa.BigInteger),           # its open job; NULL: none
+    sa.Column("batch_id", sa.BigInteger),           # job of its batch not yet done; NULL: none
     sa.PrimaryKeyConstraint("host_id", name="host_pkey"),
     sa.UniqueConstraint("host", name="host_host_key"),
     sa.Index("host_ready", "best_rank",

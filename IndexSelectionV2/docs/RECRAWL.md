@@ -29,7 +29,7 @@
 |---|---|
 | Unit | the full hostname; `en.wikipedia.org` and `zh.wikipedia.org` count separately |
 | Crawler limit | the production crawler runs AutoThrottle (target concurrency 2, delay 0.25–10 s, 16 per hostname). API and normal requests for a hostname share one downloader slot, so the recrawl adds no second rate |
-| Recrawl rate | isel sets no rate. A host is in at most one open job of up to `host_docs_per_job` (240) docs; its next job goes out once that one is applied (§7) |
+| Recrawl rate | isel sets no rate. A host has at most one batch of up to `host_docs_per_job` (240) docs not yet done at the crawler; its next batch goes out in a new job once all of them have results, even while the old job waits for other hosts (§7) |
 | Crawler pacing | the crawler sends a host's docs at its AutoThrottle slot rate, as it does normal URLs, with at most the slot concurrency (16) of them outstanding (§4) |
 | Audit | the normal crawl of each process stays at 80 % of its baseline or more (§11). Per hostname the slot is the bound, and isel cannot raise it. The earlier per-host checks (a 10-minute rate of at most normal + 0.22 req/s, at most 67 requests in 60 s) assumed an isel interval and are dropped |
 | robots.txt | always honoured |
@@ -136,7 +136,7 @@ the batch-20 list.
     `manual`). The heartbeat adds `dequeued_normal`, `dequeued_manual`, `manual_active`
     and `manual_save_ms`.
 - Politeness stays with the crawler: AutoThrottle and robots.txt. isel adds no rate of
-  its own. It decides only which docs a host's one open job carries, and pauses a host
+  its own. It decides only which docs a host's next batch carries, and pauses a host
   after a 429 or 503.
 - isel never writes crawlerdb, `/data/ipc` or `/data/manual_bulk_crawls`. It reads
   results read-only and deletes them only through the API.
@@ -177,7 +177,7 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 
 | Table | One row per | Main columns |
 |---|---|---|
-| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank`, `next_at` (end of a 429/503 pause, or its next due doc), `batch_id` (its open job) |
+| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank`, `next_at` (end of a 429/503 pause, or its next due doc), `batch_id` (the job of its batch not yet done) |
 | `recrawl.doc` | `doc_id` (signed BIGINT) | `url` (canonical), `host_id`, `rank`, `model_run_id`, `state`, `due_at`, `attempts`, `batch_id`, fetch fields, `text_file`, `text_len`, `lang` |
 | `recrawl.job` | job sent to the API | `batch_id`, `job_id`, `doc_ids` (in the order sent), `state`, timestamps, `deleted_at`, `records`, `error` |
 | `recrawl.batch_seq` | (sequence) | source of `batch_id` |
@@ -199,7 +199,7 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 - A job's only deadline is `result_ttl_days` (3), sent as `ttl_days`. The server stops
   an expired job; isel has no timeout of its own.
 - Partial indexes: `host_ready (best_rank)` and `host_queued (batch_id)` split hosts by
-  open job; `doc_due (host_id, rank)` covers due live docs; `doc_inflight (batch_id)`
+  batch at the crawler; `doc_due (host_id, rank)` covers due live docs; `doc_inflight (batch_id)`
   covers `dispatched`; `doc_stale (due_at)` covers live `fetched` docs; `job_open
   (state)` and `job_undeleted (batch_id)` cover jobs still to watch or delete.
 - Every frontier transaction takes one advisory lock, so sync, plan and archive never
@@ -235,21 +235,28 @@ committed, then sent.
      this job, so one broken job cannot hold back the others.
    - No connection: report `api_error` and end the round, so a dead API costs one
      timeout.
-3. **Delete.** Every `applied` job without `deleted_at` gets a `DELETE`. 204 or 404 sets
+3. **Drain.** For each `submitted` or `completed` job, a host that still points at it is
+   freed once every one of its docs there has a result file. `request.json`'s
+   `crawler_ids` locate the files, as the archive does; one `scandir` per partition
+   lists them. The docs stay `dispatched` until the archive applies the job. A host
+   stays held if one of those results is a 429 or 503, so the apply sets its pause
+   before its next batch. A job whose `request.json` is missing or shorter than the docs
+   sent (dropped duplicates) is left to the apply.
+4. **Delete.** Every `applied` job without `deleted_at` gets a `DELETE`. 204 or 404 sets
    `deleted_at`; anything else reports `api_error` and is tried next cycle. This runs even
    while the planner is halted.
-4. **Stop** claiming if a job is in `error`, if a completed job's results are not
+5. **Stop** claiming if a job is in `error`, if a completed job's results are not
    mounted, during the `api_backoff_s` (300 s) pause, if `max_jobs_inflight` (64) jobs are
    at the crawler (`claimed` + `submitted`), if as many `completed` jobs wait for the
    archive (`archive_lag`), or if less than `min_free_gb` (800 GB) is free under
    `text_root`.
-5. **Claim.** Ready hosts (no open job, `next_at` passed) by `best_rank`. Each gives up to
+6. **Claim.** Ready hosts (no batch at the crawler, `next_at` passed) by `best_rank`. Each gives up to
    `host_docs_per_job` (240) due docs by rank; jobs hold up to `job_size` (10,000) URLs,
    at most `plan_max_jobs` (8) per cycle. A job lists one host's docs after another; the
    crawler regroups them by host anyway. Docs become `dispatched`, each host gets
    `batch_id`, its `next_at` stays as it is, and the claim commits. The host is ready
-   again once that job is applied or lost.
-6. **Send** each job and record the answer:
+   again once that batch is drained, or its job is applied or lost.
+7. **Send** each job and record the answer:
 
 | Response | Verdict |
 |---|---|
@@ -393,15 +400,26 @@ Known risks:
   neither side starve. With the follow-up at a share of 50, the normal crawl kept 56 %
   and API requests got 50.0 % of the dispatches. The simulation and its numbers are in
   index-selection `docs/experiments/2026-10-29-pr84-starvation.md`.
-- **One open job per host is not a rate.** A PR #84 job is `completed` only when all of
-  its URLs are done. If a host were in every open job, each job would wait for that host,
-  and the recrawl would fall to about 12.5 times the slowest host's rate. So the rule
-  stays. Its cost: a fast host waits for the slowest host of its job. R3 measures that
-  as job lifetime against `host_docs_per_job` ÷ the host's rate.
+- **One batch per host at the crawler, not one job.** A PR #84 job is `completed` only
+  when all of its URLs are done, and the crawler serves a host's URLs across jobs in
+  submission order. Until 2026-11-02 a host stayed in its job until the job was
+  applied, so it waited for the slowest host of that job. In round 7 (index-selection
+  `results/summary_round7.md`) jobs lived 1,177 s at p50; small hosts then waited 470 s
+  and mid hosts 238 s after their own docs were done. That capped every host at about
+  240 ÷ (job lifetime + ~60 s), 0.19 req/s.
+- That cap matters for this list. In process 03 the 0.9 % of hosts with more than 240
+  docs hold 95 % of the URLs, and 92 % of the URLs lie past their host's first 240. At
+  0.19 req/s, 22 of the 30 largest hosts would miss 14 days, with 2.2M URLs late, and
+  `www.espn.com` would take 38 days. At its own slot rate of 0.5 req/s it takes 15 days.
+- So a host is freed as soon as its batch is done (§7 Drain): it may sit in several
+  open jobs, and the crawler still holds at most one unfinished batch of it. Job
+  lifetimes do not grow. Each host's idle time per batch is about one plan interval
+  (30 s). R3 measures what is left: per host, the time from its last `fetched_at` in a
+  job to the `claimed_at` of its next job.
 - **Next steps after R3.** If the normal crawl starves: the `balanced` policy (a crawler
-  env the TA sets) or the follow-up of §4, both on the server side. If fast hosts wait
-  for slow ones: smaller jobs, or jobs grouped by measured host rate. If the rate is
-  below the 52.9 req/s that 64M in 14 days needs: a larger `host_docs_per_job`.
+  env the TA sets) or the follow-up of §4, both on the server side. If a fast host
+  still idles between batches: a batch sized by its measured rate. If the rate is below
+  the 52.9 req/s that 64M in 14 days needs: a larger `host_docs_per_job`.
 
 ## 12. Rejected alternatives
 
@@ -419,7 +437,9 @@ Known risks:
 | The default 14-day TTL | unapplied results would stay 14 days on `/data`; 3 days covers a job under FIFO, and a longer archive outage only costs a refetch |
 | Wait for a whole wave of jobs before the next | the slowest host holds the wave |
 | Permanent raw HTML | 5–6 TB against ~2 TB free; the index needs only text |
-| A per-host wait between a host's jobs (`docs × min_gap_s`) | a second fixed rate on top of the crawler's slot; the open job already holds a host back |
+| A per-host wait between a host's jobs (`docs × min_gap_s`) | a second fixed rate on top of the crawler's slot; the batch at the crawler already holds a host back |
+| A host in up to N open jobs, 240 docs each | the crawler serves a host's batches one after another, so a slow host in N jobs makes each of them live about N times longer; a fast host then gets N batches per N-times-longer job, the same rate. Only the ~60 s between jobs is saved |
+| A host held until its job is applied | it waits for the slowest host of its job: 0.19 req/s per host in round 7, 38 days for `www.espn.com` (§11) |
 | A per-hostname list cap from an assumed rate (241,920 at 4.8 s) | the rate is the crawler's to decide and is unknown before the crawl; it saves at most the tails of 23 hosts and costs 8 head golden URLs if they finish |
 | `download_latency` or slot delay from the API to size the cap | latency gives only the slot's ceiling (about 2 / latency), not the share and normal traffic; `fetched_at` already shows the pace that results |
 

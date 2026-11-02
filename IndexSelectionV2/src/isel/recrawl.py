@@ -12,9 +12,11 @@ isel puts its docs back in line.
 - `sync` (after each swap): loads the live run's manifest. A doc is on the
   list while `rank` is set; sync writes only `rank` and `model_run_id`.
 - `plan` (loop): packs the due docs of the best-ranked ready hosts into jobs
-  and POSTs them. A host is in at most one open job; its next job goes out
-  once this one is applied. The crawler's AutoThrottle slot sets how fast a
-  host's docs go out; isel adds no rate of its own. A job is recorded
+  and POSTs them. A host has at most one batch not yet done at the crawler:
+  once all its docs in a job have results, its next batch goes out in a new
+  job, even while the old job waits for other hosts. The crawler's
+  AutoThrottle slot sets how fast a host's docs go out; isel adds no rate of
+  its own. A job is recorded
   `claimed` before it is sent, so no HTTP call runs inside a transaction. Plan
   also polls each unapplied job's status and marks it `completed` with the
   API's `completed_at`. Once a job is applied, plan DELETEs its results.
@@ -40,6 +42,7 @@ import gzip
 import hashlib
 import json
 import multiprocessing
+import os
 import re
 import shutil
 import time
@@ -353,16 +356,18 @@ def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
     2. Poll: every unapplied job is asked for its status every `status_poll_s`.
        A submitted job the API reports done becomes `completed`; a job the API
        no longer knows is lost (its TTL passed).
-    3. Delete the results of applied jobs at the API.
-    4. Stop if any job is in `error` (the API broke its contract), if a
+    3. Drain: a host whose docs in its job all have results is free again.
+    4. Delete the results of applied jobs at the API.
+    5. Stop if any job is in `error` (the API broke its contract), if a
        completed job's results are not mounted, if the API asked for a pause,
        if `max_jobs_inflight` jobs are at the crawler or wait for the archive,
        or if the text disk is short.
-    5. Claim jobs, commit, then send them.
+    6. Claim jobs, commit, then send them.
     """
     r = cfg.recrawl
     stats: dict[str, Any] = {"lost": 0, "orphans": 0, "swept": 0, "checked": 0,
-                             "completed": 0, "deleted": 0, "open": 0, "jobs": 0, "docs": 0,
+                             "completed": 0, "drained": 0, "deleted": 0, "open": 0,
+                             "jobs": 0, "docs": 0,
                              "invalid": 0, "refused": 0, "unknown": 0,
                              "halted": False, "unmounted": False, "paused": False,
                              "archive_lag": False, "disk_full": False}
@@ -384,6 +389,7 @@ def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
         _wake(cur, swept, now, r.host_pause_max_s)
         _refresh_best_rank(cur, swept)
     _check_jobs(cfg, conn, api, now, stats)
+    _drain(cfg, conn, stats)
     _delete_applied(conn, api, now, stats)
 
     counts = dict(conn.execute("SELECT state, count(*) FROM recrawl.job "
@@ -491,6 +497,83 @@ def _check_jobs(cfg: Config, conn: psycopg.Connection, api: CrawlerApi, now: dat
             continue
         conn.execute("UPDATE recrawl.job SET checked_at = %s WHERE batch_id = %s",
                      (now, batch))
+
+
+def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None:
+    """Frees each host whose docs in its open job all have a result on disk.
+
+    A job completes only when all its URLs are done, so without this a host
+    would wait for the slowest host of its job. Once freed, its next docs go out
+    in a new job while the old one is still open; the crawler still holds at
+    most one unfinished batch per host. The docs stay `dispatched` until the
+    archive applies the job. A host with a 429 or 503 among them stays held, so
+    its pause is set before its next job. A job whose `request.json` is missing
+    or dropped duplicates (positions differ from the docs sent) is left to the
+    archive.
+    """
+    jobs = conn.execute(
+        "SELECT batch_id, job_id, doc_ids FROM recrawl.job j "
+        "WHERE state IN ('submitted', 'completed') "
+        "AND EXISTS (SELECT 1 FROM recrawl.host h WHERE h.batch_id = j.batch_id) "
+        "ORDER BY batch_id").fetchall()
+    if not jobs:
+        return
+    held: dict[int, dict[int, list[int]]] = {}
+    for batch, host, doc_id in conn.execute(
+            "SELECT d.batch_id, d.host_id, d.doc_id FROM recrawl.doc d JOIN recrawl.host h "
+            "ON h.host_id = d.host_id AND h.batch_id = d.batch_id "
+            "WHERE d.state = 'dispatched' AND d.batch_id = ANY(%s::bigint[])",
+            ([b for b, _, _ in jobs],)):
+        held.setdefault(batch, {}).setdefault(host, []).append(doc_id)
+    free: list[tuple[int, int]] = []
+    for batch, job_id, doc_ids in jobs:
+        if batch in held:
+            free += [(host, batch) for host in _drained(
+                Path(cfg.recrawl.result_root) / job_id, doc_ids, held[batch])]
+    if not free:
+        return
+    with conn.transaction(), conn.cursor() as cur:
+        _cycle_lock(cur)
+        cur.execute("UPDATE recrawl.host h SET batch_id = NULL "
+                    "FROM unnest(%s::bigint[], %s::bigint[]) AS u(host_id, batch_id) "
+                    "WHERE h.host_id = u.host_id AND h.batch_id = u.batch_id RETURNING h.host_id",
+                    tuple(map(list, zip(*free, strict=True))))
+        freed = [h for (h,) in cur.fetchall()]
+        _refresh_best_rank(cur, freed)
+    stats["drained"] = len(freed)
+
+
+def _drained(job_dir: Path, doc_ids: list[int], docs: dict[int, list[int]]) -> list[int]:
+    """The hosts in `docs` (host -> its doc_ids) whose results are all on disk, unthrottled."""
+    try:
+        listing = json.loads((job_dir / "request.json").read_text(encoding="utf-8"))
+        urls, owners = listing["urls"], listing["crawler_ids"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    if len(urls) != len(doc_ids) or len(owners) != len(urls):
+        return []
+    where = {d: n for n, d in enumerate(doc_ids)}
+    names: dict[int, set[str]] = {}
+    out = []
+    for host, ids in docs.items():
+        spots = [where[d] for d in ids]
+        for n in spots:
+            if owners[n] not in names:
+                part = job_dir / f"crawler_{owners[n]:02d}"
+                try:
+                    names[owners[n]] = {e.name for e in os.scandir(part)}
+                except OSError:
+                    names[owners[n]] = set()
+        if not all(f"{n:05d}.json" in names[owners[n]] for n in spots):
+            continue
+        try:
+            outcomes = [classify(read_item(job_dir / f"crawler_{owners[n]:02d}", n, urls[n]))[0]
+                        for n in spots]
+        except (OSError, ValueError):
+            continue                     # the archive reports a bad record
+        if "throttled" not in outcomes:
+            out.append(host)
+    return out
 
 
 def _delete_applied(conn: psycopg.Connection, api: CrawlerApi, now: datetime,
@@ -602,7 +685,7 @@ def _claim(cfg: Config, cur: psycopg.Cursor, now: datetime, n_jobs: int) -> list
         "WHERE d.doc_id = u.doc_id",
         ([d for j in jobs for d in j.doc_ids],
          [j.batch_id for j in jobs for _ in j.doc_ids]))
-    # next_at stays as it is: the open job alone holds the host back.
+    # next_at stays as it is: the batch not yet done alone holds the host back.
     rows = [(h, j.batch_id) for j, groups in zip(jobs, packed, strict=True) for h, _ in groups]
     cur.execute(
         "UPDATE recrawl.host h SET batch_id = u.batch_id "

@@ -246,8 +246,9 @@ log_root = "work/recrawl/log"            # permanent per-URL results, YYYYMMDD/j
 job_size = 10000                         # URLs per job: the API's max_urls. A job
                                          # completes only when all its URLs finish
 host_docs_per_job = 240                  # docs per host and job; the crawler sends them at
-                                         # the host's slot rate. The host's next job goes out
-                                         # once this one is applied
+                                         # the host's slot rate. The host's next batch goes
+                                         # out once all of these have results, even while
+                                         # their job still waits for other hosts
 max_jobs_inflight = 64                   # jobs at the crawler: each process admits 64
                                          # (MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS); other teams'
                                          # jobs queue behind. Also the most completed jobs
