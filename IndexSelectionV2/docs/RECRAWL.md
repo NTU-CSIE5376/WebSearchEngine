@@ -336,6 +336,13 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 - `recrawl-plan`: `network_mode: host`, because the API listens on `127.0.0.1:4000`
   only; the API has no auth, so no token. It also sends the DELETEs. 2 CPUs, 4 GB.
 - `recrawl-archive`: 8 CPUs for `archive_workers`, 8 GB.
+- Threads: `pids_limit` 512 counts threads, and libraries size their pools by the host's
+  144 cores, not by `cpus`. Each archive worker is a spawn process that imports
+  `isel.cli` and `isel.recrawl`, so neither may import DuckDB at module level: DuckDB
+  1.4–1.5 starts one thread per core on `import duckdb` (fixed in 2.0). On 2026-11-02
+  that gave 208 threads per process, and 9 processes broke the pool 39 times in 40
+  minutes. `OPENBLAS_NUM_THREADS=1` caps the numpy that pyarrow loads. A test checks the
+  worker imports.
 - Both: profile `recrawl`, `restart: unless-stopped`, `/data/manual_bulk_crawls/results`
   read-only, `/data/isel` read-write. Run `mkdir -p /data/isel` as the isel user before
   `up`, or Docker creates it as root.

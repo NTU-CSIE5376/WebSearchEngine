@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 
 import duckdb
@@ -113,6 +115,16 @@ def test_read_item_ignores_new_keys_and_parses_the_time(tmp_path):
     (tmp_path / "00000.json").write_text(json.dumps({"url": URL}))
     with pytest.raises(ValueError, match="lacks a result key"):
         read_item(tmp_path, 0, URL)
+
+
+def test_archive_workers_do_not_import_duckdb():
+    # A spawn worker re-imports the console script (isel.cli) and isel.recrawl. DuckDB
+    # 1.4+ starts one thread per host core on import: 8 workers on a 144-core host
+    # overflowed the container's pids_limit (docs/RECRAWL.md §10).
+    code = "import sys, isel.cli, isel.recrawl; print('duckdb' in sys.modules)"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         check=True)
+    assert out.stdout.strip() == "False"
 
 
 def test_run_loop_once_returns_the_first_cycle():
