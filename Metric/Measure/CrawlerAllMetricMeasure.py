@@ -7,12 +7,70 @@ from tqdm import tqdm
 import tldextract
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 from w3lib.url import canonicalize_url
 
 
 def normalize_golden_url(url: str) -> str:
     """Convert a golden URL to the form the crawler and IndexSelection store."""
     return canonicalize_url(url)
+
+
+def strip_srsltid(url: str) -> str:
+    """Return `url` without Google's `srsltid` tracking parameter.
+
+    Google appends `srsltid` to search result links for Merchant Center
+    conversion attribution; it does not change the page, and every search
+    yields a new value. Other query pieces keep their encoding and order.
+    Same rule as WebCrawler `libs.urls.strip_srsltid`.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if "srsltid" not in parts.query.lower():
+        return url
+    kept = [
+        piece for piece in parts.query.split("&")
+        if unquote_plus(piece.partition("=")[0]).lower() != "srsltid"
+    ]
+    query = "&".join(kept)
+    if query == parts.query:
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+
+
+def golden_lookup_urls(golden_url: str) -> list[str]:
+    """Crawler-side URLs that count as this (normalized) golden URL.
+
+    A URL with and without `srsltid` is the same page: WebCrawler's
+    golden_inject stores the stripped form, the spider may store either.
+    Only `srsltid` is treated this way.
+    """
+    stripped = strip_srsltid(golden_url)
+    return [golden_url] if stripped == golden_url else [golden_url, stripped]
+
+
+def build_lookup_map(golden_urls) -> dict[str, list[str]]:
+    """Map each URL to look up in crawler tables -> golden URLs it counts for."""
+    lookup: dict[str, list[str]] = {}
+    for golden in golden_urls:
+        for url in golden_lookup_urls(golden):
+            lookup.setdefault(url, []).append(golden)
+    return lookup
+
+
+def apply_found_urls(url_status_map, lookup_map, found) -> None:
+    """Fold crawler-table hits into per-golden status: a golden URL is
+    discovered / crawled if any of its lookup URLs is."""
+    for url, crawled, indexed, shard_id in found:
+        for golden in lookup_map.get(url, ()):
+            status = url_status_map[golden]
+            status['discovered'] = True
+            status['crawled'] = status['crawled'] or crawled
+            status['indexed'] = status['indexed'] or indexed
+            if status['shard_id'] == -1:
+                status['shard_id'] = shard_id
 
 
 class CrawlerAllMetricMeasure(Measure):
@@ -172,10 +230,13 @@ class CrawlerAllMetricMeasure(Measure):
         # 準備掃描用的 Tuple
         url_list = list(url_id_map.keys())
         domain_list = list(all_golden_domains)
-        url_tuple = tuple(url_list)
+        # 帶 srsltid 的 golden 同時查「去掉 srsltid」的版本，任一命中就算
+        lookup_map = build_lookup_map(url_list)
+        url_tuple = tuple(lookup_map.keys())
         domain_tuple = tuple(domain_list)
         
-        print(f"   Loaded {len(url_list)} unique URLs from {len(domain_list)} domains.")
+        print(f"   Loaded {len(url_list)} unique URLs from {len(domain_list)} domains "
+              f"(+{len(url_tuple) - len(url_list)} srsltid-stripped lookups).")
 
         # ==========================================
         # 2. 並行掃描 CrawlerDB (Shards)
@@ -199,21 +260,15 @@ class CrawlerAllMetricMeasure(Measure):
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = [executor.submit(self._scan_url_shard, chunk, url_tuple) for chunk in shard_chunks]
             for future in tqdm(as_completed(futures), total=len(futures), desc="URLs"):
-                results = future.result()
-                for (url, crawled, indexed, shard_id) in results:
-                    if url in url_status_map:
-                        url_status_map[url]['discovered'] = True
-                        url_status_map[url]['crawled'] = crawled
-                        url_status_map[url]['indexed'] = indexed
-                        url_status_map[url]['shard_id'] = shard_id
+                apply_found_urls(url_status_map, lookup_map, future.result())
 
         # 查詢 SelectDB 取得 indexed 狀態
         if self.selectDB is not None:
             print(f"🔍 Checking SelectDB for index status ...")
             indexed_urls = self._load_indexed_urls(url_tuple)
             for url in indexed_urls:
-                if url in url_status_map:
-                    url_status_map[url]['indexed'] = True
+                for golden in lookup_map.get(url, ()):
+                    url_status_map[golden]['indexed'] = True
 
         # ==========================================
         # 3. 聚合統計與分組 (Team A / Team B)
