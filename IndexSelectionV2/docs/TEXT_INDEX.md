@@ -520,8 +520,13 @@ The Host2 pieces are in the repo, and nothing runs there yet:
 - `deploy/compose.compute.yaml`: the `opensearch` service (profile `search`) and the
   `text-index` job service;
 - `config/text_index/host2.toml`: `settings_file` under `/app` (the image runs in
-  `/work`), 8 shards, no `keep_prev`. The `text-index` service passes it after
-  `container.toml`.
+  `/work`), 8 shards, no `keep_prev`, and a small DuckDB. The `text-index` service passes
+  it after `container.toml`.
+- Hard limits, since Host2's CPU is rarely full and `cpu_shares` then does nothing: the node
+  has `OS_CPUS` (16) CPUs and `OS_MEM` (64g) of memory, with an `OS_HEAP` (31g) heap, and the
+  `text-index` job has 4 CPUs and 24 GB. A stage runs with smaller values. No I/O limit is
+  set: the NVMe scheduler is `none`, so a weight does nothing, and `io.max` on the shared
+  ext4 journal could stall the fsyncs of YugabyteDB. `bulk_workers` bounds the writes.
 
 Steps:
 1. Recompute the disk room on the day. Take the lowest free space before a prune over
@@ -534,9 +539,10 @@ Steps:
 3. `docker compose ... --profile search up -d opensearch`. Check
    `curl 127.0.0.1:9200/_cluster/health`, and check that `_nodes` reports
    `mlockall: true`: swap is full on Host2.
-4. Once the recrawl has text, build about 10M docs first (`docker compose ... run --rm
-   text-index text-index-build --text-root` on a few partitions) and record the peak
-   disk use. Then build all of it.
+4. Once the recrawl has text, build in stages and record the peak disk use and the load on
+   Host2 at each: about 100k docs, about 1M, then one `fetch_date` partition. A smaller
+   stage is a directory of hard links to job files, mounted with `docker compose run -v`.
+   `--text-root` takes one directory. Then build all of it.
 5. Run `text-index-eval --batch N` on the next golden batch: batch 20 alone chose the
    query.
 

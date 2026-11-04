@@ -93,7 +93,9 @@ services:
       DISABLE_SECURITY_PLUGIN: "true"
       DISABLE_INSTALL_DEMO_CONFIG: "true"
       bootstrap.memory_lock: "true"     # swap is full on Host2
-      OPENSEARCH_JAVA_OPTS: "-Xms31g -Xmx31g"
+      OPENSEARCH_JAVA_OPTS: "-Xms${OS_HEAP:-31g} -Xmx${OS_HEAP:-31g}"
+      # Thread pools follow this count; the JVM would otherwise see all 144 cores.
+      node.processors: ${OS_CPUS:-16}
       # One shard merges at a time, so with a refresh after each one a build needs one
       # shard of extra disk, not a second copy of the index.
       thread_pool.force_merge.size: "1"
@@ -104,8 +106,10 @@ services:
       nofile: {soft: 65536, hard: 65536}
     volumes:
       - /data/isel/opensearch:/usr/share/opensearch/data
-    mem_limit: 64g                      # the 31 GB heap; the rest caches index files
-    memswap_limit: 64g
+    mem_limit: ${OS_MEM:-64g}           # the heap; the rest caches index files
+    memswap_limit: ${OS_MEM:-64g}
+    # A hard cap: cpu_shares acts only when all cores are busy, and they rarely are.
+    cpus: ${OS_CPUS:-16}
     cpu_shares: 256                     # the crawler wins under contention
     logging:
       driver: json-file
@@ -122,6 +126,9 @@ services:
     network_mode: host                  # OpenSearch listens on 127.0.0.1:9200 only
     volumes:
       - /data/isel/text:/data/isel/text:ro
+    mem_limit: 24g                      # [duckdb] in host2.toml plus the bulk client
+    memswap_limit: 24g
+    cpus: 4
 
 secrets:
   crawlerdb_dsn:
