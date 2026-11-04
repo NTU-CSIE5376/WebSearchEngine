@@ -1057,7 +1057,8 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
     this job.
     """
     r = cfg.recrawl
-    args = {"now": now, "stale": r.stale_days, "robots": r.robots_retry_days,
+    args = {"now": now, "stale": r.stale_days, "exhausted": r.failed_retry_days,
+            "robots": r.robots_retry_days,
             "base": r.retry_base_s, "max": r.retry_max_s, "attempts": r.max_attempts,
             "pause": r.host_pause_max_s, "text_file": done.text_file, "batch": job.batch_id,
             "n": len(done.records)}
@@ -1106,7 +1107,7 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
             "WHERE r.outcome = 'throttled' AND d.state = 'dispatched' "
             "AND d.batch_id = %(batch)s) p WHERE h.host_id = p.host_id", args)
         backoff = ("state = 'failed', attempts = d.attempts + 1, due_at = %(now)s + CASE "
-                   "WHEN d.attempts + 1 >= %(attempts)s THEN make_interval(days => %(stale)s) "
+                   "WHEN d.attempts + 1 >= %(attempts)s THEN make_interval(days => %(exhausted)s) "
                    "ELSE make_interval(secs => least(%(base)s * power(2, d.attempts), %(max)s)) "
                    "END")
         cur.execute(

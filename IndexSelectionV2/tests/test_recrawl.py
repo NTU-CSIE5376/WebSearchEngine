@@ -183,6 +183,7 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
         (("result_ttl_days = 3 ", "result_ttl_days = 61 "), "result_ttl_days"),
         (("archive_workers = 8", "archive_workers = 0"), "must be > 0"),
         (("max_resend = 20 ", "max_resend = -1 "), "max_resend"),
+        (("failed_retry_days = 7 ", "failed_retry_days = 0 "), "must be > 0"),
         (("blocked_status = [202, 403]", "blocked_status = [202, 429]"), "blocked_status"),
         (("blocked_status = [202, 403]", "blocked_status = [99]"), "blocked_status"),
     ]

@@ -310,11 +310,15 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 | `IgnoreRequest` (robots.txt) | `failed` | after `robots_retry_days` (30) |
 | 429, 503 | `failed`, `attempts + 1`; host paused `retry_base_s` | exponential backoff |
 | `blocked_status` (202, 403) | `failed`, `attempts + 1`; no text row | exponential backoff |
-| other failure, `unmatched`, extraction failure | `failed`, `attempts + 1` | `retry_base_s · 2^attempts`, cap 24 h; `stale_days` after `max_attempts` (5) |
+| other failure, `unmatched`, extraction failure | `failed`, `attempts + 1` | `retry_base_s · 2^attempts`, cap 24 h; `failed_retry_days` (7) after `max_attempts` (5) |
 
 - A 2xx applies whenever it is newer than the stored fetch. A failure applies only while
   the doc still waits on this job. A doc of the job with no result is retried
   (`no_result`).
+- The five backoff tries took a median of 6.8 h (p90 9.8 h) on 2026-11-04. A doc that then
+  waited `stale_days` missed two golden batches, which come about every 14 days, so a block
+  that lifted a day later still cost a month. `failed_retry_days` gives every failed doc at
+  least two more tries per golden cycle. robots.txt keeps its 30 days: the site decides that.
 - A 202 is not a page. All 338 sampled 202 bodies on 2026-11-04 were AWS WAF challenges
   (`awswaf`, `gokuProps`, `challenge.js`, about 2 KB). Until then they counted as
   `fetched`, and an empty row in the text Parquet could replace a real page.

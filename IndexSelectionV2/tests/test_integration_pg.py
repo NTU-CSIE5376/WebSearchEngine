@@ -674,6 +674,28 @@ def test_recrawl_archive_keeps_a_waf_challenge_from_counting_as_fetched(selectdb
         admin.close()
 
 
+def test_recrawl_retries_an_exhausted_doc_before_the_next_golden_batch(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, max_attempts=1)
+    r = cfg.recrawl
+    assert r.failed_retry_days < r.stale_days
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        crawler = FakeCrawler(stub, {A1: Page(status=500)})
+        crawler.take(T0)
+        _poll(cfg, admin, stub, T0)
+        archive_cycle(cfg, admin, T0)
+        retry = T0 + timedelta(days=r.failed_retry_days)
+        assert _doc(admin, A1, "state", "attempts", "due_at") == ("failed", 1, retry)
+        assert plan_cycle(cfg, admin, retry - timedelta(seconds=1), api)["jobs"] == 0
+        assert plan_cycle(cfg, admin, retry, api)["jobs"] == 1
+    finally:
+        admin.close()
+
+
 def test_recrawl_sync_takes_docs_off_the_list_and_plan_skips_them(selectdb, tmp_path, stub):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub)
     _setup(cfg)
