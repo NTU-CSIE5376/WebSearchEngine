@@ -333,8 +333,8 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
     with pytest.raises(NeedsBaselineStamp):
         migrate(_admin(cfg))
     first = migrate(_admin(cfg), stamp_baseline=True)
-    assert first == {"revision_before": None, "revision": "0003", "stamped_baseline": True}
-    assert migrate(_admin(cfg))["revision_before"] == "0003"     # a rerun changes nothing
+    assert first == {"revision_before": None, "revision": "0004", "stamped_baseline": True}
+    assert migrate(_admin(cfg))["revision_before"] == "0004"     # a rerun changes nothing
     with pytest.raises(RuntimeError, match="only fits a pre-Alembic"):
         migrate(_admin(cfg), stamp_baseline=True)
     admin = _admin(cfg)
@@ -358,7 +358,7 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
 
 def test_migrate_builds_an_empty_selectdb_and_downgrades(selectdb):
     cfg = selectdb
-    assert _setup(cfg)["revision"] == "0003"
+    assert _setup(cfg)["revision"] == "0004"
     dsn = os.environ[cfg.selectdb.admin_dsn_env]
     engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://"))
     acfg = _alembic_config()
@@ -766,6 +766,53 @@ def test_recrawl_keeps_the_backoff_of_a_host_that_does_not_block(selectdb, tmp_p
         assert _host(admin, "a.example") == (None, None)
         assert _doc(admin, A1, "state", "attempts", "due_at") == (
             "failed", 1, T0 + timedelta(seconds=r.retry_base_s))
+    finally:
+        admin.close()
+
+
+def test_migration_0004_requeues_the_docs_the_old_retry_rule_held_back(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    B2 = "https://b.example/2"
+    _setup(cfg)
+    admin = _admin(cfg)
+    far = T0 + timedelta(days=30)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, B1, B2])
+        seed = ("UPDATE recrawl.doc SET state = %s, http_status = %s, fail_reason = %s, "
+                "attempts = %s, due_at = %s, text_file = %s, text_len = %s, lang = %s, "
+                "payload_sha1 = %s WHERE doc_id = %s")
+        for url, values in {
+            A1: ("fetched", 202, None, 0, far, "f.parquet", 0, None, "sha"),   # a WAF challenge
+            A2: ("failed", 403, "http_403", 5, far, None, None, None, None),   # exhausted
+            A3: ("failed", None, "ignore_request", 5, far, None, None, None, None),   # robots.txt
+            B1: ("fetched", 200, None, 0, far, "g.parquet", 9, "en", "sha2"),  # a real page
+            B2: ("failed", 500, "http_500", 1, far, None, None, None, None),   # still in backoff
+        }.items():
+            admin.execute(seed, (*values, pg_doc_id(url)))
+        admin.execute("UPDATE recrawl.host SET next_at = %s, best_rank = NULL", (far,))
+        dsn = os.environ[cfg.selectdb.admin_dsn_env]
+        engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://"))
+        acfg = _alembic_config()
+        with engine.begin() as conn:
+            acfg.attributes["connection"] = conn
+            command.downgrade(acfg, "0003")
+            command.upgrade(acfg, "0004")
+        engine.dispose()
+
+        cols = ("state", "fail_reason", "attempts", "text_file", "text_len", "lang",
+                "payload_sha1")
+        assert _doc(admin, A1, *cols) == ("failed", "http_202", 0, None, None, None, None)
+        assert _doc(admin, A2, *cols[:3]) == ("failed", "http_403", 5)
+        (now,) = admin.execute("SELECT now()").fetchone()
+        assert _doc(admin, A1, "due_at")[0] <= now and _doc(admin, A2, "due_at")[0] <= now
+        assert _doc(admin, A3, "due_at") == (far,)
+        assert _doc(admin, B1, "state", "due_at", "text_file") == ("fetched", far, "g.parquet")
+        assert _doc(admin, B2, "due_at") == (far,)
+        # The requeued host is ready again, by its best due doc; the other one is left alone.
+        (rank,) = _doc(admin, A1, "rank")
+        assert admin.execute("SELECT best_rank, next_at FROM recrawl.host WHERE host_id = %s",
+                             (host_id("a.example"),)).fetchone() == (rank, None)
+        assert _host(admin, "b.example")[1] == far
     finally:
         admin.close()
 

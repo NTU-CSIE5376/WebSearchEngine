@@ -330,6 +330,10 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
   429/503 pause does.
 - How long a block lasts is not known yet: the data covers 47 h, and every doc stopped being
   tried after about 7–10 h. The probes measure it.
+- Revision `0004` applied these rules once to the docs already held back: about 620,000
+  `fetched` docs with a 202, and about 2.07M exhausted docs (not robots.txt), became due at
+  once. It changes no schema, and its downgrade only moves the revision. An older image
+  refuses a selectdb at `0004`, so a rollback runs that downgrade first.
 - A 202 is not a page. All 338 sampled 202 bodies on 2026-11-04 were AWS WAF challenges
   (`awswaf`, `gokuProps`, `challenge.js`, about 2 KB). Until then they counted as
   `fetched`, and an empty row in the text Parquet could replace a real page.
