@@ -642,6 +642,38 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         admin.close()
 
 
+def test_recrawl_archive_keeps_a_waf_challenge_from_counting_as_fetched(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, B1])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        challenge = Page(status=202, body=b"<html><head><title></title></head></html>")
+        crawler = FakeCrawler(stub, {A1: challenge, B1: ENGLISH})
+        crawler.take(T0)
+        _poll(cfg, admin, stub, T0)
+        got = archive_cycle(cfg, admin, T0)
+        assert (got["applied"], got["texts"]) == (2, 1)
+        assert _doc(admin, A1, "state", "attempts", "fail_reason", "http_status", "text_file",
+                    "due_at") == ("failed", 1, "http_202", 202, None,
+                                  T0 + timedelta(seconds=r.retry_base_s))
+        assert _doc(admin, B1, "state")[0] == "fetched"
+
+        # The retry reaches the real page once the challenge is gone.
+        later = T0 + timedelta(seconds=r.retry_base_s)
+        assert plan_cycle(cfg, admin, later, api)["jobs"] == 1
+        crawler.web[A1] = ARTICLE
+        crawler.take(later)
+        _poll(cfg, admin, stub, later)
+        assert archive_cycle(cfg, admin, later)["texts"] == 1
+        assert _doc(admin, A1, "state", "attempts", "fail_reason") == ("fetched", 0, None)
+    finally:
+        admin.close()
+
+
 def test_recrawl_sync_takes_docs_off_the_list_and_plan_skips_them(selectdb, tmp_path, stub):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub)
     _setup(cfg)

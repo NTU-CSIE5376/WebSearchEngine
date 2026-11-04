@@ -29,6 +29,7 @@ from isel.recrawl import _record as record_of
 from isel.urlnorm import md5_number_lower
 
 URL = "https://a.example/x"
+BLOCKED = [202, 403]
 
 
 def item(**kw):
@@ -67,9 +68,12 @@ def test_ids_match_duckdb_and_fit_postgres():
     ({"status_code": 500, "error": "HTTP 500"}, ("retry", "http_500")),
     ({"status_code": 301, "error": "HTTP 301", "html_file": None}, ("retry", "http_301")),
     ({"status_code": 781, "error": "HTTP 781"}, ("retry", "http_781")),
+    # An AWS WAF challenge is a 202 with a small HTML page, so 2xx alone is not a page.
+    ({"status_code": 202}, ("blocked", "http_202")),
+    ({"status_code": 403, "error": "HTTP 403"}, ("blocked", "http_403")),
 ])
 def test_classify(kw, expected):
-    assert classify(item(**kw)) == expected
+    assert classify(item(**kw), BLOCKED) == expected
 
 
 def test_map_results_pairs_by_position_and_catches_a_new_order():
@@ -138,6 +142,15 @@ def test_record_keeps_only_three_digit_statuses(tmp_path, status, stored):
         "retry", f"http_{status}", stored)
 
 
+def test_record_keeps_a_waf_challenge_out_of_the_text(tmp_path):
+    job = JobInput(1, "1" * 32, [7], [URL], datetime(2026, 11, 2, tzinfo=UTC))
+    rows = []
+    got = item(status_code=202, fetched_at=datetime(2026, 11, 2, tzinfo=UTC))
+    rec = record_of(load_config([BASE]).recrawl, tmp_path, job, 0, got, rows)
+    assert (rec["outcome"], rec["fail_reason"], rec["http_status"]) == ("blocked", "http_202", 202)
+    assert rows == [] and rec["text_len"] is None
+
+
 def test_archive_workers_do_not_import_duckdb():
     # A spawn worker re-imports the console script (isel.cli) and isel.recrawl. DuckDB
     # 1.4+ starts one thread per host core on import: 8 workers on a 144-core host
@@ -170,6 +183,8 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
         (("result_ttl_days = 3 ", "result_ttl_days = 61 "), "result_ttl_days"),
         (("archive_workers = 8", "archive_workers = 0"), "must be > 0"),
         (("max_resend = 20 ", "max_resend = -1 "), "max_resend"),
+        (("blocked_status = [202, 403]", "blocked_status = [202, 429]"), "blocked_status"),
+        (("blocked_status = [202, 403]", "blocked_status = [99]"), "blocked_status"),
     ]
     for (old, new), message in cases:
         assert old in BASE.read_text(), old

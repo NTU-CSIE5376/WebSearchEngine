@@ -211,6 +211,7 @@ class RecrawlCfg:
     retry_max_s: int
     max_attempts: int
     robots_retry_days: int
+    blocked_status: list[int]
     host_pause_max_s: int
     archive_interval_s: float
     archive_workers: int
@@ -472,6 +473,10 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "result_ttl_days")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
+    need(all(100 <= s <= 999 for s in r.blocked_status)
+         and not set(r.blocked_status) & {404, 410, 429, 503},
+         "recrawl.blocked_status must hold HTTP statuses without 404, 410, 429 and 503, "
+         "which have their own outcomes")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:

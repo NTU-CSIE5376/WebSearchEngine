@@ -104,9 +104,15 @@ def pg_doc_id(url: str) -> int:
     return value - (1 << 64) if value > _INT63 else value
 
 
-def classify(item: dict[str, Any]) -> tuple[str, str | None]:
-    """Maps one result record (`NNNNN.json`) to (outcome, fail_reason)."""
+def classify(item: dict[str, Any], blocked_status: Iterable[int]) -> tuple[str, str | None]:
+    """Maps one result record (`NNNNN.json`) to (outcome, fail_reason).
+
+    A status in `blocked_status` means the site refused us, even if it is a 2xx: an AWS
+    WAF challenge is a 202 with a small HTML page, which holds none of the page's text.
+    """
     status, error = item["status_code"], item["error"]
+    if status in blocked_status:
+        return "blocked", f"http_{status}"
     if status is not None and 200 <= status < 300:
         if error is None and item["html_file"]:
             return "fetched", None
@@ -533,7 +539,7 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
     for batch, job_id, doc_ids in jobs:
         if batch in held:
             free += [(host, batch) for host in _drained(
-                Path(cfg.recrawl.result_root) / job_id, doc_ids, held[batch])]
+                cfg.recrawl, Path(cfg.recrawl.result_root) / job_id, doc_ids, held[batch])]
     if not free:
         return
     with conn.transaction(), conn.cursor() as cur:
@@ -547,7 +553,8 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
     stats["drained"] = len(freed)
 
 
-def _drained(job_dir: Path, doc_ids: list[int], docs: dict[int, list[int]]) -> list[int]:
+def _drained(r: RecrawlCfg, job_dir: Path, doc_ids: list[int],
+             docs: dict[int, list[int]]) -> list[int]:
     """The hosts in `docs` (host -> its doc_ids) whose results are all on disk, unthrottled."""
     try:
         listing = json.loads((job_dir / "request.json").read_text(encoding="utf-8"))
@@ -571,7 +578,8 @@ def _drained(job_dir: Path, doc_ids: list[int], docs: dict[int, list[int]]) -> l
         if not all(f"{n:05d}.json" in names[owners[n]] for n in spots):
             continue
         try:
-            outcomes = [classify(read_item(job_dir / f"crawler_{owners[n]:02d}", n, urls[n]))[0]
+            outcomes = [classify(read_item(job_dir / f"crawler_{owners[n]:02d}", n, urls[n]),
+                                 r.blocked_status)[0]
                         for n in spots]
         except (OSError, ValueError):
             continue                     # the archive reports a bad record
@@ -1017,7 +1025,7 @@ def _record(r: RecrawlCfg, part: Path, job: JobInput, i: int, item: dict[str, An
     if item is None:
         rec["outcome"], rec["fail_reason"] = "retry", "unmatched"
         return rec
-    rec["outcome"], rec["fail_reason"] = classify(item)
+    rec["outcome"], rec["fail_reason"] = classify(item, r.blocked_status)
     rec.update(http_status=_http_status(item["status_code"]), final_url=item["final_url"],
                fetched_at=item["fetched_at"])
     if rec["outcome"] != "fetched":
@@ -1104,7 +1112,7 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
         cur.execute(
             f"UPDATE recrawl.doc d SET {backoff}, http_status = r.http_status, "
             "final_url = r.final_url, fail_reason = r.fail_reason "
-            "FROM r WHERE r.outcome IN ('throttled', 'retry') AND d.doc_id = r.doc_id "
+            "FROM r WHERE r.outcome IN ('throttled', 'retry', 'blocked') AND d.doc_id = r.doc_id "
             "AND d.state = 'dispatched' AND d.batch_id = %(batch)s", args)
         changed += cur.rowcount
         # A doc of this job with no record at all: never expected, never left waiting.

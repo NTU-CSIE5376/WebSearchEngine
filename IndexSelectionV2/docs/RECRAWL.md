@@ -309,11 +309,15 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 | 2xx non-HTML, 404, 410 | `gone` | never |
 | `IgnoreRequest` (robots.txt) | `failed` | after `robots_retry_days` (30) |
 | 429, 503 | `failed`, `attempts + 1`; host paused `retry_base_s` | exponential backoff |
+| `blocked_status` (202, 403) | `failed`, `attempts + 1`; no text row | exponential backoff |
 | other failure, `unmatched`, extraction failure | `failed`, `attempts + 1` | `retry_base_s · 2^attempts`, cap 24 h; `stale_days` after `max_attempts` (5) |
 
 - A 2xx applies whenever it is newer than the stored fetch. A failure applies only while
   the doc still waits on this job. A doc of the job with no result is retried
   (`no_result`).
+- A 202 is not a page. All 338 sampled 202 bodies on 2026-11-04 were AWS WAF challenges
+  (`awswaf`, `gokuProps`, `challenge.js`, about 2 KB). Until then they counted as
+  `fetched`, and an empty row in the text Parquet could replace a real page.
 
 **Text Parquet.** `doc_id` (uint64, as in the manifest), `batch_id`, `url`, `final_url`,
 `fetched_at`, `http_status`, `lang`, `title`, `description`, `body`, `text_len`,

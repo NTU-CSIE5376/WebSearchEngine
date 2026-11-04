@@ -273,6 +273,7 @@ retry_base_s = 600                       # failed doc: retry_base_s * 2^attempts
 retry_max_s = 86400
 max_attempts = 5                         # then wait stale_days instead of retry_max_s
 robots_retry_days = 30                   # a robots.txt refusal is asked again after this
+blocked_status = [202, 403]              # the site refused us; 202 is an AWS WAF challenge page
 host_pause_max_s = 86400                 # cap on a 429/503 pause
 archive_interval_s = 15.0
 archive_workers = 8                      # text extraction: 6.5 ms per 590 KB page each
