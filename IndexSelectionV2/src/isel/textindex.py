@@ -175,16 +175,20 @@ def latest_docs(con: duckdb.DuckDBPyConnection, text_root: Path,
                 batch_rows: int) -> tuple[int, pa.RecordBatchReader]:
     """The newest row of each doc_id under `text_root`, as (rows, batches).
 
-    The first pass picks each doc's winner from (doc_id, fetched_at, file name) alone,
-    so the page bodies are never sorted; the second pass reads the winners. A tie on
-    `fetched_at` goes to the larger file name. `*.parquet` skips `.parquet.tmp` files.
+    The first pass picks each doc's winner without the page bodies, so they are never
+    sorted; the second pass reads the winners. A row with text beats any row without it,
+    such as an empty WAF page, which older archives stored; a doc with no text still
+    gets a document, as its URL's words can find it. A tie on `fetched_at` goes to the
+    larger file name. `*.parquet` skips `.parquet.tmp` files.
     """
     if next(text_root.glob("**/*.parquet"), None) is None:
         raise TextIndexError(f"no text Parquet under {text_root}")
     files = (f"read_parquet({sql_str(str(text_root / '**' / '*.parquet'))}, "
              "filename=true, hive_partitioning=false)")
     con.execute(f"""CREATE OR REPLACE TEMP TABLE winner AS
-        SELECT doc_id, max({{'t': fetched_at, 'f': filename}}) AS win FROM {files}
+        SELECT doc_id, max({{'text': coalesce(text_len, 0) > 0 OR title IS NOT NULL
+                                     OR description IS NOT NULL,
+                             't': fetched_at, 'f': filename}}) AS win FROM {files}
         GROUP BY doc_id""")
     (rows,) = con.execute("SELECT count(*) FROM winner").fetchone()
     reader = con.execute(f"""SELECT s.doc_id, {', '.join(f's.{f}' for f in DOC_FIELDS)}

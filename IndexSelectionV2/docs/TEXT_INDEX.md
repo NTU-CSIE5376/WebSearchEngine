@@ -26,8 +26,10 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
 ## Design
 
 - **Input.** The text Parquet that `recrawl-archive` writes (`TEXT_SCHEMA`). A first
-  DuckDB pass picks each doc's newest row from (`doc_id`, `fetched_at`, file name)
-  alone, so 128M page bodies are never sorted; a second pass reads only the winners.
+  DuckDB pass picks each doc's newest row without the bodies, so 128M page bodies are
+  never sorted; a second pass reads only the winners. A row with text beats any row
+  without it: about 620,000 rows hold an empty WAF page from before revision `0004`. Such
+  a doc stays in the index, where the words of its URL can find it.
 - **Document.** `_id` is the doc id in decimal. `url` and `lang` are stored; `title`,
   `description` and `body` are full text, and `body` is left out of `_source`. The body
   is indexed without positions (`index_options: freqs`): BM25 needs only term counts,

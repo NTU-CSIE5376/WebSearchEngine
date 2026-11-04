@@ -97,6 +97,23 @@ def test_latest_docs_keeps_the_newest_row_of_each_doc(cfg, tmp_path):
                       strict=True)) == [(1, "new"), (2, "b")]
 
 
+def test_latest_docs_lets_a_row_without_text_lose_to_any_row_with_text(cfg, tmp_path):
+    from isel.io import open_duckdb
+
+    root = tmp_path / "text"
+    challenge = {"title": None, "body": ""}     # a WAF page that an older archive stored
+    _write(root / "fetch_date=20261001" / "job-1.parquet", [
+        _row(1, OLD, "real", "text"), _row(2, OLD, None, "only a body"), _row(3, OLD, **challenge)])
+    _write(root / "fetch_date=20261020" / "job-2.parquet", [
+        _row(1, NEW, **challenge), _row(2, NEW, **challenge), _row(3, NEW, **challenge)])
+    _, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10)
+    table = reader.read_all().sort_by("doc_id")
+    assert table["body"].to_pylist() == ["text", "only a body", ""]
+    assert table["title"].to_pylist()[0] == "real"
+    # With no text at all the doc stays: its URL's words can still find it.
+    assert table["doc_id"].to_pylist()[2] == 3
+
+
 def test_latest_docs_needs_text(cfg, tmp_path):
     from isel.io import open_duckdb
 
