@@ -489,8 +489,13 @@ crawler restarted, unless much recovery source survives the load.
   tie at rank 10, and two builds of the same text disagreed on the top-10 set for
   about 10 % of the keywords. With the `doc_id` tie-break they agree on all of them.
 - The flood-stage watermark (95 % of the disk) also applies to a single-node cluster.
-  The low and high watermarks do not by default
-  (`cluster.routing.allocation.disk.watermark.enable_for_single_data_node`). Past the
+  The low and high watermarks do not move shards there by default
+  (`cluster.routing.allocation.disk.watermark.enable_for_single_data_node`), but past the
+  high watermark (90 %) the node still sets `cluster.blocks.create_index`, as seen on a
+  local node on 2026-11-04. A new index then fails, and so does the first force merge of a
+  fresh node, which cannot create `.tasks` to store its result: the poll gets a 404 (`task
+  isn't running and hasn't stored its results`). The build then drops its index and leaves
+  the alias as it was. On Host2 that means less than 0.76 TB free. Past the
   flood stage, every index on the node gets `read_only_allow_delete`, writes fail with
   HTTP 429, and the cluster gets `cluster.blocks.create_index`. In a local test with
   byte-valued watermarks set above the free space, the read-only block came within
