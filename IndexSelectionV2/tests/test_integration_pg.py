@@ -696,6 +696,80 @@ def test_recrawl_retries_an_exhausted_doc_before_the_next_golden_batch(selectdb,
         admin.close()
 
 
+def test_recrawl_pauses_a_blocking_host_and_probes_it_by_rank(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, block_min_docs=2)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        blocked = Page(status=403)
+        crawler = FakeCrawler(stub, {A1: blocked, A2: Page(status=202, body=b"<html></html>")})
+        crawler.take(T0)
+        _poll(cfg, admin, stub, T0)
+        archive_cycle(cfg, admin, T0)
+        probe = T0 + timedelta(seconds=r.host_pause_max_s)
+        assert _host(admin, "a.example") == (None, probe)
+        # The refusal belongs to the host, so the doc keeps its tries and is due at once.
+        assert _doc(admin, A1, "state", "attempts", "due_at", "fail_reason") == (
+            "failed", 0, T0, "http_403")
+        assert _doc(admin, A2, "state", "attempts", "due_at", "fail_reason", "text_file") == (
+            "failed", 0, T0, "http_202", None)
+
+        # A plan cycle's sweep must not clear the pause, and no doc goes out during it.
+        assert plan_cycle(cfg, admin, probe - timedelta(seconds=1), api)["jobs"] == 0
+        assert _host(admin, "a.example")[1] == probe
+
+        # The probe sends the same best-ranked docs, and a host still blocking pauses again.
+        assert plan_cycle(cfg, admin, probe, api)["jobs"] == 1
+        assert stub.posts[-1] == [A1, A2]
+        crawler.take(probe)
+        _poll(cfg, admin, stub, probe)
+        archive_cycle(cfg, admin, probe)
+        lifted = probe + timedelta(seconds=r.host_pause_max_s)
+        assert _host(admin, "a.example") == (None, lifted)
+        assert _doc(admin, A1, "attempts", "due_at") == (0, probe)
+
+        # Once the block lifts, the host answers and its other docs follow.
+        crawler.web.update({A1: ARTICLE, A2: ENGLISH, A3: ENGLISH})
+        assert plan_cycle(cfg, admin, lifted, api)["jobs"] == 1
+        crawler.take(lifted)
+        _poll(cfg, admin, stub, lifted)
+        assert archive_cycle(cfg, admin, lifted)["texts"] == 2
+        assert _doc(admin, A1, "state", "attempts")[0] == "fetched"
+        after = lifted + timedelta(seconds=1)
+        assert plan_cycle(cfg, admin, after, api)["jobs"] == 1
+        assert stub.posts[-1] == [A3]
+    finally:
+        admin.close()
+
+
+@pytest.mark.parametrize(("pages", "min_docs"), [
+    ({A1: Page(status=403), A2: ENGLISH}, 2),     # half of its docs answer
+    ({A1: Page(status=403), A2: Page(status=403)}, 3),   # too few docs to judge the host
+])
+def test_recrawl_keeps_the_backoff_of_a_host_that_does_not_block(selectdb, tmp_path, stub, pages,
+                                                                 min_docs):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, block_min_docs=min_docs)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        FakeCrawler(stub, pages).take(T0)
+        _poll(cfg, admin, stub, T0)
+        archive_cycle(cfg, admin, T0)
+        assert _host(admin, "a.example") == (None, None)
+        assert _doc(admin, A1, "state", "attempts", "due_at") == (
+            "failed", 1, T0 + timedelta(seconds=r.retry_base_s))
+    finally:
+        admin.close()
+
+
 def test_recrawl_sync_takes_docs_off_the_list_and_plan_skips_them(selectdb, tmp_path, stub):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub)
     _setup(cfg)
@@ -796,6 +870,25 @@ def test_recrawl_drain_holds_a_throttled_host_until_its_pause_is_set(selectdb, t
         _poll(cfg, admin, stub, T0)
         archive_cycle(cfg, admin, T0)
         assert _host(admin, "a.example") == (None, T0 + timedelta(seconds=r.retry_base_s))
+    finally:
+        admin.close()
+
+
+def test_recrawl_drain_holds_a_blocking_host_until_its_pause_is_set(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, block_min_docs=2)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, B1, "https://b.example/2"])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        ((batch, job_id, _, _),) = _jobs(admin)[:1]
+        web = {A1: Page(status=403), A2: Page(status=403), B1: Page(status=403),
+               "https://b.example/2": ENGLISH}
+        FakeCrawler(stub, web).fetch(job_id, web, T0)
+        assert plan_cycle(cfg, admin, T0, api)["drained"] == 1     # only b.example goes on
+        assert _host(admin, "a.example")[0] == batch
+        assert _host(admin, "b.example")[0] != batch
     finally:
         admin.close()
 

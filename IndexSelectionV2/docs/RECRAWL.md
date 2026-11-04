@@ -239,8 +239,8 @@ committed, then sent.
    freed once every one of its docs there has a result file. `request.json`'s
    `crawler_ids` locate the files, as the archive does; one `scandir` per partition
    lists them. The docs stay `dispatched` until the archive applies the job. A host
-   stays held if one of those results is a 429 or 503, so the apply sets its pause
-   before its next batch. A job whose `request.json` is missing or shorter than the docs
+   stays held if one of those results is a 429 or 503, or if it blocks the batch (§8), so
+   the apply sets its pause before its next batch. A job whose `request.json` is missing or shorter than the docs
    sent (dropped duplicates) is left to the apply.
 4. **Delete.** Every `applied` job without `deleted_at` gets a `DELETE`. 204 or 404 sets
    `deleted_at`; anything else reports `api_error` and is tried next cycle. This runs even
@@ -310,6 +310,7 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 | `IgnoreRequest` (robots.txt) | `failed` | after `robots_retry_days` (30) |
 | 429, 503 | `failed`, `attempts + 1`; host paused `retry_base_s` | exponential backoff |
 | `blocked_status` (202, 403) | `failed`, `attempts + 1`; no text row | exponential backoff |
+| The same, when the host blocks the batch | `failed`; `attempts` unchanged, no text row; host paused `host_pause_max_s` (24 h) | at once, once the pause ends |
 | other failure, `unmatched`, extraction failure | `failed`, `attempts + 1` | `retry_base_s · 2^attempts`, cap 24 h; `failed_retry_days` (7) after `max_attempts` (5) |
 
 - A 2xx applies whenever it is newer than the stored fetch. A failure applies only while
@@ -319,6 +320,16 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
   waited `stale_days` missed two golden batches, which come about every 14 days, so a block
   that lifted a day later still cost a month. `failed_retry_days` gives every failed doc at
   least two more tries per golden cycle. robots.txt keeps its 30 days: the site decides that.
+- A host blocks the batch when `block_ratio` (90 %) of its docs in the job are blocked, out
+  of at least `block_min_docs` (20). Blocking is a state of the host, and it changes: on
+  2026-11-04, hosts at 90 % or more took 17.5 % of the API's requests and answered 0.41 % of
+  them, a 403 there recovered 0.23 % of the time against 32.6 % on other hosts, and 77 hosts
+  went from answering to refusing during the run. So the host pauses, its docs keep their
+  tries, and its next batch of `host_docs_per_job` docs by rank is the probe, about 2.6 req/s
+  for 941 such hosts. This sets no rate. It only skips hosts that give no page, as the
+  429/503 pause does.
+- How long a block lasts is not known yet: the data covers 47 h, and every doc stopped being
+  tried after about 7–10 h. The probes measure it.
 - A 202 is not a page. All 338 sampled 202 bodies on 2026-11-04 were AWS WAF challenges
   (`awswaf`, `gokuProps`, `challenge.js`, about 2 KB). Until then they counted as
   `fetched`, and an empty row in the text Parquet could replace a real page.
