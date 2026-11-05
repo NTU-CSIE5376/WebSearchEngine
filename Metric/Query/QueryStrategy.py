@@ -1,4 +1,5 @@
 from serpapi import GoogleSearch
+from Metric.Query.GoogleRedirect import resolve_golden_urls
 import time
 import os
 
@@ -34,7 +35,7 @@ class QueryStrategy:
 
                 # 成功取得資料
                 urls = [r["link"] for r in results.get("organic_results", []) if "link" in r]
-                return urls
+                break
 
             except Exception as e:
                 print(f"[Attempt {attempt + 1}/{max_retries}] Failed: {e}")
@@ -49,3 +50,6 @@ class QueryStrategy:
                     # 最後一次也失敗，回傳空 list
                     print("Max retries reached. Returning empty list.")
                     return []
+
+        # google.com/goto 轉址連結換成實際網址，解析不了的丟掉
+        return resolve_golden_urls(urls)
