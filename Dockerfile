@@ -33,8 +33,6 @@ RUN echo "\
 # 每小時執行一次 (Status) \n\
 0 * * * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 measure.py --test --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.3:5433 --measure status >> /var/log/cron.log 2>&1 \n\
 0 * * * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 migrate.py >> /var/log/cron.log 2>&1 \n\
-# 每小時第 5 分 (Pipeline stage rate: Loki -> metricdb.pipeline_stage_rate) \n\
-5 * * * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 -m Metric.pipeline_rate --metric_db_url 172.16.191.1:5433 --loki_url http://172.16.191.2:3100 --hours 2 >> /var/log/cron.log 2>&1 \n\
 # 每月 1 號與 16 號 中午 12 點 (Strategy: random) \n\
 0 12 1,16 * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 measure.py --create --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.3:5433 --select_db_url 172.16.191.1:5445 --strategy random --keywordNums 1000 --test --measure crawler_all >> /var/log/cron.log 2>&1 \n\
 # 每月 1 號與 16 號 下午 6 點 (Strategy: head) \n\

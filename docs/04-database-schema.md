@@ -111,25 +111,6 @@ Shared schema from `MetricCoverageMixin`:
 
 PK: `stat_date`.
 
-### 4.3 `pipeline_stage_rate` (hourly, from Loki)
-
-Written by `Metric/pipeline_rate.py` (model `PipelineStageRate`); the table is
-created on first run. One row per hour and stage
-(`crawler` / `router` / `ingestor` / `extractor`):
-
-- `records`: crawler fetches (`request.end`); ingestor crawl results written
-- `new_links`: ingestor newly inserted urls
-- `folders_done`: 10-minute folders finished (healthy ~96/h = 16 workers x 6)
-- `avg_lag_min`, `max_lag_min`: folder finish time minus folder time
-  (crawl_result is deleted after ~8 h, so ~480 means data loss)
-- `avg_duration_s`: folder_start -> folder_done (> 600 s cannot keep up)
-- `skipped_folders`: folders a worker never processed
-- `errors`: ERROR log lines of the stage's service
-- `workers`, `updated_at`
-
-PK: `(bucket_start, stage)`. Shown on the **Pipeline (24h)** tab of the Superset
-dashboard.
-
 ## 5. Team Partition Definition
 
 - Team A: shard id `0..127`

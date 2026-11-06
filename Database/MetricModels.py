@@ -125,23 +125,3 @@ class MetricURL(Base):
     shard_id = Column(Integer, nullable=True)
     
     query = relationship("MetricQuery", back_populates="results")
-
-# ==========================================
-# Pipeline stage rate (hourly, from Loki; see Metric/pipeline_rate.py)
-# ==========================================
-class PipelineStageRate(Base):
-    __tablename__ = 'pipeline_stage_rate'
-
-    bucket_start = Column(DateTime(timezone=True), primary_key=True)
-    stage = Column(String(16), primary_key=True)  # crawler / router / ingestor / extractor
-
-    records = Column(BigInteger, nullable=True)       # crawler: fetches; ingestor: results
-    new_links = Column(BigInteger, nullable=True)     # ingestor only
-    folders_done = Column(Integer, nullable=True)
-    avg_lag_min = Column(Float, nullable=True)
-    max_lag_min = Column(Float, nullable=True)
-    avg_duration_s = Column(Float, nullable=True)
-    skipped_folders = Column(Integer, nullable=True)
-    errors = Column(Integer, nullable=True)
-    workers = Column(Integer, nullable=True)
-    updated_at = Column(DateTime(timezone=True), nullable=True)

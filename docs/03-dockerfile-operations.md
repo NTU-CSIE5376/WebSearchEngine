@@ -29,10 +29,6 @@ Configured in `/etc/cron.d/search-engine-cron`:
   - `measure.py --test --measure status`
   - `migrate.py`
 
-- Hourly at minute 5:
-  - `python3 -m Metric.pipeline_rate --hours 2` (Loki `172.16.191.2:3100` ->
-    `metricdb.pipeline_stage_rate`; recomputes the last 2 finished hours)
-
 - Monthly on day 1 and 16 at 12:00:
   - `measure.py --create --strategy random --keywordNums 1000 --test --measure crawler_all`
 
