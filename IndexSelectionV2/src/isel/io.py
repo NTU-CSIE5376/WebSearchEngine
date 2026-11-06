@@ -12,13 +12,15 @@ import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from isel.config import Config
+
+if TYPE_CHECKING:
+    import duckdb
 
 TMP_SUFFIX = ".tmp"
 _SECRET_RE = re.compile(r"\b(password|passwd|secret|token)\b|://[^/\s]*:[^@/\s]*@", re.I)
@@ -117,6 +119,10 @@ class AtomicParquetWriter:
 
 def open_duckdb(cfg: Config, temp_dir: Path) -> duckdb.DuckDBPyConnection:
     """Opens an in-memory DuckDB bounded by the configured memory, threads and spill."""
+    # Imported here: DuckDB 1.4+ starts one thread per host core on import, and every
+    # module that only needs the file helpers below (the archive workers) imports this one.
+    import duckdb
+
     con = duckdb.connect(database=":memory:")
     con.execute("SET TimeZone = 'UTC'")
     con.execute(f"SET threads = {int(cfg.duckdb.threads)}")

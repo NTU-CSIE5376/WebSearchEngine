@@ -303,6 +303,28 @@ def _list_constraints(table):
     return [(f"{table}_pkey", "p", None), (f"{table}_run_id_fkey", "f", "r")]
 
 
+@pytest.mark.parametrize("read_only", [False, True])
+def test_selectdb_connections_find_a_dead_peer_within_a_minute(selectdb, read_only):
+    # On 2026-11-02 Host1 reset the planner's connection mid-result; the reset never
+    # reached Host2, so recrawl-plan waited in poll() on a socket with the OS default
+    # keepalive (2 h idle). Both ends must probe; the server's end holds our locks.
+    s = selectdb.selectdb
+    conn = connect(selectdb, s.admin_dsn_env, read_only=read_only)
+    try:
+        params = conn.info.get_parameters()
+        assert (params["keepalives"], params["keepalives_idle"],
+                params["keepalives_interval"], params["keepalives_count"]) == (
+            "1", str(s.keepalives_idle_s), str(s.keepalives_interval_s),
+            str(s.keepalives_count))
+        server = [conn.execute(f"SHOW {g}").fetchone()[0] for g in (
+            "tcp_keepalives_idle", "tcp_keepalives_interval", "tcp_keepalives_count",
+            "default_transaction_read_only")]
+        assert server == [str(s.keepalives_idle_s), str(s.keepalives_interval_s),
+                          str(s.keepalives_count), "on" if read_only else "off"]
+    finally:
+        conn.close()
+
+
 def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
     cfg = selectdb
     admin = _admin(cfg)
@@ -311,8 +333,8 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
     with pytest.raises(NeedsBaselineStamp):
         migrate(_admin(cfg))
     first = migrate(_admin(cfg), stamp_baseline=True)
-    assert first == {"revision_before": None, "revision": "0003", "stamped_baseline": True}
-    assert migrate(_admin(cfg))["revision_before"] == "0003"     # a rerun changes nothing
+    assert first == {"revision_before": None, "revision": "0004", "stamped_baseline": True}
+    assert migrate(_admin(cfg))["revision_before"] == "0004"     # a rerun changes nothing
     with pytest.raises(RuntimeError, match="only fits a pre-Alembic"):
         migrate(_admin(cfg), stamp_baseline=True)
     admin = _admin(cfg)
@@ -336,7 +358,7 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
 
 def test_migrate_builds_an_empty_selectdb_and_downgrades(selectdb):
     cfg = selectdb
-    assert _setup(cfg)["revision"] == "0003"
+    assert _setup(cfg)["revision"] == "0004"
     dsn = os.environ[cfg.selectdb.admin_dsn_env]
     engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://"))
     acfg = _alembic_config()
@@ -620,6 +642,181 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         admin.close()
 
 
+def test_recrawl_archive_keeps_a_waf_challenge_from_counting_as_fetched(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, B1])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        challenge = Page(status=202, body=b"<html><head><title></title></head></html>")
+        crawler = FakeCrawler(stub, {A1: challenge, B1: ENGLISH})
+        crawler.take(T0)
+        _poll(cfg, admin, stub, T0)
+        got = archive_cycle(cfg, admin, T0)
+        assert (got["applied"], got["texts"]) == (2, 1)
+        assert _doc(admin, A1, "state", "attempts", "fail_reason", "http_status", "text_file",
+                    "due_at") == ("failed", 1, "http_202", 202, None,
+                                  T0 + timedelta(seconds=r.retry_base_s))
+        assert _doc(admin, B1, "state")[0] == "fetched"
+
+        # The retry reaches the real page once the challenge is gone.
+        later = T0 + timedelta(seconds=r.retry_base_s)
+        assert plan_cycle(cfg, admin, later, api)["jobs"] == 1
+        crawler.web[A1] = ARTICLE
+        crawler.take(later)
+        _poll(cfg, admin, stub, later)
+        assert archive_cycle(cfg, admin, later)["texts"] == 1
+        assert _doc(admin, A1, "state", "attempts", "fail_reason") == ("fetched", 0, None)
+    finally:
+        admin.close()
+
+
+def test_recrawl_retries_an_exhausted_doc_before_the_next_golden_batch(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, max_attempts=1)
+    r = cfg.recrawl
+    assert r.failed_retry_days < r.stale_days
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        crawler = FakeCrawler(stub, {A1: Page(status=500)})
+        crawler.take(T0)
+        _poll(cfg, admin, stub, T0)
+        archive_cycle(cfg, admin, T0)
+        retry = T0 + timedelta(days=r.failed_retry_days)
+        assert _doc(admin, A1, "state", "attempts", "due_at") == ("failed", 1, retry)
+        assert plan_cycle(cfg, admin, retry - timedelta(seconds=1), api)["jobs"] == 0
+        assert plan_cycle(cfg, admin, retry, api)["jobs"] == 1
+    finally:
+        admin.close()
+
+
+def test_recrawl_pauses_a_blocking_host_and_probes_it_by_rank(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, block_min_docs=2)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        blocked = Page(status=403)
+        crawler = FakeCrawler(stub, {A1: blocked, A2: Page(status=202, body=b"<html></html>")})
+        crawler.take(T0)
+        _poll(cfg, admin, stub, T0)
+        archive_cycle(cfg, admin, T0)
+        probe = T0 + timedelta(seconds=r.host_pause_max_s)
+        assert _host(admin, "a.example") == (None, probe)
+        # The refusal belongs to the host, so the doc keeps its tries and is due at once.
+        assert _doc(admin, A1, "state", "attempts", "due_at", "fail_reason") == (
+            "failed", 0, T0, "http_403")
+        assert _doc(admin, A2, "state", "attempts", "due_at", "fail_reason", "text_file") == (
+            "failed", 0, T0, "http_202", None)
+
+        # A plan cycle's sweep must not clear the pause, and no doc goes out during it.
+        assert plan_cycle(cfg, admin, probe - timedelta(seconds=1), api)["jobs"] == 0
+        assert _host(admin, "a.example")[1] == probe
+
+        # The probe sends the same best-ranked docs, and a host still blocking pauses again.
+        assert plan_cycle(cfg, admin, probe, api)["jobs"] == 1
+        assert stub.posts[-1] == [A1, A2]
+        crawler.take(probe)
+        _poll(cfg, admin, stub, probe)
+        archive_cycle(cfg, admin, probe)
+        lifted = probe + timedelta(seconds=r.host_pause_max_s)
+        assert _host(admin, "a.example") == (None, lifted)
+        assert _doc(admin, A1, "attempts", "due_at") == (0, probe)
+
+        # Once the block lifts, the host answers and its other docs follow.
+        crawler.web.update({A1: ARTICLE, A2: ENGLISH, A3: ENGLISH})
+        assert plan_cycle(cfg, admin, lifted, api)["jobs"] == 1
+        crawler.take(lifted)
+        _poll(cfg, admin, stub, lifted)
+        assert archive_cycle(cfg, admin, lifted)["texts"] == 2
+        assert _doc(admin, A1, "state", "attempts")[0] == "fetched"
+        after = lifted + timedelta(seconds=1)
+        assert plan_cycle(cfg, admin, after, api)["jobs"] == 1
+        assert stub.posts[-1] == [A3]
+    finally:
+        admin.close()
+
+
+@pytest.mark.parametrize(("pages", "min_docs"), [
+    ({A1: Page(status=403), A2: ENGLISH}, 2),     # half of its docs answer
+    ({A1: Page(status=403), A2: Page(status=403)}, 3),   # too few docs to judge the host
+])
+def test_recrawl_keeps_the_backoff_of_a_host_that_does_not_block(selectdb, tmp_path, stub, pages,
+                                                                 min_docs):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, block_min_docs=min_docs)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        FakeCrawler(stub, pages).take(T0)
+        _poll(cfg, admin, stub, T0)
+        archive_cycle(cfg, admin, T0)
+        assert _host(admin, "a.example") == (None, None)
+        assert _doc(admin, A1, "state", "attempts", "due_at") == (
+            "failed", 1, T0 + timedelta(seconds=r.retry_base_s))
+    finally:
+        admin.close()
+
+
+def test_migration_0004_requeues_the_docs_the_old_retry_rule_held_back(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    B2 = "https://b.example/2"
+    _setup(cfg)
+    admin = _admin(cfg)
+    far = T0 + timedelta(days=30)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, B1, B2])
+        seed = ("UPDATE recrawl.doc SET state = %s, http_status = %s, fail_reason = %s, "
+                "attempts = %s, due_at = %s, text_file = %s, text_len = %s, lang = %s, "
+                "payload_sha1 = %s WHERE doc_id = %s")
+        for url, values in {
+            A1: ("fetched", 202, None, 0, far, "f.parquet", 0, None, "sha"),   # a WAF challenge
+            A2: ("failed", 403, "http_403", 5, far, None, None, None, None),   # exhausted
+            A3: ("failed", None, "ignore_request", 5, far, None, None, None, None),   # robots.txt
+            B1: ("fetched", 200, None, 0, far, "g.parquet", 9, "en", "sha2"),  # a real page
+            B2: ("failed", 500, "http_500", 1, far, None, None, None, None),   # still in backoff
+        }.items():
+            admin.execute(seed, (*values, pg_doc_id(url)))
+        admin.execute("UPDATE recrawl.host SET next_at = %s, best_rank = NULL", (far,))
+        dsn = os.environ[cfg.selectdb.admin_dsn_env]
+        engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://"))
+        acfg = _alembic_config()
+        with engine.begin() as conn:
+            acfg.attributes["connection"] = conn
+            command.downgrade(acfg, "0003")
+            command.upgrade(acfg, "0004")
+        engine.dispose()
+
+        cols = ("state", "fail_reason", "attempts", "text_file", "text_len", "lang",
+                "payload_sha1")
+        assert _doc(admin, A1, *cols) == ("failed", "http_202", 0, None, None, None, None)
+        assert _doc(admin, A2, *cols[:3]) == ("failed", "http_403", 5)
+        (now,) = admin.execute("SELECT now()").fetchone()
+        assert _doc(admin, A1, "due_at")[0] <= now and _doc(admin, A2, "due_at")[0] <= now
+        assert _doc(admin, A3, "due_at") == (far,)
+        assert _doc(admin, B1, "state", "due_at", "text_file") == ("fetched", far, "g.parquet")
+        assert _doc(admin, B2, "due_at") == (far,)
+        # The requeued host is ready again, by its best due doc; the other one is left alone.
+        (rank,) = _doc(admin, A1, "rank")
+        assert admin.execute("SELECT best_rank, next_at FROM recrawl.host WHERE host_id = %s",
+                             (host_id("a.example"),)).fetchone() == (rank, None)
+        assert _host(admin, "b.example")[1] == far
+    finally:
+        admin.close()
+
+
 def test_recrawl_sync_takes_docs_off_the_list_and_plan_skips_them(selectdb, tmp_path, stub):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub)
     _setup(cfg)
@@ -720,6 +917,25 @@ def test_recrawl_drain_holds_a_throttled_host_until_its_pause_is_set(selectdb, t
         _poll(cfg, admin, stub, T0)
         archive_cycle(cfg, admin, T0)
         assert _host(admin, "a.example") == (None, T0 + timedelta(seconds=r.retry_base_s))
+    finally:
+        admin.close()
+
+
+def test_recrawl_drain_holds_a_blocking_host_until_its_pause_is_set(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, block_min_docs=2)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, B1, "https://b.example/2"])
+        api = _api(stub)
+        plan_cycle(cfg, admin, T0, api)
+        ((batch, job_id, _, _),) = _jobs(admin)[:1]
+        web = {A1: Page(status=403), A2: Page(status=403), B1: Page(status=403),
+               "https://b.example/2": ENGLISH}
+        FakeCrawler(stub, web).fetch(job_id, web, T0)
+        assert plan_cycle(cfg, admin, T0, api)["drained"] == 1     # only b.example goes on
+        assert _host(admin, "a.example")[0] == batch
+        assert _host(admin, "b.example")[0] != batch
     finally:
         admin.close()
 

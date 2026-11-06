@@ -62,8 +62,6 @@ import pyarrow as pa
 from isel.config import Config, RecrawlCfg
 from isel.extract import extract
 from isel.io import TMP_SUFFIX, commit_file, open_duckdb, sql_str, write_parquet_atomic
-from isel.manifest import validate_run
-from isel.publish import swap_allowed
 from isel.schema import DUE_STATES, OPEN_JOB_STATES
 from isel.urlnorm import md5_number_lower
 
@@ -73,6 +71,7 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 BAD_INDEX_RE = re.compile(r"\bat index (\d+)$")
 NON_HTML = "NonHTML content-type"       # the crawler's error for a 2xx without HTML
 ITEM_KEYS = frozenset({"url", "final_url", "status_code", "error", "html_file", "fetched_at"})
+HTTP_STATUS = range(100, 1000)          # three digits (RFC 9110 §15); fits SMALLINT
 RESULT_COLUMNS = ("doc_id", "outcome", "http_status", "final_url", "fail_reason",
                   "payload_sha1", "fetched_at", "text_len", "lang")
 # One row per fetched page, the input of the inverted index (docs/RECRAWL.md).
@@ -105,9 +104,15 @@ def pg_doc_id(url: str) -> int:
     return value - (1 << 64) if value > _INT63 else value
 
 
-def classify(item: dict[str, Any]) -> tuple[str, str | None]:
-    """Maps one result record (`NNNNN.json`) to (outcome, fail_reason)."""
+def classify(item: dict[str, Any], blocked_status: Iterable[int]) -> tuple[str, str | None]:
+    """Maps one result record (`NNNNN.json`) to (outcome, fail_reason).
+
+    A status in `blocked_status` means the site refused us, even if it is a 2xx: an AWS
+    WAF challenge is a 202 with a small HTML page, which holds none of the page's text.
+    """
     status, error = item["status_code"], item["error"]
+    if status in blocked_status:
+        return "blocked", f"http_{status}"
     if status is not None and 200 <= status < 300:
         if error is None and item["html_file"]:
             return "fetched", None
@@ -122,6 +127,12 @@ def classify(item: dict[str, Any]) -> tuple[str, str | None]:
         # Raised by robots.txt refusals; other downloader middlewares may raise it too.
         return "robots", "ignore_request"
     return "retry", f"http_{status}" if status is not None else (error or "no_response")
+
+
+def _blocks_host(r: RecrawlCfg, outcomes: list[str]) -> bool:
+    """True if a host's results in one job show that it refuses us, not that a page failed."""
+    return (len(outcomes) >= r.block_min_docs
+            and outcomes.count("blocked") >= r.block_ratio * len(outcomes))
 
 
 def _instance_lock(conn: psycopg.Connection, name: str) -> None:
@@ -159,6 +170,11 @@ def run_loop(cycle: Callable[[], dict[str, Any]], interval_s: float, once: bool,
 def sync(cfg: Config, conn: psycopg.Connection,
          now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> dict[str, Any]:
     """Makes the frontier match the live run: new docs, new ranks, docs off the list."""
+    # Imported here: both import DuckDB, which starts one thread per host core on
+    # import, and the archive workers import this module.
+    from isel.manifest import validate_run
+    from isel.publish import swap_allowed
+
     at = now()
     if not swap_allowed(at, cfg.schedule):
         raise RecrawlError("swap freeze window: the metric may be reading selectdb")
@@ -506,8 +522,9 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
     would wait for the slowest host of its job. Once freed, its next docs go out
     in a new job while the old one is still open; the crawler still holds at
     most one unfinished batch per host. The docs stay `dispatched` until the
-    archive applies the job. A host with a 429 or 503 among them stays held, so
-    its pause is set before its next job. A job whose `request.json` is missing
+    archive applies the job. A host with a 429 or 503 among them, or that blocks
+    the batch, stays held, so its pause is set before its next job. A job whose
+    `request.json` is missing
     or dropped duplicates (positions differ from the docs sent) is left to the
     archive.
     """
@@ -529,7 +546,7 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
     for batch, job_id, doc_ids in jobs:
         if batch in held:
             free += [(host, batch) for host in _drained(
-                Path(cfg.recrawl.result_root) / job_id, doc_ids, held[batch])]
+                cfg.recrawl, Path(cfg.recrawl.result_root) / job_id, doc_ids, held[batch])]
     if not free:
         return
     with conn.transaction(), conn.cursor() as cur:
@@ -543,8 +560,9 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
     stats["drained"] = len(freed)
 
 
-def _drained(job_dir: Path, doc_ids: list[int], docs: dict[int, list[int]]) -> list[int]:
-    """The hosts in `docs` (host -> its doc_ids) whose results are all on disk, unthrottled."""
+def _drained(r: RecrawlCfg, job_dir: Path, doc_ids: list[int],
+             docs: dict[int, list[int]]) -> list[int]:
+    """The hosts in `docs` (host -> its doc_ids) with all results on disk and no pause due."""
     try:
         listing = json.loads((job_dir / "request.json").read_text(encoding="utf-8"))
         urls, owners = listing["urls"], listing["crawler_ids"]
@@ -567,11 +585,12 @@ def _drained(job_dir: Path, doc_ids: list[int], docs: dict[int, list[int]]) -> l
         if not all(f"{n:05d}.json" in names[owners[n]] for n in spots):
             continue
         try:
-            outcomes = [classify(read_item(job_dir / f"crawler_{owners[n]:02d}", n, urls[n]))[0]
+            outcomes = [classify(read_item(job_dir / f"crawler_{owners[n]:02d}", n, urls[n]),
+                                 r.blocked_status)[0]
                         for n in spots]
         except (OSError, ValueError):
             continue                     # the archive reports a bad record
-        if "throttled" not in outcomes:
+        if "throttled" not in outcomes and not _blocks_host(r, outcomes):
             out.append(host)
     return out
 
@@ -889,6 +908,11 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _http_status(value: int | None) -> int | None:
+    """The status as stored: anything but three digits is kept only in `fail_reason`."""
+    return value if value in HTTP_STATUS else None
+
+
 def _timestamp(value: Any, key: str) -> datetime:
     if not isinstance(value, str):
         raise ValueError(f"{key} must be an ISO 8601 string")
@@ -909,9 +933,9 @@ def read_item(part: Path, index: int, url: str) -> dict[str, Any]:
         raise ValueError(f"{name} lacks a result key")
     if item["url"] != url:
         raise ValueError(f"{name} is for another URL than request.json lists")
-    status = item["status_code"]
-    if status is not None and not (_is_int(status) and 100 <= status <= 599):
-        raise ValueError(f"{name}: status_code must be an HTTP status or null")
+    # Only the type: the value is whatever integer the site sent (781, 901, ...).
+    if item["status_code"] is not None and not _is_int(item["status_code"]):
+        raise ValueError(f"{name}: status_code must be an integer or null")
     for key in ("final_url", "error"):
         if item[key] is not None and not isinstance(item[key], str):
             raise ValueError(f"{name}: {key} must be a string or null")
@@ -1008,8 +1032,8 @@ def _record(r: RecrawlCfg, part: Path, job: JobInput, i: int, item: dict[str, An
     if item is None:
         rec["outcome"], rec["fail_reason"] = "retry", "unmatched"
         return rec
-    rec["outcome"], rec["fail_reason"] = classify(item)
-    rec.update(http_status=item["status_code"], final_url=item["final_url"],
+    rec["outcome"], rec["fail_reason"] = classify(item, r.blocked_status)
+    rec.update(http_status=_http_status(item["status_code"]), final_url=item["final_url"],
                fetched_at=item["fetched_at"])
     if rec["outcome"] != "fetched":
         return rec
@@ -1040,10 +1064,12 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
     this job.
     """
     r = cfg.recrawl
-    args = {"now": now, "stale": r.stale_days, "robots": r.robots_retry_days,
+    args = {"now": now, "stale": r.stale_days, "exhausted": r.failed_retry_days,
+            "robots": r.robots_retry_days,
             "base": r.retry_base_s, "max": r.retry_max_s, "attempts": r.max_attempts,
             "pause": r.host_pause_max_s, "text_file": done.text_file, "batch": job.batch_id,
-            "n": len(done.records)}
+            "n": len(done.records), "block_min": r.block_min_docs,
+            "block_ratio": r.block_ratio}
     changed = 0
     with conn.transaction(), conn.cursor() as cur:
         _cycle_lock(cur)
@@ -1056,6 +1082,13 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
         with cur.copy(f"COPY r ({', '.join(RESULT_COLUMNS)}) FROM STDIN") as copy:
             for rec in done.records:
                 copy.write_row([rec[c] for c in RESULT_COLUMNS])
+        # Before any doc leaves `dispatched`, or the share would count only the failures.
+        cur.execute(
+            "SELECT d.host_id FROM r JOIN recrawl.doc d USING (doc_id) "
+            "WHERE d.state = 'dispatched' AND d.batch_id = %(batch)s GROUP BY d.host_id "
+            "HAVING count(*) >= %(block_min)s "
+            "AND count(*) FILTER (WHERE r.outcome = 'blocked') >= %(block_ratio)s * count(*)", args)
+        args["blocking"] = [h for (h,) in cur.fetchall()]
         cur.execute(
             "UPDATE recrawl.doc d SET state = 'fetched', fetched_at = r.fetched_at, "
             "http_status = r.http_status, final_url = r.final_url, fail_reason = NULL, "
@@ -1088,14 +1121,25 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
             "FROM (SELECT DISTINCT d.host_id FROM r JOIN recrawl.doc d USING (doc_id) "
             "WHERE r.outcome = 'throttled' AND d.state = 'dispatched' "
             "AND d.batch_id = %(batch)s) p WHERE h.host_id = p.host_id", args)
+        # The refusal belongs to the host: its docs keep their tries and wait for its next
+        # probe, so they return as soon as the block lifts. The pause equals
+        # host_pause_max_s, so _wake does not take it for a backoff `next_at`.
+        cur.execute("UPDATE recrawl.host SET next_at = %(now)s + make_interval(secs => %(pause)s) "
+                    "WHERE host_id = ANY(%(blocking)s::bigint[])", args)
+        cur.execute(
+            "UPDATE recrawl.doc d SET state = 'failed', http_status = r.http_status, "
+            "final_url = r.final_url, fail_reason = r.fail_reason, due_at = %(now)s FROM r "
+            "WHERE r.outcome = 'blocked' AND d.doc_id = r.doc_id AND d.state = 'dispatched' "
+            "AND d.batch_id = %(batch)s AND d.host_id = ANY(%(blocking)s::bigint[])", args)
+        changed += cur.rowcount
         backoff = ("state = 'failed', attempts = d.attempts + 1, due_at = %(now)s + CASE "
-                   "WHEN d.attempts + 1 >= %(attempts)s THEN make_interval(days => %(stale)s) "
+                   "WHEN d.attempts + 1 >= %(attempts)s THEN make_interval(days => %(exhausted)s) "
                    "ELSE make_interval(secs => least(%(base)s * power(2, d.attempts), %(max)s)) "
                    "END")
         cur.execute(
             f"UPDATE recrawl.doc d SET {backoff}, http_status = r.http_status, "
             "final_url = r.final_url, fail_reason = r.fail_reason "
-            "FROM r WHERE r.outcome IN ('throttled', 'retry') AND d.doc_id = r.doc_id "
+            "FROM r WHERE r.outcome IN ('throttled', 'retry', 'blocked') AND d.doc_id = r.doc_id "
             "AND d.state = 'dispatched' AND d.batch_id = %(batch)s", args)
         changed += cur.rowcount
         # A doc of this job with no record at all: never expected, never left waiting.

@@ -222,6 +222,12 @@ reader_role = "select"                   # WebSearchEngine measure.py hardcodes 
 reader_password_env = "ISEL_SELECTDB_READER_PASSWORD"   # only init-selectdb needs it
 forbidden_ports = [5432, 5433, 5444]     # crawlerdb, metricdb, V1 selectdb
 connect_timeout_s = 10
+# TCP keepalive on both ends of every selectdb connection: a peer that vanished
+# without a reset (Host1 -> Host2, 2026-11-02) is found after idle + interval x count
+# (60 s), not the OS default of 2 h 11 min. The server end holds our advisory locks.
+keepalives_idle_s = 30
+keepalives_interval_s = 10
+keepalives_count = 3
 copy_block_bytes = 8388608
 maintenance_work_mem = "4GB"             # primary key build on 128M URLs
 swap_lock_timeout = "5s"                 # readers wait at most this long for a swap
@@ -265,9 +271,13 @@ sweep_rows = 100000                      # fetched docs made due again per plan 
 stale_days = 30                          # uniform revisit interval
 retry_base_s = 600                       # failed doc: retry_base_s * 2^attempts
 retry_max_s = 86400
-max_attempts = 5                         # then wait stale_days instead of retry_max_s
+max_attempts = 5                         # then wait failed_retry_days instead of retry_max_s
+failed_retry_days = 7                    # at least two tries per golden cycle (about 14 days)
 robots_retry_days = 30                   # a robots.txt refusal is asked again after this
-host_pause_max_s = 86400                 # cap on a 429/503 pause
+blocked_status = [202, 403]              # the site refused us; 202 is an AWS WAF challenge page
+block_ratio = 0.9                        # this share of a host's docs in a job blocked, of
+block_min_docs = 20                      # at least this many, pauses it for host_pause_max_s
+host_pause_max_s = 86400                 # cap on a 429/503 pause; the pause of a blocking host
 archive_interval_s = 15.0
 archive_workers = 8                      # text extraction: 6.5 ms per 590 KB page each
 min_free_gb = 800                        # no new jobs below this free space under text_root;

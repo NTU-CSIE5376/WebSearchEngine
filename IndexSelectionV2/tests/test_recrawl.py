@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 
 import duckdb
@@ -13,6 +15,7 @@ from recrawl_fakes import ApiStub, FakeCrawler, Page
 from isel.config import ConfigError, load_config
 from isel.recrawl import (
     CrawlerApi,
+    JobInput,
     RecrawlError,
     Reply,
     classify,
@@ -22,9 +25,11 @@ from isel.recrawl import (
     read_item,
     run_loop,
 )
+from isel.recrawl import _record as record_of
 from isel.urlnorm import md5_number_lower
 
 URL = "https://a.example/x"
+BLOCKED = [202, 403]
 
 
 def item(**kw):
@@ -62,9 +67,13 @@ def test_ids_match_duckdb_and_fit_postgres():
      ("retry", "TimeoutError")),
     ({"status_code": 500, "error": "HTTP 500"}, ("retry", "http_500")),
     ({"status_code": 301, "error": "HTTP 301", "html_file": None}, ("retry", "http_301")),
+    ({"status_code": 781, "error": "HTTP 781"}, ("retry", "http_781")),
+    # An AWS WAF challenge is a 202 with a small HTML page, so 2xx alone is not a page.
+    ({"status_code": 202}, ("blocked", "http_202")),
+    ({"status_code": 403, "error": "HTTP 403"}, ("blocked", "http_403")),
 ])
 def test_classify(kw, expected):
-    assert classify(item(**kw)) == expected
+    assert classify(item(**kw), BLOCKED) == expected
 
 
 def test_map_results_pairs_by_position_and_catches_a_new_order():
@@ -92,7 +101,7 @@ def _item_file(tmp_path, **kw):
 @pytest.mark.parametrize(("kw", "message"), [
     ({"url": "https://other.example/"}, "another URL"),
     ({"status_code": "200"}, "status_code"),
-    ({"status_code": 99999}, "status_code"),
+    ({"status_code": True}, "status_code"),
     ({"error": 5}, "error must be"),
     ({"final_url": 5}, "final_url must be"),
     ({"html_file": "../../etc/passwd"}, "html_file"),
@@ -113,6 +122,43 @@ def test_read_item_ignores_new_keys_and_parses_the_time(tmp_path):
     (tmp_path / "00000.json").write_text(json.dumps({"url": URL}))
     with pytest.raises(ValueError, match="lacks a result key"):
         read_item(tmp_path, 0, URL)
+
+
+@pytest.mark.parametrize("status", [781, 901, 0, 99999])
+def test_read_item_passes_any_integer_status_through(tmp_path, status):
+    # The crawler copies whatever integer the site sent (Twisted only calls int()).
+    # A 781 from one site once put a whole job in `error` and halted the planner.
+    _item_file(tmp_path, status_code=status, error=f"HTTP {status}")
+    assert read_item(tmp_path, 0, URL)["status_code"] == status
+
+
+@pytest.mark.parametrize(("status", "stored"), [(781, 781), (99999, None), (0, None)])
+def test_record_keeps_only_three_digit_statuses(tmp_path, status, stored):
+    job = JobInput(1, "1" * 32, [7], [URL], datetime(2026, 11, 2, tzinfo=UTC))
+    got = item(status_code=status, error=f"HTTP {status}",
+               fetched_at=datetime(2026, 11, 2, tzinfo=UTC))
+    rec = record_of(load_config([BASE]).recrawl, tmp_path, job, 0, got, [])
+    assert (rec["outcome"], rec["fail_reason"], rec["http_status"]) == (
+        "retry", f"http_{status}", stored)
+
+
+def test_record_keeps_a_waf_challenge_out_of_the_text(tmp_path):
+    job = JobInput(1, "1" * 32, [7], [URL], datetime(2026, 11, 2, tzinfo=UTC))
+    rows = []
+    got = item(status_code=202, fetched_at=datetime(2026, 11, 2, tzinfo=UTC))
+    rec = record_of(load_config([BASE]).recrawl, tmp_path, job, 0, got, rows)
+    assert (rec["outcome"], rec["fail_reason"], rec["http_status"]) == ("blocked", "http_202", 202)
+    assert rows == [] and rec["text_len"] is None
+
+
+def test_archive_workers_do_not_import_duckdb():
+    # A spawn worker re-imports the console script (isel.cli) and isel.recrawl. DuckDB
+    # 1.4+ starts one thread per host core on import: 8 workers on a 144-core host
+    # overflowed the container's pids_limit (docs/RECRAWL.md §10).
+    code = "import sys, isel.cli, isel.recrawl; print('duckdb' in sys.modules)"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         check=True)
+    assert out.stdout.strip() == "False"
 
 
 def test_run_loop_once_returns_the_first_cycle():
@@ -137,6 +183,12 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
         (("result_ttl_days = 3 ", "result_ttl_days = 61 "), "result_ttl_days"),
         (("archive_workers = 8", "archive_workers = 0"), "must be > 0"),
         (("max_resend = 20 ", "max_resend = -1 "), "max_resend"),
+        (("failed_retry_days = 7 ", "failed_retry_days = 0 "), "must be > 0"),
+        (("block_ratio = 0.9 ", "block_ratio = 0.0 "), "block_ratio"),
+        (("block_ratio = 0.9 ", "block_ratio = 1.1 "), "block_ratio"),
+        (("block_min_docs = 20 ", "block_min_docs = 0 "), "must be > 0"),
+        (("blocked_status = [202, 403]", "blocked_status = [202, 429]"), "blocked_status"),
+        (("blocked_status = [202, 403]", "blocked_status = [99]"), "blocked_status"),
     ]
     for (old, new), message in cases:
         assert old in BASE.read_text(), old

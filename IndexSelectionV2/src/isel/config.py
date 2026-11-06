@@ -168,6 +168,9 @@ class SelectDbCfg:
     reader_password_env: str
     forbidden_ports: list[int]
     connect_timeout_s: int
+    keepalives_idle_s: int
+    keepalives_interval_s: int
+    keepalives_count: int
     copy_block_bytes: int
     maintenance_work_mem: str
     swap_lock_timeout: str
@@ -207,7 +210,11 @@ class RecrawlCfg:
     retry_base_s: int
     retry_max_s: int
     max_attempts: int
+    failed_retry_days: int
     robots_retry_days: int
+    blocked_status: list[int]
+    block_ratio: float
+    block_min_docs: int
     host_pause_max_s: int
     archive_interval_s: float
     archive_workers: int
@@ -448,7 +455,8 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "recrawl.result_root, text_root and log_root must differ")
     need(min(r.job_size, r.host_docs_per_job, r.max_jobs_inflight, r.plan_max_jobs,
              r.claim_timeout_s, r.sweep_rows,
-             r.stale_days, r.retry_base_s, r.max_attempts, r.robots_retry_days,
+             r.stale_days, r.retry_base_s, r.max_attempts, r.failed_retry_days,
+             r.robots_retry_days, r.block_min_docs,
              r.host_pause_max_s, r.sync_chunk_rows, r.max_body_chars, r.archive_workers) > 0,
          "recrawl sizes, counts and intervals must be > 0")
     need(r.job_size <= 10000, "recrawl.job_size must be <= 10000, the API's max_urls")
@@ -469,6 +477,11 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "result_ttl_days")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
+    need(0 < r.block_ratio <= 1, "recrawl.block_ratio must be in (0, 1]")
+    need(all(100 <= s <= 999 for s in r.blocked_status)
+         and not set(r.blocked_status) & {404, 410, 429, 503},
+         "recrawl.blocked_status must hold HTTP statuses without 404, 410, 429 and 503, "
+         "which have their own outcomes")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:
@@ -503,7 +516,8 @@ def _validate_selectdb(cfg: Config, need: Any) -> None:
          "selectdb DSN env vars must differ from each other and from the read-only DBs")
     need(bool(s.forbidden_ports), "selectdb.forbidden_ports must not be empty")
     need(min(s.copy_block_bytes, s.swap_retry_attempts, s.max_db_bytes, s.est_bytes_per_row,
-             s.verify_chunk, s.connect_timeout_s) > 0,
+             s.verify_chunk, s.connect_timeout_s, s.keepalives_idle_s,
+             s.keepalives_interval_s, s.keepalives_count) > 0,
          "selectdb sizes, counts and timeouts must be > 0")
     need(s.swap_retry_backoff_s >= 0, "selectdb.swap_retry_backoff_s must be >= 0")
     w = cfg.schedule.swap_freeze_window
