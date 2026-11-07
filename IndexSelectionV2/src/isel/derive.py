@@ -98,7 +98,7 @@ def derive_sample(cfg: Config, work_dir: Path) -> dict[str, Any]:
             "sample_salt": cfg.full.sample_salt, "agg_share": cfg.full.agg_share,
             "agg_salt": cfg.full.agg_salt, "snapshot_at": exported["started_at"],
             "export_started_at": exported["started_at"],
-            "frozen_probe": exported.get("frozen_probe"), "rows": rows,
+            "rows": rows,
             "shards_done": sorted(int(s) for s in rows),
             "max_last_fetch_ok": newest.isoformat() if newest else None,
             "duplicate_keys": duplicates, "differing_duplicates": differing,

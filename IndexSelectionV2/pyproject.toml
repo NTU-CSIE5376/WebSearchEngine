@@ -45,8 +45,11 @@ convention = "google"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: needs a local Docker daemon with the postgres:16 image"]
-addopts = "-m 'not integration'"
+markers = [
+    "integration: needs a local Docker daemon with the postgres:16 image",
+    "yugabyte: needs Docker with the yugabytedb/yugabyte:2026.1.2.0-b137 image",
+]
+addopts = "-m 'not integration and not yugabyte'"
 
 [dependency-groups]
 dev = [

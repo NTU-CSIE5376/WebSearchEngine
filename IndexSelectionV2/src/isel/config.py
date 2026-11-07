@@ -39,8 +39,6 @@ class GuardCfg:
     probe_interval_s: float
     probe_ttl_s: float
     pause_s: float
-    min_mb_s: float
-    timeout_floor_s: int
     timeout_cap_s: int
 
 
@@ -51,6 +49,7 @@ class CrawlerDbCfg:
     num_shards: int
     url_table_fmt: str
     split_table: str
+    io_wait_types: list[str]
     session: dict[str, str]
 
 
@@ -146,13 +145,14 @@ class DuckDbCfg:
 
 @dataclass(frozen=True)
 class FullCfg:
-    chunk_blocks: int
+    hash_chunks: int
     chunks_per_file: int
+    chunk_retries: int
     min_free_gb: float
     tau_margin: float
     parse_threads: int
     connections: int
-    max_heap_mb_s: float
+    max_mb_s: float
     sample_percent: float
     sample_salt: str
     agg_share: float
@@ -259,6 +259,8 @@ LGBM_THREAD_ALIASES = ("n_jobs", "nthread", "nthreads", "num_thread")
 # crawlerdb session settings that fix the CSV text the full export parses: other
 # values fail the parse, or round url_score (extra_float_digits < 1).
 CSV_SESSION = {"datestyle": "ISO", "extra_float_digits": "1", "client_encoding": "UTF8"}
+# yb_hash_code() returns a uint16, so a YugabyteDB shard table spans [0, 65536).
+YB_HASH_SPACE = 65536
 
 
 def _deep_merge(base: dict[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
@@ -371,13 +373,12 @@ def _validate_guard(g: GuardCfg, need: Any) -> None:
     need(all(1 <= d <= 31 for d in g.month_days), "guard.month_days must be 1-31")
     need(len(g.hourly_window) == 2 and all(0 <= m < 60 for m in g.hourly_window),
          "guard.hourly_window must be [start_minute, end_minute]")
-    need(0 < g.timeout_floor_s <= g.timeout_cap_s < hourly_open_s(g),
-         "guard timeouts must satisfy 0 < floor <= cap < the hourly open gap")
+    need(0 < g.timeout_cap_s < hourly_open_s(g),
+         "guard.timeout_cap_s must be > 0 and below the hourly open gap")
     need(g.max_io_waiters >= 0, "guard.max_io_waiters must be >= 0")
     need(g.probes >= 1, "guard.probes must be >= 1")
     need(min(g.probe_interval_s, g.probe_ttl_s) >= 0 and g.pause_s > 0,
          "guard intervals must be >= 0 and pause_s > 0")
-    need(g.min_mb_s > 0, "guard.min_mb_s must be > 0")
 
 
 def _validate_session(name: str, session: Mapping[str, str], g: GuardCfg, need: Any) -> None:
@@ -396,6 +397,7 @@ def _validate(cfg: Config) -> None:
             raise ConfigError(message)
 
     need(cfg.crawlerdb.num_shards > 0, "crawlerdb.num_shards must be > 0")
+    need(bool(cfg.crawlerdb.io_wait_types), "crawlerdb.io_wait_types must not be empty")
     _validate_guard(cfg.guard, need)
     _validate_session("crawlerdb", cfg.crawlerdb.session, cfg.guard, need)
     _validate_session("metricdb", cfg.metricdb.session, cfg.guard, need)
@@ -475,16 +477,15 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
 
 
 def _validate_full(cfg: Config, need: Any) -> None:
-    f, g = cfg.full, cfg.guard
-    need(f.chunk_blocks > 0 and f.chunks_per_file > 0,
-         "full.chunk_blocks and full.chunks_per_file must be > 0")
-    # A chunk read at the worst-case speed must still finish inside its timeout.
-    need(f.chunk_blocks * 8192 <= g.min_mb_s * 1_000_000 * g.timeout_cap_s,
-         "full.chunk_blocks must be readable at guard.min_mb_s within guard.timeout_cap_s")
+    f = cfg.full
+    need(f.chunks_per_file > 0, "full.chunks_per_file must be > 0")
+    need(f.hash_chunks > 0 and YB_HASH_SPACE % f.hash_chunks == 0,
+         f"full.hash_chunks must be > 0 and divide {YB_HASH_SPACE}")
+    need(f.chunk_retries >= 0, "full.chunk_retries must be >= 0")
     need(f.min_free_gb >= 0, "full.min_free_gb must be >= 0")
     need(f.parse_threads > 0, "full.parse_threads must be > 0")
-    need(f.connections > 0 and f.max_heap_mb_s > 0,
-         "full.connections and full.max_heap_mb_s must be > 0")
+    need(f.connections > 0 and f.max_mb_s > 0,
+         "full.connections and full.max_mb_s must be > 0")
     need(all(cfg.crawlerdb.session.get(k) == v for k, v in CSV_SESSION.items()),
          f"crawlerdb.session must set {CSV_SESSION} for the CSV text the full export parses")
     need(0 < f.sample_percent <= 100

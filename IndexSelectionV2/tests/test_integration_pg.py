@@ -1,4 +1,6 @@
-"""The read and selectdb paths against a throwaway local `postgres:16` container.
+"""The metricdb read and the selectdb paths against a throwaway local `postgres:16` container.
+
+crawlerdb is YugabyteDB; its read path is checked in `test_integration_yb`.
 
 Run with `uv run pytest -m integration`. Nothing here touches a course server:
 the container listens on 127.0.0.1 only and is removed when the module ends.
@@ -29,11 +31,10 @@ from recrawl_fakes import ApiStub, FakeCrawler, Page, crawler_of
 
 from isel.cli import main as cli_main
 from isel.golden import golden_table, pull_golden
-from isel.io import read_json, write_parquet_atomic
+from isel.io import write_parquet_atomic
 from isel.manifest import write_run
-from isel.pg import ReadGuard, ReadOnlyViolation, open_crawlerdb, open_metricdb
+from isel.pg import ReadGuard, ReadOnlyViolation, open_metricdb
 from isel.publish import load_selection, rollback, swap, verify_live
-from isel.pull import CRAWL_COLUMNS, FULL_SCHEMA, estimate_full, pull_dims, pull_full
 from isel.recrawl import (
     CrawlerApi,
     archive_cycle,
@@ -148,19 +149,10 @@ def cfg(base_cfg, tmp_path, dsn, monkeypatch):
     return replace(cfg, "pull", min_interval_s=0.0)
 
 
-def _session(cfg, opener=open_crawlerdb):
-    session = opener(cfg)
+def _session(cfg):
+    session = open_metricdb(cfg)
     session.guard = ReadGuard(cfg.guard, session.io_waiters, now=lambda: ALLOWED)
     return session
-
-
-def test_dims_read_real_rows(cfg, tmp_path):
-    session = _session(cfg)
-    try:
-        assert session.io_waiters() >= 0
-        assert pull_dims(cfg, session, tmp_path / "dims")["split_hosts"] == 1
-    finally:
-        session.close()
 
 
 def test_the_server_refuses_writes_and_the_gate_stops_bypasses(cfg):
@@ -178,56 +170,12 @@ def test_the_server_refuses_writes_and_the_gate_stops_bypasses(cfg):
 
 
 def test_golden_pull_reads_metricdb_tables(cfg, tmp_path):
-    session = _session(cfg, open_metricdb)
+    session = _session(cfg)
     try:
         summary = pull_golden(session, tmp_path / "golden", cfg.golden.tags)
     finally:
         session.close()
     assert summary["1"]["head"]["distinct_raw_urls"] == 2
-
-
-def _files(root):
-    return pa.concat_tables([pq.read_table(p) for p in sorted(root.glob("shard=*/part-*.parquet"))])
-
-
-def test_full_export_reads_every_crawled_row_once(cfg, tmp_path, dsn):
-    cfg = replace(cfg, "full", chunk_blocks=1, chunks_per_file=3, min_free_gb=0.0)
-    sessions = [_session(cfg), _session(cfg)]
-    try:
-        assert estimate_full(cfg, sessions[0])["chunks"] > SHARDS
-        out = pull_full(cfg, sessions, tmp_path / "export", now=ALLOWED)
-    finally:
-        for session in sessions:
-            session.close()
-    exported = _files(tmp_path / "export")
-    crawled = [u for n, u in enumerate(_urls()) if n % 10 != 0]
-    assert out["shards_missing"] == 0 and out["rows"] == exported.num_rows == len(crawled)
-    assert sorted(exported.column("url").to_pylist()) == sorted(crawled)
-    assert exported.schema.equals(FULL_SCHEMA, check_metadata=False)
-    meta = read_json(tmp_path / "export" / "_meta.json")
-    assert "finished_at" in meta and "end_probe" in meta
-    assert set(meta["io"]) == {str(s) for s in range(SHARDS)}
-
-
-def test_the_csv_full_export_equals_psycopg_decoding(cfg, tmp_path, dsn):
-    cfg = replace(cfg, "full", chunk_blocks=1, chunks_per_file=3, min_free_gb=0.0)
-    session = _session(cfg)
-    try:
-        pull_full(cfg, [session], tmp_path / "export", now=ALLOWED)
-    finally:
-        session.close()
-    columns = ", ".join(f"{expr} AS {name}" for name, expr, _ in CRAWL_COLUMNS)
-    rows = []
-    with psycopg.connect(dsn) as conn:
-        for shard in range(SHARDS):
-            cur = conn.execute(f"SELECT {columns} FROM url_state_current_{shard:03d} "
-                               "WHERE last_fetch_ok IS NOT NULL")
-            names = [d.name for d in cur.description]
-            rows += [{**dict(zip(names, r, strict=True)), "shard": shard} for r in cur]
-    decoded = pa.Table.from_pylist(rows, schema=FULL_SCHEMA)
-    csv = _files(tmp_path / "export").cast(FULL_SCHEMA)
-    assert csv.sort_by("url").equals(decoded.sort_by("url"))
-    assert sum("\n" in u for u in csv.column("url").to_pylist()) == 9
 
 
 OPEN = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
