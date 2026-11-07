@@ -280,3 +280,45 @@ min_free_gb = 800                        # no new jobs below this free space und
                                          # Host2 /data has ~2 TB free while the crawler runs
 max_body_chars = 200000                  # extracted body text kept per page
 sync_chunk_rows = 1000000                # docs per recrawl-sync transaction
+
+[text_index]                             # full-text index of the recrawl text; docs/TEXT_INDEX.md
+url = "http://127.0.0.1:9200"            # OpenSearch (deploy/compose.opensearch.yaml locally)
+timeout_s = 120.0
+alias = "isel-text"                      # searches go through the alias; each build is a new
+                                         # physical index isel-text-<utc id>, swapped in at once
+settings_file = "config/text_index/icu.json"   # index settings and mappings
+shards = 1                               # primary shards of a new index; host-specific
+query_type = "best_fields"               # the best field's BM25; or most_fields, combined_fields
+fields = ["title^2", "description", "body", "url.text^2"]   # tuned on golden batch 20, the
+                                         # URL weight on 51M docs; combined_fields needs one
+                                         # analyzer and weights >= 1
+k = 10                                   # hits per query: the metric's top 10
+fetch_k = 200                            # hits read per query, so a host cap can refill the top k
+host_cap = 2                             # hits per host in the top k; 0 turns the cap off
+prior_file = ""                          # Parquet glob of the list's doc_id and rank; "" gives
+                                         # docs no prior. Host-specific (host2.toml)
+prior_scale = 1e9                        # sel_prior = prior_scale / (rank + 1); above the largest
+                                         # rank, so log(1 + S) stays close to log(S)
+prior_scaling_factor = 1.0               # rank_feature's log(scaling_factor + S)
+prior_boost = 1.7372                     # 4 / ln(10): 4 points of score per factor of 10 in rank,
+                                         # chosen on 51M docs; 0 drops the prior from the query
+prior_depth = 1500                       # best text matches the prior reorders, split over the
+                                         # shards. Over every match, popular pages with a weak
+                                         # match took 40 % of the top 10
+prior_min_coverage = 0.99                # share of docs with a rank a build needs
+read_batch_rows = 10000                  # text rows per Arrow batch read for the bulk load
+bulk_bytes = 8388608                     # per _bulk request; OpenSearch suggests 5-15 MiB
+bulk_workers = 2                         # concurrent _bulk requests
+retries = 5                              # resends of a _bulk refused with 429 or 503
+backoff_s = 2.0                          # doubles per resend
+lease_wait_s = 120.0                     # wait for the retention leases before the force
+                                         # merge, which then drops the _recovery_source copy
+force_merge_segments = 1                 # segments per shard after the build
+keep_prev = true                         # keep the previous index for rollback
+lookup_chunk = 1000                      # doc ids per presence lookup
+warmup_queries = 20                      # unmeasured queries before an eval
+flood_free_ratio = 0.05                  # free share the node's flood stage keeps (95 %,
+                                         # the default); a build that would cross it stops
+expected_bytes_per_doc = 1003            # icu.json on 44k crawled pages; a build needs
+                                         # twice this per doc free before it loads
+progress_every = 1000                    # _bulk requests between progress log lines

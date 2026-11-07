@@ -1,0 +1,14 @@
+# Host2 text index overlay; the text-index service in deploy/compose.compute.yaml passes it
+# after container.toml. docs/TEXT_INDEX.md, "Before Host2".
+[text_index]
+settings_file = "/app/config/text_index/icu.json"   # the image runs in /work
+shards = 8                               # 0.13 TB in shards of about 16 GB
+keep_prev = false                        # a second index does not fit beside the crawler
+                                         # on /data; rollback is a rebuild from the Parquet
+# The manifest of the live selection run. A new run needs a new path here and a rebuild.
+prior_file = "/work/full/selection/run=20261102T091240977675Z/manifest/index_shard=*.parquet"
+
+[duckdb]                                 # a build only streams rows to the bulk client
+threads = 4
+memory_limit = "16GB"
+max_temp_directory_size = "20GB"
