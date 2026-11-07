@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from conftest import ROOT, replace, small_cfg
 from opensearch_fakes import OpenSearchStub
@@ -242,6 +243,11 @@ def test_evaluate_golden_counts_pairs_by_doc_id(cfg, stub, tmp_path):
     stub.aliases["isel-text"] = {"isel-text-x"}
     stub.hits = {"alpha": [ids[1], "999"], "beta": []}
     out = evaluate_golden(cfg, _client(stub), 20)
+    saved = pq.read_table(next((cfg.work_dir / "text_index" / "eval").glob("*.queries.parquet")))
+    by_query = {r["query_id"]: r for r in saved.to_pylist()}
+    assert by_query[1]["present"] == 2 and by_query[1]["ranked"] == [ids[1]]
+    assert by_query[2]["present"] == 0 and by_query[2]["ranked"] == []
+    assert out["all"]["recall_given_present_ci95"][0] <= out["all"]["recall_given_present"]
     assert out["all"]["pairs"] == 3 and out["all"]["recall_pairs"] == pytest.approx(1 / 3)
     assert out["all"]["presence"] == pytest.approx(2 / 3)
     assert out["all"]["recall_given_present"] == pytest.approx(1 / 2)

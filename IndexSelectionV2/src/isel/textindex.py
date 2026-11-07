@@ -533,6 +533,7 @@ def evaluate_golden(cfg: Config, client: OpenSearch, batch_id: int,
     atomic_write_json(out_dir / f"{run}.json", out)
     write_parquet_atomic(pa.Table.from_pylist([
         {"query_id": q, "keyword": keyword[q], "judged": len(judged[q]),
-         "hits": len(ranked[q]), "found": len(judged[q] & set(ranked[q])),
-         "took_ms": took[q]} for q in sorted(judged)]), out_dir / f"{run}.queries.parquet")
+         "present": len(judged[q] & present), "hits": len(ranked[q]),
+         "found": len(judged[q] & set(ranked[q])), "took_ms": took[q], "ranked": ranked[q]}
+        for q in sorted(judged)]), out_dir / f"{run}.queries.parquet")
     return out
