@@ -478,7 +478,7 @@ each index's own. Intervals resample keyword texts, 10,000 draws.
 - **Competition.** The golden pages are there but rank low. Recall given present at depth
   10, 100, 200, 500, 1,000 and 1,500 is 0.150, 0.398, 0.459, 0.529, 0.591 and 0.617. BM25's
   top 10 has 5.97 hosts and a median list rank of 25.8M; a keyword's golden pages have 7.17
-  hosts per 7.87 URLs and a median list rank of 0.64M. In 68.7 % of the keywords one host has
+  hosts per 7.87 URLs and a median list rank of 0.45M. In 68.7 % of the keywords one host has
   over 2 of the top 10, and in 10.6 % of the golden lists.
 - **Query shape and BM25 change little.** Of 18 shapes and a bundle on batches 18, 19 and 20
   dev, `url.text^2` (+0.005, SE 0.002) is the simplest within 1 SE of the best (+0.007).
@@ -521,6 +521,49 @@ The rule asks for a lower bound above 0 on batch 20, and for no interval entirel
 It holds. The other scripts of batch 20 pass only because the upper bound is exactly 0, on
 39 pairs.
 
+**Where the other pairs stop** (batch 20 and 21 dev, 1,946 pairs, H/F 0.417):
+
+| Pair | Share |
+|---|---|
+| In the top 10 | 41.7 % |
+| In BM25's top 1,500, scored too low | 27.1 % |
+| Outside BM25's top 1,500 | 29.6 % |
+| Removed by the host cap | 1.6 % |
+
+| List rank | Pairs | In the top 1,500 | H/F, BM25 only | H/F, now |
+|---|---|---|---|---|
+| under 0.1M | 681 | 60.9 % | 0.109 | 0.564 |
+| 0.1–1M | 441 | 73.7 % | 0.186 | 0.558 |
+| 1–5M | 324 | 72.2 % | 0.216 | 0.321 |
+| 5–10M | 153 | 76.5 % | 0.235 | 0.229 |
+| 10–20M | 139 | 71.2 % | 0.209 | 0.122 |
+| 20M or more | 208 | 85.1 % | 0.231 | 0.125 |
+
+- **Re-ranking stops at about 0.68.** That is the share inside the top 1,500: 0.691 on batch
+  20 and 0.670 on batch 21. Without competition, H/F is 0.833.
+- **The pages the model trusts most are the ones BM25 drops most.** 65.8 % of the pairs outside
+  the top 1,500 have a list rank under 1M, so 19.5 % of all pairs are such pages. Most of them
+  do not hold the keyword: 36 % hold only some of its tokens and 27 % none, as with another
+  language (`turquia`, `wiki/Turkey`) or a broader page (`india vs west indies`, `wiki/India`).
+  22.5 % hold it all in the title or URL (`arsenal`, `wiki/Arsenal_F.C.`), and 14 % in the
+  body or description. 20 % have no text. These classes approximate the analyzer, and a whole
+  CJK keyword must occur as written. A deeper window gains little: 3,000 and 6,000 candidates give 0.431
+  and 0.427 on batch 20, and 0.406 and 0.402 on batch 21. The `should` form did not either:
+  it gained 43 of them and lost 141 others.
+- **The query shape was chosen for the wrong stage.** The shape family scored BM25's top 10, but
+  with a `rescore` the first stage only has to reach the top 1,500: `url.text^2` adds 0.008 at 10
+  and 0.074 at 1,500. Clauses for all tokens in the title or URL were never measured that way.
+  They could reach at most 6.2 % of the pairs, and about 4.6 % if those convert like the
+  same pages inside the top 1,500. New competitors would lower that.
+- **Inside the top 1,500, better weights have little left.** 430 of the 527 pairs scored too
+  low beat a top-10 doc on BM25, and lose to its list rank. The best weight per keyword, which no
+  query can know, gives 0.472 against 0.418.
+- **A learned re-ranker on the same signals did not win.** LightGBM `lambdarank` with 14
+  features, 5 folds by keyword, gives 0.423 on batch 20 and 0.386 on batch 21, against 0.429 and
+  0.389 (−0.006 [−0.022, +0.010] and −0.004 [−0.026, +0.020]). This was one exploratory
+  configuration, without per-field BM25 or anchor text. List rank, model score and BM25
+  position took 60 % of the gain; title and URL coverage took 6 %.
+
 - **Build.** 52,044,958 docs in 3.4 h: 2.6 h of load at 5,486 docs/s, the rest merge. 43.6 GB,
   837 bytes per doc, against about 824 for the 51.2M index. All docs have a rank. With both
   indices kept, `/data` stayed above 2,663 GiB free.
@@ -529,8 +572,7 @@ It holds. The other scripts of batch 20 pass only because the upper bound is exa
     halves were read twice here, offline and for the online check. Nothing was chosen from
     the second read. Batch 22 (created 11-16), if it holds no `goto` URLs, is the clean read.
   - The gain falls where the model is sure: 27 % of the present URLs were golden in an
-    earlier batch. On dev, pairs under list rank 0.1M go from 0.153 to 0.793, and those at
-    rank 20M or more from 0.077 to 0.040.
+    earlier batch. See the table above for who gains and who loses by list rank.
   - The weight fits this size. BM25 scores are small on a small index, so on 2,653 golden
     pages the same weight gives 0.650 against 0.833 without it. Tune again for another size.
   - The scores come from one selection run. A new run needs a new `prior_file` and a rebuild.
@@ -714,16 +756,20 @@ Scripts (sha256 prefix), kept outside the repo:
 | `golden_flags.py` | `4c194f64dfb7c616` | batch 20's official `is_crawled` and `is_indexed` flags, read once from metricdb |
 | `golden_official.py` | `92a6f07cf46d3320` | batch 20 as the official metric counts it: on-list pages, four background sizes, paired bootstrap |
 | `host2_smoke.sh` | `d9ad011c446507fa` | the Host2 node's settings and data directory permissions on the local Docker VM |
-| `rule.md` | `a0db958c0a613474` | the rule of the 52M work, written before any variant ran, with its deviations |
+| `rule.md` | `ea789f1b9b920018` | the rule of the 52M work, written before any variant ran, with its deviations |
 | `rk_common.py` | `ca7a8c3013364c50` | shared config, golden batches, splits, the fixed present set and the bootstrap |
 | `rk_dump.py` | `44b8a2698055c645` | top 1,500 of one query shape for every golden keyword |
-| `rk_depth.py` | `a6437a88b91370e7` | recall at depth, ties at rank 10, hosts and list ranks of a top 10 |
+| `rk_depth.py` | `a6437a88b91370e7` | recall at depth, ties at rank 10, hosts and list ranks of a top 10; its golden ranks lean deep, see `rk_golden_rank.py` |
 | `rk_ctrl.py` | `2183fb11e97ce16c` | the index of only batch 20's present golden pages |
 | `rk_shape.py` | `e4b22baae0cc8567` | the query shape family and the bundle |
 | `rk_bm25.py` | `02699587e88f52d4` | k1 and b by closing, updating and opening the index |
 | `rk_rerank.py` | `8e47640bf9a6bd1a` | the prior and host cap family offline, and the test read |
-| `rk_probe.py` | `e3f6426bbfeaa44e` | dev H/F of one candidate by new URLs, tag, script and list rank |
+| `rk_probe.py` | `e3f6426bbfeaa44e` | dev H/F of one candidate by new URLs, tag and script; its list rank bins are wrong, see `rk_miss.py` |
 | `rk_online.py` | `5de0e2884b7c8e8c` | a rebuilt index against the baseline and the offline values |
 | `rk_gap.py` | `5fc91ba415e33f6e` | what separates the online and the offline top 10 |
 | `rk_rescore.py` | `5a6e43bc4e4dfea8` | the prior as a `rescore`, by window, on dev |
 | `rk_gate.py` | `ef99be3cc8bcc633` | the adoption rule on the test half of a rebuilt index |
+| `rk_miss.py` | `e61d7325f461a344` | where the missing pairs stop, and H/F by true list rank, on dev |
+| `rk_ltr.py` | `fd02066d0d9d5039` | a learned re-ranker over the same top 1,500, on dev |
+| `rk_golden_rank.py` | `ac37e03a13ef8408` | the true list rank of every present golden doc |
+| `rk_outside.py` | `dac908cb5c74fef1` | where a keyword's tokens occur in the pages outside the top 1,500, on dev |
