@@ -283,9 +283,23 @@ alias = "isel-text"                      # searches go through the alias; each b
 settings_file = "config/text_index/icu.json"   # index settings and mappings
 shards = 1                               # primary shards of a new index; host-specific
 query_type = "best_fields"               # the best field's BM25; or most_fields, combined_fields
-fields = ["title^2", "description", "body", "url.text"]   # tuned on golden batch 20;
-                                         # combined_fields needs one analyzer and weights >= 1
+fields = ["title^2", "description", "body", "url.text^2"]   # tuned on golden batch 20, the
+                                         # URL weight on 51M docs; combined_fields needs one
+                                         # analyzer and weights >= 1
 k = 10                                   # hits per query: the metric's top 10
+fetch_k = 200                            # hits read per query, so a host cap can refill the top k
+host_cap = 2                             # hits per host in the top k; 0 turns the cap off
+prior_file = ""                          # Parquet glob of the list's doc_id and rank; "" gives
+                                         # docs no prior. Host-specific (host2.toml)
+prior_scale = 1e9                        # sel_prior = prior_scale / (rank + 1); above the largest
+                                         # rank, so log(1 + S) stays close to log(S)
+prior_scaling_factor = 1.0               # rank_feature's log(scaling_factor + S)
+prior_boost = 1.7372                     # 4 / ln(10): 4 points of score per factor of 10 in rank,
+                                         # chosen on 51M docs; 0 drops the prior from the query
+prior_depth = 1500                       # best text matches the prior reorders, split over the
+                                         # shards. Over every match, popular pages with a weak
+                                         # match took 40 % of the top 10
+prior_min_coverage = 0.99                # share of docs with a rank a build needs
 read_batch_rows = 10000                  # text rows per Arrow batch read for the bulk load
 bulk_bytes = 8388608                     # per _bulk request; OpenSearch suggests 5-15 MiB
 bulk_workers = 2                         # concurrent _bulk requests

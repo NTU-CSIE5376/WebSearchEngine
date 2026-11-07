@@ -16,13 +16,16 @@ from isel.io import write_parquet_atomic
 from isel.recrawl import TEXT_SCHEMA
 from isel.textindex import (
     DOC_FIELDS,
+    PRIOR_FIELD,
     OpenSearch,
     TextIndexError,
     build,
     bulk_payloads,
+    cap_hosts,
     evaluate_golden,
     latest_docs,
     query_body,
+    search,
 )
 from isel.urlnorm import md5_number_lower
 
@@ -67,9 +70,9 @@ def test_bulk_payloads_split_by_bytes_and_keep_u64_ids():
     big_id = (1 << 64) - 1
     rows = [_row(big_id), _row(1), _row(2, body="x" * 300), _row(3)]
     batch = pa.RecordBatch.from_pylist(rows, schema=TEXT_SCHEMA)
-    sizes = [len(p) for p in bulk_payloads([batch], max_bytes=1)]   # one document each
+    sizes = [len(p) for p in bulk_payloads([batch], 1, 1e9)]        # one document each
     cap = sizes[0] + sizes[1]
-    payloads = list(bulk_payloads([batch], max_bytes=cap))
+    payloads = list(bulk_payloads([batch], cap, 1e9))
     assert all(p.endswith(b"\n") for p in payloads)
     assert [len(p.splitlines()) for p in payloads] == [4, 2, 2]     # the long body alone
     assert len(payloads[0]) == cap and len(payloads[1]) > cap
@@ -77,6 +80,15 @@ def test_bulk_payloads_split_by_bytes_and_keep_u64_ids():
     doc = _lines(payloads[0])[1]
     assert set(doc) == {"doc_id", "url", "lang", "title", "body"}  # no null field
     assert doc["doc_id"] == big_id
+
+
+def test_bulk_payloads_turn_the_rank_into_a_positive_prior():
+    rows = [{**_row(1), "prior_rank": 0}, {**_row(2), "prior_rank": 9}, {**_row(3), "prior_rank": None}]
+    schema = TEXT_SCHEMA.append(pa.field("prior_rank", pa.int64()))
+    payload = next(bulk_payloads([pa.RecordBatch.from_pylist(rows, schema=schema)], 10**6, 100.0))
+    docs = _lines(payload)[1::2]
+    assert [d.get(PRIOR_FIELD) for d in docs] == [100.0, 10.0, None]
+    assert PRIOR_FIELD not in docs[2]                # rank_feature rejects a null
 
 
 def test_latest_docs_keeps_the_newest_row_of_each_doc(cfg, tmp_path):
@@ -89,10 +101,10 @@ def test_latest_docs_keeps_the_newest_row_of_each_doc(cfg, tmp_path):
     from isel.io import open_duckdb
 
     con = open_duckdb(cfg, tmp_path / "tmp")
-    rows, reader = latest_docs(con, root, 10)
+    rows, ranked, reader = latest_docs(con, root, 10)
     table = reader.read_all()
-    assert rows == 2
-    assert table.column_names == ["doc_id", *DOC_FIELDS]
+    assert rows == 2 and ranked == 0
+    assert table.column_names == ["doc_id", *DOC_FIELDS, "prior_rank"]
     # doc 2 ties on fetched_at: the larger file name (job-2) wins.
     assert sorted(zip(table["doc_id"].to_pylist(), table["title"].to_pylist(),
                       strict=True)) == [(1, "new"), (2, "b")]
@@ -107,7 +119,7 @@ def test_latest_docs_lets_a_row_without_text_lose_to_any_row_with_text(cfg, tmp_
         _row(1, OLD, "real", "text"), _row(2, OLD, None, "only a body"), _row(3, OLD, **challenge)])
     _write(root / "fetch_date=20261020" / "job-2.parquet", [
         _row(1, NEW, **challenge), _row(2, NEW, **challenge), _row(3, NEW, **challenge)])
-    _, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10)
+    _, _, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10)
     table = reader.read_all().sort_by("doc_id")
     assert table["body"].to_pylist() == ["text", "only a body", ""]
     assert table["title"].to_pylist()[0] == "real"
@@ -208,11 +220,93 @@ def test_build_drops_the_new_index_when_the_merge_fails(cfg, stub, tmp_path):
     assert stub.indices == {} and "/_aliases" not in stub.paths("POST")
 
 
+def test_latest_docs_joins_the_rank_without_adding_rows(cfg, tmp_path):
+    from isel.io import open_duckdb
+
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1), _row(2), _row(3)])
+    # A doc can be on the list twice: two URLs that share a canonical form.
+    prior = pa.table({"doc_id": pa.array([1, 1, 2, 9], pa.uint64()),
+                      "rank": pa.array([7, 5, 0, 3], pa.int64()),
+                      "url": ["u", "v", "w", "x"]})
+    write_parquet_atomic(prior, tmp_path / "list" / "run=r" / "index_shard=00.parquet")
+    glob = str(tmp_path / "list" / "run=r" / "index_shard=*.parquet")
+    rows, ranked, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10, glob)
+    table = reader.read_all()
+    assert rows == 3 and ranked == 2 and table.num_rows == 3
+    got = dict(zip(table["doc_id"].to_pylist(), table["prior_rank"].to_pylist(), strict=True))
+    assert got == {1: 5, 2: 0, 3: None}
+
+
+def test_build_stops_when_too_few_docs_have_a_rank(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1), _row(2)])
+    prior = pa.table({"doc_id": pa.array([1], pa.uint64()), "rank": pa.array([0], pa.int64())})
+    write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
+    with_prior = replace(cfg, "text_index", prior_file=str(tmp_path / "list" / "s.parquet"))
+    with pytest.raises(TextIndexError, match="1 of 2 docs have a rank"):
+        build(with_prior, _client(stub), root)
+    assert stub.indices == {}
+    out = build(replace(with_prior, "text_index", prior_min_coverage=0.5), _client(stub), root)
+    assert out["prior_docs"] == 1
+    docs = stub.indices[out["index"]]["docs"]
+    assert PRIOR_FIELD in docs["1"] and PRIOR_FIELD not in docs["2"]
+
+
+def test_query_body_rescores_the_best_text_matches_with_the_prior(base_cfg):
+    t = replace(base_cfg, "text_index", prior_boost=1.5, prior_scaling_factor=2.0,
+                host_cap=2, fetch_k=50, prior_depth=1500, shards=8).text_index
+    body = query_body(t, "a b")
+    # Only the text query selects docs, and the prior reorders the best of them.
+    assert body["query"]["multi_match"]["query"] == "a b"
+    assert body["rescore"] == {"window_size": 188, "query": {"rescore_query": {"rank_feature": {
+        "field": PRIOR_FIELD, "boost": 1.5, "log": {"scaling_factor": 2.0}}}}}
+    assert body["size"] == 50 and body["_source"] == ["url"]
+    # OpenSearch rejects `rescore` beside a sort on anything but the score.
+    assert "sort" not in body
+
+
+def test_search_orders_equal_scores_by_doc_id(cfg, stub):
+    t = replace(cfg, "text_index", host_cap=0, k=3, prior_boost=1.0).text_index
+    stub.indices["isel-text-x"] = {"docs": {str(i): {"url": f"https://{i}.com/"} for i in (9, 10, 11)},
+                                   "body": {}, "settings": {}}
+    stub.aliases["isel-text"] = {"isel-text-x"}
+    stub.hits = {"q": ["11", "10", "9"]}
+    stub.scores = {"11": 1.0, "10": 1.0, "9": 1.0}
+    ids, _ = search(_client(stub), t, "q")
+    # As numbers: as strings, "10" comes before "9".
+    assert ids == ["9", "10", "11"]
+
+
+def test_cap_hosts_fills_the_gaps_with_later_hits():
+    def hit(i, url):
+        return {"_id": str(i), "_source": {"url": url}}
+
+    hits = [hit(1, "https://www.a.com/1"), hit(2, "https://a.com/2"), hit(3, "http://a.com/3"),
+            hit(4, "https://b.com/"), hit(5, "https://sub.a.com/"), hit(6, "https://c.com/")]
+    # `www.` is the same host; a subdomain is not.
+    assert cap_hosts(hits, 2, 3) == ["1", "2", "4"]
+    assert cap_hosts(hits, 2, 10) == ["1", "2", "4", "5", "6"]
+
+
+def test_search_reads_more_hits_than_it_returns_when_it_caps_hosts(cfg, stub):
+    t = replace(cfg, "text_index", host_cap=1, fetch_k=4, k=2, prior_boost=1.0).text_index
+    stub.indices["isel-text-x"] = {"docs": {
+        "1": {"url": "https://a.com/1"}, "2": {"url": "https://a.com/2"},
+        "3": {"url": "https://b.com/"}, "4": {"url": "https://c.com/"}},
+        "body": {}, "settings": {}}
+    stub.aliases["isel-text"] = {"isel-text-x"}
+    stub.hits = {"q": ["1", "2", "3", "4"]}
+    ids, _ = search(_client(stub), t, "q")
+    assert ids == ["1", "3"]
+
+
 @pytest.mark.parametrize("query_type, key", [
     ("combined_fields", "combined_fields"), ("most_fields", "multi_match"),
     ("best_fields", "multi_match")])
 def test_query_body(base_cfg, query_type, key):
-    t = replace(base_cfg, "text_index", query_type=query_type).text_index
+    t = replace(base_cfg, "text_index", query_type=query_type, prior_boost=0.0, host_cap=0,
+                fields=["title^2", "description", "body"]).text_index
     body = query_body(t, 'a "b" OR c:d')
     assert body["query"][key]["query"] == 'a "b" OR c:d'
     assert body["size"] == 10 and body["_source"] is False
@@ -238,8 +332,8 @@ def test_evaluate_golden_counts_pairs_by_doc_id(cfg, stub, tmp_path):
     write_parquet_atomic(pa.Table.from_pylist(golden, schema=GOLDEN_SCHEMA),
                          golden_path(cfg.work_dir))
     spec = json.loads((ROOT / "config/text_index/icu.json").read_text())
-    stub.indices["isel-text-x"] = {"docs": {ids[0]: {}, ids[1]: {}}, "body": spec,
-                                   "settings": {}}
+    stub.indices["isel-text-x"] = {"docs": {ids[0]: {"url": urls[0]}, ids[1]: {"url": urls[1]}},
+                                   "body": spec, "settings": {}}
     stub.aliases["isel-text"] = {"isel-text-x"}
     stub.hits = {"alpha": [ids[1], "999"], "beta": []}
     out = evaluate_golden(cfg, _client(stub), 20)
@@ -383,6 +477,15 @@ def test_build_and_eval_reject_a_field_the_index_lacks(cfg, stub, tmp_path):
     with pytest.raises(TextIndexError, match="one analyzer"):
         build(replace(cfg, "text_index", query_type="combined_fields",
                       fields=["title", "url.text"]), _client(stub), root)
+
+
+def test_eval_rejects_an_index_without_the_prior_field(cfg, stub):
+    spec = json.loads((ROOT / "config/text_index/icu.json").read_text())
+    del spec["mappings"]["properties"][PRIOR_FIELD]
+    stub.indices["isel-text-x"] = {"docs": {}, "body": spec, "settings": {}}
+    stub.aliases["isel-text"] = {"isel-text-x"}
+    with pytest.raises(TextIndexError, match=f"{PRIOR_FIELD} is not a rank_feature"):
+        evaluate_golden(replace(cfg, "text_index", prior_boost=1.0), _client(stub), 20)
 
 
 def test_a_failed_shard_fails_the_eval(cfg, stub, tmp_path):

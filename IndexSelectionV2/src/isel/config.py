@@ -240,6 +240,14 @@ class TextIndexCfg:
     flood_free_ratio: float
     expected_bytes_per_doc: int
     progress_every: int
+    fetch_k: int
+    host_cap: int
+    prior_file: str
+    prior_scale: float
+    prior_scaling_factor: float
+    prior_boost: float
+    prior_depth: int
+    prior_min_coverage: float
 
 
 @dataclass(frozen=True)
@@ -536,6 +544,13 @@ def _validate_text_index(cfg: Config, need: Any) -> None:
     need(0 < t.flood_free_ratio < 1, "text_index.flood_free_ratio must be in (0, 1)")
     need(min(t.retries, t.backoff_s, t.warmup_queries) >= 0,
          "text_index.retries, backoff_s and warmup_queries must be >= 0")
+    need(t.fetch_k >= t.k, "text_index.fetch_k must be >= k")
+    need(t.host_cap >= 0, "text_index.host_cap must be >= 0")
+    need(t.prior_boost >= 0, "text_index.prior_boost must be >= 0")
+    need(t.prior_depth >= t.fetch_k, "text_index.prior_depth must be >= fetch_k")
+    need(min(t.prior_scale, t.prior_scaling_factor) > 0,
+         "text_index.prior_scale and prior_scaling_factor must be > 0")
+    need(0 <= t.prior_min_coverage <= 1, "text_index.prior_min_coverage must be in [0, 1]")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:

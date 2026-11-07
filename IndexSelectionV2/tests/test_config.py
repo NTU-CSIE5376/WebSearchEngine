@@ -61,6 +61,13 @@ def test_base_config_loads(base_cfg):
     ("[text_index]\nexpected_bytes_per_doc = 0\n", "text_index sizes and counts must be > 0"),
     ("[text_index]\nprogress_every = 0\n", "text_index sizes and counts must be > 0"),
     ("[text_index]\nflood_free_ratio = 1.0\n", "flood_free_ratio must be in"),
+    ("[text_index]\nfetch_k = 5\n", "fetch_k must be >= k"),
+    ("[text_index]\nhost_cap = -1\n", "host_cap must be >= 0"),
+    ("[text_index]\nprior_boost = -1.0\n", "prior_boost must be >= 0"),
+    ("[text_index]\nprior_depth = 100\n", "prior_depth must be >= fetch_k"),
+    ("[text_index]\nprior_scale = 0.0\n", "prior_scale and prior_scaling_factor must be > 0"),
+    ("[text_index]\nprior_scaling_factor = 0.0\n", "prior_scale and prior_scaling_factor"),
+    ("[text_index]\nprior_min_coverage = 1.5\n", "prior_min_coverage must be in"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):

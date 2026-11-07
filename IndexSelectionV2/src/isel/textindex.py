@@ -29,13 +29,16 @@ import re
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from datetime import datetime
 from hashlib import sha256
+from math import ceil
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import duckdb
 import pyarrow as pa
@@ -59,6 +62,8 @@ RETRY_STATUS = (429, 503)
 RESEND_STATUS = (None, *RETRY_STATUS)
 DOC_FIELDS = ("url", "lang", "title", "description", "body")
 TEXT_FIELDS = ("title", "description", "body")
+# The selection model's list rank as a static score, the `rank_feature` of the mapping.
+PRIOR_FIELD = "sel_prior"
 # Bulk-load mode: nothing searches the new index before the swap, and the Parquet is
 # the source of truth, so a lost translog only costs a rebuild.
 BUILD_SETTINGS = {"number_of_replicas": 0, "refresh_interval": "-1",
@@ -152,14 +157,22 @@ class OpenSearch:
         raise AssertionError("unreachable")
 
 
-def bulk_payloads(batches: Iterable[pa.RecordBatch], max_bytes: int) -> Iterator[bytes]:
-    """NDJSON `_bulk` bodies of at most `max_bytes`; a larger document goes alone."""
+def bulk_payloads(batches: Iterable[pa.RecordBatch], max_bytes: int,
+                  prior_scale: float) -> Iterator[bytes]:
+    """NDJSON `_bulk` bodies of at most `max_bytes`; a larger document goes alone.
+
+    A row's `prior_rank` becomes `prior_scale / (rank + 1)`: a `rank_feature` must be
+    positive and larger must mean better. A row without a rank gets no such field.
+    """
     parts: list[bytes] = []
     size = 0
     for batch in batches:
         for row in batch.to_pylist():
             doc = {"doc_id": row["doc_id"],
                    **{f: row[f] for f in DOC_FIELDS if row[f] is not None}}
+            rank = row.get("prior_rank")
+            if rank is not None:
+                doc[PRIOR_FIELD] = prior_scale / (rank + 1)
             line = (b'{"index":{"_id":"%d"}}\n' % row["doc_id"]
                     + json.dumps(doc, ensure_ascii=False).encode() + b"\n")
             if parts and size + len(line) > max_bytes:
@@ -171,30 +184,42 @@ def bulk_payloads(batches: Iterable[pa.RecordBatch], max_bytes: int) -> Iterator
         yield b"".join(parts)
 
 
-def latest_docs(con: duckdb.DuckDBPyConnection, text_root: Path,
-                batch_rows: int) -> tuple[int, pa.RecordBatchReader]:
-    """The newest row of each doc_id under `text_root`, as (rows, batches).
+def latest_docs(con: duckdb.DuckDBPyConnection, text_root: Path, batch_rows: int,
+                prior_file: str = "") -> tuple[int, int, pa.RecordBatchReader]:
+    """The newest row of each doc_id under `text_root`, as (rows, rows with a rank, batches).
 
     The first pass picks each doc's winner without the page bodies, so they are never
     sorted; the second pass reads the winners. A row with text beats any row without it,
     such as an empty WAF page, which older archives stored; a doc with no text still
     gets a document, as its URL's words can find it. A tie on `fetched_at` goes to the
     larger file name. `*.parquet` skips `.parquet.tmp` files.
+
+    `prior_file` is a Parquet glob of the list's `doc_id` and `rank`. A doc can be on the
+    list twice, under two URLs with one canonical form, so it takes its best rank and the
+    join adds no rows.
     """
     if next(text_root.glob("**/*.parquet"), None) is None:
         raise TextIndexError(f"no text Parquet under {text_root}")
     files = (f"read_parquet({sql_str(str(text_root / '**' / '*.parquet'))}, "
              "filename=true, hive_partitioning=false)")
-    con.execute(f"""CREATE OR REPLACE TEMP TABLE winner AS
-        SELECT doc_id, max({{'text': coalesce(text_len, 0) > 0 OR title IS NOT NULL
-                                     OR description IS NOT NULL,
-                             't': fetched_at, 'f': filename}}) AS win FROM {files}
-        GROUP BY doc_id""")
-    (rows,) = con.execute("SELECT count(*) FROM winner").fetchone()
-    reader = con.execute(f"""SELECT s.doc_id, {', '.join(f's.{f}' for f in DOC_FIELDS)}
+    winners = f"""SELECT doc_id, max({{'text': coalesce(text_len, 0) > 0 OR title IS NOT NULL
+                                               OR description IS NOT NULL,
+                                       't': fetched_at, 'f': filename}}) AS win FROM {files}
+                  GROUP BY doc_id"""
+    if prior_file:
+        ranks = (f"SELECT doc_id, min(rank) AS prior_rank FROM read_parquet("
+                 f"{sql_str(prior_file)}, hive_partitioning=false) GROUP BY doc_id")
+        source = f"""SELECT w.doc_id, w.win, r.prior_rank FROM ({winners}) w
+                     LEFT JOIN ({ranks}) r ON w.doc_id = r.doc_id"""
+    else:
+        source = f"SELECT doc_id, win, NULL::BIGINT AS prior_rank FROM ({winners})"
+    con.execute(f"CREATE OR REPLACE TEMP TABLE winner AS {source}")
+    rows, ranked = con.execute("SELECT count(*), count(prior_rank) FROM winner").fetchone()
+    reader = con.execute(f"""SELECT s.doc_id, {', '.join(f's.{f}' for f in DOC_FIELDS)},
+               w.prior_rank
         FROM {files} s JOIN winner w ON s.doc_id = w.doc_id
          AND s.fetched_at = w.win.t AND s.filename = w.win.f""").to_arrow_reader(batch_rows)
-    return int(rows), reader
+    return int(rows), int(ranked), reader
 
 
 def _text_bytes(batch: pa.RecordBatch) -> int:
@@ -217,7 +242,7 @@ def _load(client: OpenSearch, t: TextIndexCfg, index: str,
     started = time.monotonic()
     with ThreadPoolExecutor(t.bulk_workers) as pool:
         pending: set[Future[int]] = set()
-        for payload in bulk_payloads(counted(), t.bulk_bytes):
+        for payload in bulk_payloads(counted(), t.bulk_bytes, t.prior_scale):
             if len(pending) >= t.bulk_workers:
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
                 indexed += sum(f.result() for f in done)
@@ -309,6 +334,10 @@ def _check_fields(properties: dict[str, Any], t: TextIndexCfg) -> None:
         analyzers[name] = field.get("analyzer", "default")
     if t.query_type == "combined_fields" and len(set(analyzers.values())) > 1:
         raise TextIndexError(f"combined_fields needs one analyzer, got {analyzers}")
+    # A `rescore_query` on a field the index lacks matches nothing, so the prior would
+    # quietly stop counting on an older index.
+    if t.prior_boost > 0 and properties.get(PRIOR_FIELD, {}).get("type") != "rank_feature":
+        raise TextIndexError(f"{PRIOR_FIELD} is not a rank_feature field of the index")
 
 
 def _physical(alias: str) -> re.Pattern[str]:
@@ -388,7 +417,10 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
     with _build_lock(cfg.work_dir / "text_index" / "build.lock"):
         con = open_duckdb(cfg, cfg.work_dir / "text_index" / "tmp")
         try:
-            rows, batches = latest_docs(con, text_root, t.read_batch_rows)
+            rows, ranked, batches = latest_docs(con, text_root, t.read_batch_rows, t.prior_file)
+            if t.prior_file and ranked < t.prior_min_coverage * rows:
+                raise TextIndexError(f"only {ranked} of {rows} docs have a rank in "
+                                     f"{t.prior_file}")
             # A build killed before it could delete its index left it unaliased and
             # without a manifest; it would add to this build's disk peak.
             aliased = set(_aliased(client, t.alias))
@@ -451,6 +483,7 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
             "load_s": round(load_s, 3), "total_s": round(total_s, 3),
             "docs_per_s_load": round(rows / load_s, 1) if load_s else None,
             "previous": previous, "deleted": deleted, "strays": strays,
+            "prior_file": t.prior_file, "prior_docs": ranked,
             "settings_sha256": sha256(spec_bytes).hexdigest(), "config_sha256": cfg.sha256(),
             "code_version": code_version(),
         }
@@ -461,25 +494,57 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
 def query_body(t: TextIndexCfg, text: str) -> dict[str, Any]:
     """A search for `text` over `t.fields`; never `query_string`, so no query syntax.
 
-    Equal scores are ordered by doc id, so the top k is the same after every build.
+    Equal scores are ordered by doc id, so the top k is the same after every build. The
+    prior is a `rescore` of the best `t.prior_depth` text matches: over every match, it
+    lets a popular page with a weak match replace a good match. `rescore` rules out the
+    doc id sort, so `search` breaks those ties. `collapse` keeps one hit per host, while
+    Google's top 10 often has two, so `search` also applies the host cap.
     """
     if t.query_type == "combined_fields":
         query = {"combined_fields": {"query": text, "fields": t.fields}}
     else:
         query = {"multi_match": {"query": text, "fields": t.fields, "type": t.query_type}}
-    return {"query": query, "size": t.k, "sort": [{"_score": "desc"}, {"doc_id": "asc"}],
-            "_source": False, "track_total_hits": False}
+    body: dict[str, Any] = {"query": query, "size": t.fetch_k if t.host_cap else t.k,
+                            "_source": ["url"] if t.host_cap else False,
+                            "track_total_hits": False}
+    if t.prior_boost > 0:
+        body["rescore"] = {
+            "window_size": ceil(t.prior_depth / t.shards),  # the window is per shard
+            "query": {"rescore_query": {"rank_feature": {
+                "field": PRIOR_FIELD, "boost": t.prior_boost,
+                "log": {"scaling_factor": t.prior_scaling_factor}}}}}
+    else:
+        body["sort"] = [{"_score": "desc"}, {"doc_id": "asc"}]
+    return body
 
 
 # A shard that fails a search fails it, instead of quietly returning fewer hits.
 WHOLE = "allow_partial_search_results=false"
 
 
+def cap_hosts(hits: list[dict[str, Any]], cap: int, k: int) -> list[str]:
+    """The ids of the best `k` hits with at most `cap` per host; `www.` is the same host."""
+    seen: Counter[str] = Counter()
+    ids: list[str] = []
+    for hit in hits:
+        host = (urlsplit(hit["_source"]["url"]).hostname or "").removeprefix("www.")
+        if seen[host] < cap:
+            seen[host] += 1
+            ids.append(hit["_id"])
+            if len(ids) == k:
+                break
+    return ids
+
+
 def search(client: OpenSearch, t: TextIndexCfg, text: str) -> tuple[list[str], float]:
     """The ids of the top `t.k` hits and the server's `took` in ms."""
     reply = client.call("POST", f"/{t.alias}/_search?{WHOLE}", query_body(t, text),
                         resend=True)
-    return [h["_id"] for h in reply["hits"]["hits"]], float(reply["took"])
+    hits = reply["hits"]["hits"]
+    if t.prior_boost > 0:
+        hits.sort(key=lambda h: (-h["_score"], int(h["_id"])))
+    ids = cap_hosts(hits, t.host_cap, t.k) if t.host_cap else [h["_id"] for h in hits]
+    return ids, float(reply["took"])
 
 
 def present_ids(client: OpenSearch, alias: str, ids: list[str], chunk: int) -> set[str]:
@@ -526,6 +591,7 @@ def evaluate_golden(cfg: Config, client: OpenSearch, batch_id: int,
     present = present_ids(client, t.alias, every, t.lookup_chunk)
     out = {"batch_id": batch_id, "alias": t.alias, "index": _aliased(client, t.alias),
            "k": t.k, "query_type": t.query_type, "fields": t.fields,
+           "prior_boost": t.prior_boost, "prior_depth": t.prior_depth, "host_cap": t.host_cap,
            **run_eval(judged, ranked, took, present, tags, t.k, cfg.eval.bootstrap_samples,
                       cfg.eval.bootstrap_seed)}
     run = utc_id(now)
