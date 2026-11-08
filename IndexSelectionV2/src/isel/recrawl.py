@@ -136,15 +136,25 @@ def _cycle_lock(cur: psycopg.Cursor) -> None:
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_CYCLE,))
 
 
+def _due_tiers(select: str, host: str) -> tuple[str, str]:
+    """`(SELECT {select} ...)` over the due docs of `host`: first fetches, then revisits.
+
+    Each subquery repeats its tier's partial-index predicate, so it probes
+    `doc_due_first` or `doc_due_revisit` by host. A per-host lookup without the
+    `fetched_at` test matches neither index and scans all of `recrawl.doc`.
+    """
+    first, revisit = (f"(SELECT {select} FROM recrawl.doc d WHERE d.host_id = {host} "
+                      f"AND d.rank IS NOT NULL AND d.{_DUE} AND d.fetched_at {test})"
+                      for test in ("IS NULL", "IS NOT NULL"))
+    return first, revisit
+
+
 def _refresh_best_rank(cur: psycopg.Cursor, hosts: Iterable[int]) -> None:
     ids = sorted(set(hosts))
     if ids:
-        # One index probe per tier (doc_due_first, doc_due_revisit).
-        due = f"FROM recrawl.doc d WHERE d.host_id = h.host_id AND d.rank IS NOT NULL AND d.{_DUE}"
+        first, revisit = _due_tiers("min(d.rank)", "h.host_id")
         cur.execute(
-            f"UPDATE recrawl.host h SET best_rank = coalesce((SELECT min(d.rank) {due} "
-            f"AND d.fetched_at IS NULL), (SELECT min(d.rank) {due} "
-            f"AND d.fetched_at IS NOT NULL) + {REVISIT_RANK}) "
+            f"UPDATE recrawl.host h SET best_rank = coalesce({first}, {revisit} + {REVISIT_RANK}) "
             "WHERE h.host_id = ANY(%s::bigint[])", (ids,))
 
 
@@ -205,10 +215,9 @@ def sync(cfg: Config, conn: psycopg.Connection,
             f"WHEN fetched_at IS NULL THEN 0 ELSE {REVISIT_RANK} END) AS r "
             f"FROM recrawl.doc WHERE rank IS NOT NULL AND {_DUE} GROUP BY host_id) m "
             "WHERE h.host_id = m.host_id AND h.best_rank IS DISTINCT FROM m.r")
-        cur.execute(
-            "UPDATE recrawl.host h SET best_rank = NULL WHERE best_rank IS NOT NULL AND "
-            "NOT EXISTS (SELECT 1 FROM recrawl.doc d WHERE d.host_id = h.host_id "
-            f"AND d.rank IS NOT NULL AND d.{_DUE})")
+        first, revisit = _due_tiers("1", "h.host_id")
+        cur.execute("UPDATE recrawl.host h SET best_rank = NULL WHERE best_rank IS NOT NULL "
+                    f"AND NOT EXISTS {first} AND NOT EXISTS {revisit}")
     conn.execute("ANALYZE recrawl.host")
     conn.execute("ANALYZE recrawl.doc")
     (hosts,) = conn.execute("SELECT count(*) FROM recrawl.host WHERE best_rank IS NOT NULL"
@@ -687,12 +696,14 @@ def _ready_hosts(cfg: Config, cur: psycopg.Cursor, now: datetime,
             docs.setdefault(h, []).append((doc_id, url))
         idle = [h for h, _ in hosts if h not in docs]
         if idle:
+            # MATERIALIZED: m.n is read twice below, and an inlined m would run both
+            # subqueries twice per host.
+            first, revisit = _due_tiers("min(d.due_at)", "u.host_id")
             cur.execute(
+                f"WITH m AS MATERIALIZED (SELECT u.host_id, least({first}, {revisit}) AS n "
+                "FROM unnest(%s::bigint[]) AS u(host_id)) "
                 "UPDATE recrawl.host h SET next_at = m.n, best_rank = CASE WHEN m.n IS NULL "
-                "THEN NULL ELSE h.best_rank END FROM (SELECT u.host_id, (SELECT min(d.due_at) "
-                "FROM recrawl.doc d WHERE d.host_id = u.host_id AND d.rank IS NOT NULL "
-                f"AND d.{_DUE}) AS n FROM unnest(%s::bigint[]) AS u(host_id)) m "
-                "WHERE h.host_id = m.host_id", (idle,))
+                "THEN NULL ELSE h.best_rank END FROM m WHERE h.host_id = m.host_id", (idle,))
         for h, _ in hosts:
             if h in docs:
                 yield h, docs[h]

@@ -757,6 +757,66 @@ def test_recrawl_reads_due_docs_tier_by_tier_from_their_index(selectdb, tmp_path
         admin.close()
 
 
+def _doc_scans(plan):
+    return [n for n, _ in _nodes(plan["Plan"]) if n.get("Relation Name") == "doc"]
+
+
+def _fail_until(admin, url, due):
+    admin.execute("UPDATE recrawl.doc SET state = 'failed', due_at = %s WHERE doc_id = %s",
+                  (due, pg_doc_id(url)))
+
+
+def test_recrawl_idle_host_waits_for_its_earliest_due_doc(selectdb, tmp_path, stub):
+    """A ready host with every due doc in backoff waits for the earliest of them, read
+    through the tier indexes: one probe per tier, never a scan of doc."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, B1, C1])
+        _revisit(admin, A2)
+        hour, two = T0 + timedelta(hours=1), T0 + timedelta(hours=2)
+        _fail_until(admin, A1, hour)             # a first fetch in backoff
+        _fail_until(admin, A2, two)              # a revisit in backoff
+        admin.execute("UPDATE recrawl.doc SET state = 'gone' WHERE doc_id = %s",
+                      (pg_doc_id(C1),))          # C keeps a best_rank but has no due doc
+        a_rank = _best_ranks(admin)["a.example"]
+        plans = _plans(admin)
+        assert plan_cycle(cfg, admin, T0, _api(stub))["jobs"] == 1
+        assert stub.posts == [[B1]]
+        assert _host(admin, "a.example") == (None, hour)
+        assert _host(admin, "c.example") == (None, None)
+        assert _best_ranks(admin)["a.example"] == a_rank
+        assert _best_ranks(admin)["c.example"] is None
+        idle = [p for p in plans if "min(d.due_at)" in p["Query Text"]]
+        assert len(idle) == 1
+        scans = sorted((n["Node Type"], n.get("Index Name", "")) for n in _doc_scans(idle[0]))
+        assert scans == [("Index Scan", "doc_due_first"), ("Index Scan", "doc_due_revisit")]
+    finally:
+        admin.close()
+
+
+def test_recrawl_sync_clears_best_rank_through_the_tier_indexes(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, C1])
+        admin.execute("UPDATE recrawl.doc SET state = 'gone' WHERE doc_id = %s",
+                      (pg_doc_id(C1),))
+        plans = _plans(admin)
+        sync(cfg, admin, now=lambda: OPEN)
+        assert _best_ranks(admin)["c.example"] is None
+        assert _best_ranks(admin)["a.example"] is not None
+        clear = [p for p in plans if "SET best_rank = NULL" in p["Query Text"]]
+        assert len(clear) == 1
+        scans = _doc_scans(clear[0])
+        assert scans and {n.get("Index Name") for n in scans} <= {"doc_due_first",
+                                                                 "doc_due_revisit"}
+    finally:
+        admin.close()
+
+
 def test_recrawl_report_counts_real_text_apart_from_challenge_pages(selectdb, tmp_path, stub):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub)
     r = cfg.recrawl
