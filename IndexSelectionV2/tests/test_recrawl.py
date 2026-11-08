@@ -170,6 +170,9 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
         (("result_ttl_days = 3 ", "result_ttl_days = 61 "), "result_ttl_days"),
         (("archive_workers = 8", "archive_workers = 0"), "must be > 0"),
         (("max_resend = 20 ", "max_resend = -1 "), "max_resend"),
+        (("real_text_min_chars = 200 ", "real_text_min_chars = -1 "), "real_text_min_chars"),
+        (('"f1dbc6923af7384830c2b832bc9859adacbc3b70"', '"F1DBC6923AF7384830C2B832BC"'),
+         "challenge_sha1"),
     ]
     for (old, new), message in cases:
         assert old in BASE.read_text(), old

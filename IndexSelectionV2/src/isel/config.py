@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import tomllib
 import types
 import typing
@@ -217,6 +218,8 @@ class RecrawlCfg:
     min_free_gb: int
     max_body_chars: int
     sync_chunk_rows: int
+    real_text_min_chars: int
+    challenge_sha1: list[str]
 
 
 @dataclass(frozen=True)
@@ -472,6 +475,9 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "result_ttl_days")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
+    need(r.real_text_min_chars >= 0, "recrawl.real_text_min_chars must be >= 0")
+    need(all(re.fullmatch(r"[0-9a-f]{40}", h) for h in r.challenge_sha1),
+         "recrawl.challenge_sha1 must be 40-char lowercase hex SHA-1s")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:

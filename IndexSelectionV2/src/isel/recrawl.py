@@ -781,11 +781,14 @@ def _days(left: int, per_day: int) -> float | None:
     return round(left / per_day, 1) if per_day else None
 
 
-def capacity_report(conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
+def capacity_report(r: RecrawlCfg, conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
     """Progress of the live list, measured: docs left and docs fetched in the last day.
 
     No rate is assumed: the crawler's pace shows in `fetched_at`. Days left are the
     docs left over the last day's fetches, for the list and for its largest host.
+    `fetched` counts every 2xx HTML; `real_text` counts the fetched 200s with at least
+    `real_text_min_chars` of body that are not a shared challenge page, and `waf_202` the
+    fetched 202s (AWS WAF challenges). Both only report: outcomes do not change.
     """
     rows = conn.execute(
         "SELECT count(*), count(*) FILTER (WHERE state <> 'fetched'), "
@@ -794,9 +797,16 @@ def capacity_report(conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
         (now - timedelta(days=1),)).fetchall()
     docs, left, day = (np.array(c, dtype=np.int64) for c in zip(*rows, strict=True)) \
         if rows else (np.zeros(0, dtype=np.int64),) * 3
-    states = dict(conn.execute("SELECT state, count(*) FROM recrawl.doc "
-                               "WHERE rank IS NOT NULL GROUP BY state").fetchall())
+    counts = conn.execute(
+        "SELECT state, count(*), count(*) FILTER (WHERE state = 'fetched' "
+        "AND http_status = 200 AND text_len >= %s AND payload_sha1 IS NOT NULL "
+        "AND payload_sha1 <> ALL(%s::text[])), "
+        "count(*) FILTER (WHERE state = 'fetched' AND http_status = 202) "
+        "FROM recrawl.doc WHERE rank IS NOT NULL GROUP BY state",
+        (r.real_text_min_chars, r.challenge_sha1)).fetchall()
+    states = {state: n for state, n, _, _ in counts}
     report = {"docs": int(docs.sum()), "hosts": int(docs.size), "states": states,
+              "real_text": sum(c[2] for c in counts), "waf_202": sum(c[3] for c in counts),
               "max_host_docs": int(docs.max()) if docs.size else 0,
               "left": int(left.sum()), "fetched_1d": int(day.sum()),
               "days_left": _days(int(left.sum()), int(day.sum())), "largest_left": None}
