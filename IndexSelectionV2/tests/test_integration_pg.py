@@ -786,6 +786,34 @@ def test_recrawl_plan_drops_an_invalid_url_and_sends_the_rest(selectdb, tmp_path
         admin.close()
 
 
+def test_recrawl_sends_a_url_percent_encoded_and_keeps_the_stored_one(selectdb, tmp_path,
+                                                                     stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    brackets, pipe = "https://d.example/matches/[seo]/[h2h]", "https://e.example/a|b/c"
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, brackets, pipe])
+        stub.reject = {brackets}             # as `validators.url` judges it; the stub rejects "|"
+        got = plan_cycle(cfg, admin, T0, _api(stub))
+        assert (got["jobs"], got["invalid"], got["docs"]) == (1, 0, 3)
+        assert stub.posts == [[A1, "https://d.example/matches/%5Bseo%5D/%5Bh2h%5D",
+                               "https://e.example/a%7Cb/c"]]
+        ((batch, job_id, _, doc_ids),) = _jobs(admin)
+        assert doc_ids == [pg_doc_id(u) for u in (A1, brackets, pipe)]
+        assert _doc(admin, brackets, "url") == (brackets,)
+        FakeCrawler(stub, {u: ENGLISH for u in stub.manifest(job_id)["urls"]}).take(T0)
+        _poll(cfg, admin, stub, T0)
+        assert archive_cycle(cfg, admin, T0)["texts"] == 3
+        for url in (brackets, pipe):
+            assert _doc(admin, url, "state", "url") == ("fetched", url)
+        text = Path(cfg.recrawl.text_root) / f"fetch_date=20261015/job-{batch}.parquet"
+        assert sorted(pq.read_table(text, columns=["url"]).column("url").to_pylist()) == sorted(
+            [A1, brackets, pipe])
+    finally:
+        admin.close()
+
+
 @pytest.mark.parametrize("answer", [
     (400, "Invalid request body"),
     (415, "Content-Type must be application/json"),

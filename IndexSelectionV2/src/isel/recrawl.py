@@ -29,7 +29,9 @@ Results map to docs by position: `request.json` lists the URLs in the order
 sent, after the API canonicalizes them and drops duplicates, and the crawler
 that owns each one (`crawler_ids`). Result n is `crawler_{crawler_ids[n]:02d}/
 {n:05d}.json`, as the API resolves its downloads. The archive checks the order
-before it trusts it (`map_results`).
+before it trusts it (`map_results`). URLs go out percent-encoded (`wire_url`),
+as the API rejects a raw `[`, `]` or `|`; a doc keeps its stored URL in
+`recrawl.doc` and in its text rows.
 
 Every frontier transaction takes one advisory lock, so plan, archive and sync
 never interleave their updates and cannot deadlock.
@@ -63,7 +65,7 @@ from isel.config import Config, RecrawlCfg
 from isel.extract import extract
 from isel.io import TMP_SUFFIX, commit_file, open_duckdb, sql_str, write_parquet_atomic
 from isel.schema import DUE_STATES, OPEN_JOB_STATES
-from isel.urlnorm import md5_number_lower
+from isel.urlnorm import md5_number_lower, wire_url
 
 LOCK_CYCLE = 0x15E1_DB02      # xact lock held by every frontier transaction
 LOCK_INSTANCE = {"sync": 0x15E1_DB03, "plan": 0x15E1_DB04, "archive": 0x15E1_DB05}
@@ -345,7 +347,7 @@ def run_planner(cfg: Config, conn: psycopg.Connection, once: bool) -> dict[str, 
 
 @dataclass
 class Job:
-    """A claimed job: its docs in the order their URLs are sent."""
+    """A claimed job: its docs and, in the same order, their URLs as sent (`wire_url`)."""
 
     batch_id: int
     doc_ids: list[int]
@@ -679,7 +681,7 @@ def _claim(cfg: Config, cur: psycopg.Cursor, now: datetime, n_jobs: int) -> list
     jobs = []
     for (batch,), groups in zip(cur.fetchall(), packed, strict=True):
         order = [d for _, docs in groups for d in docs]
-        jobs.append(Job(batch, [d for d, _ in order], [u for _, u in order]))
+        jobs.append(Job(batch, [d for d, _ in order], [wire_url(u) for _, u in order]))
     cur.executemany("INSERT INTO recrawl.job (batch_id, doc_ids, state, claimed_at) "
                     "VALUES (%s, %s, 'claimed', %s)",
                     [(j.batch_id, j.doc_ids, now) for j in jobs])
@@ -704,8 +706,8 @@ def _send(cfg: Config, conn: psycopg.Connection, api: CrawlerApi, jobs: list[Job
     """POSTs claimed jobs in order and records each answer (docs/03 §3.6).
 
     - 200: the job is `submitted` under its `job_id`.
-    - 400 "... at index N": that URL is unfetchable; it becomes `gone` and the
-      rest is sent again, at most `max_resend` times.
+    - 400 "... at index N": the API rejects that URL even percent-encoded; it
+      becomes `gone` and the rest is sent again, at most `max_resend` times.
     - Any other 4xx or 5xx: the API accepted nothing. The job is released,
       sending stops, and the planner pauses `api_backoff_s`.
     - No answer: acceptance is unknown, so the job stays `claimed` (the claim

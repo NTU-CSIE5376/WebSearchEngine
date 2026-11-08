@@ -256,12 +256,15 @@ committed, then sent.
    crawler regroups them by host anyway. Docs become `dispatched`, each host gets
    `batch_id`, its `next_at` stays as it is, and the claim commits. The host is ready
    again once that batch is drained, or its job is applied or lost.
-7. **Send** each job and record the answer:
+7. **Send** each job and record the answer. URLs go out percent-encoded (`wire_url`):
+   path, query and fragment escape what RFC 3986 does not allow there, such as `[`, `]`
+   and `|`, which the API's `validators.url` rejects; existing `%XX` escapes, scheme and
+   host stay as they are. A doc keeps its stored URL, its `doc_id` and its text rows' `url`.
 
 | Response | Verdict |
 |---|---|
 | 200 with a `job_id` | `submitted` |
-| 400 "Invalid HTTP(S) URL at index N" | doc N becomes `gone` (`invalid_url`); the rest is sent again, at most `max_resend` (20) times |
+| 400 "Invalid HTTP(S) URL at index N" | the API rejects doc N even encoded: it becomes `gone` (`invalid_url`); the rest is sent again, at most `max_resend` (20) times |
 | other 400, 415, 500, 503 | nothing accepted: `lost`, docs released; pause `api_backoff_s`; unsent jobs released |
 | no reply, or 200 without a usable `job_id` | unknown: the job stays `claimed` until the claim timeout; unsent jobs released |
 
