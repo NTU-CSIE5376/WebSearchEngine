@@ -163,7 +163,9 @@ def test_build_search_and_eval(node, tmp_path):
     assert [h["_id"] for h in reply["hits"]["hits"]] == [str(i) for i in twin_ids]
 
 
-def test_the_prior_reorders_only_the_best_text_matches(node, tmp_path):
+# The sum adds 4 points per factor of 10 in rank; the scale multiplies by 1 + 0.444 per factor.
+@pytest.mark.parametrize(("mode", "boost"), [("total", 1.7372), ("multiply", 0.193)])
+def test_the_prior_reorders_only_the_best_text_matches(node, tmp_path, mode, boost):
     bodies = {"strong": "zebra zebra zebra other", "middle": "zebra zebra other other",
               "weak": "zebra other other other", "unrelated": "other other other other"}
     docs = [(f"https://{name}.example.org/", "en", "page", None, body)
@@ -177,7 +179,8 @@ def test_the_prior_reorders_only_the_best_text_matches(node, tmp_path):
     write_parquet_atomic(pa.table({"doc_id": pa.array([doc_id[n] for n in ranks], pa.uint64()),
                                    "rank": pa.array(list(ranks.values()), pa.int64())}), prior)
     cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
-                  alias="isel-text-prior", host_cap=0, prior_file=str(prior),
+                  alias=f"isel-text-prior-{mode}", host_cap=0, prior_file=str(prior),
+                  prior_score_mode=mode, prior_boost=boost,
                   settings_file=str(ROOT / "config/text_index/icu.json"))
     client = OpenSearch(node, 60.0, 2, 1.0)
     assert build(cfg, client, root, datetime(2026, 10, 24, tzinfo=UTC))["prior_docs"] == len(docs)
