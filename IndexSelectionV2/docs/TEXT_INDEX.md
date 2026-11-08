@@ -48,8 +48,10 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   scores by its best-matching field. The type and weights were chosen on half of golden
   batch 20's keywords and confirmed on the other half ([Tuning on batch
   20](#tuning-on-batch-20)); the URL weight came later, on 51M docs. The keyword is never
-  parsed as query syntax. A `rescore` then adds the prior to the best `prior_depth` matches,
-  `prior_boost × ln(1 + sel_prior)`. The client reads `fetch_k` hits and keeps the best `k`
+  parsed as query syntax. A `rescore` then applies the prior to the best `prior_depth` matches:
+  with `prior_score_mode = "multiply"` it scales BM25 by `1 + prior_boost × ln(1 + sel_prior)`,
+  with `"total"` it adds `prior_boost × ln(1 + sel_prior)`. The client reads `fetch_k` hits and
+  keeps the best `k`
   with at most `host_cap` per host, without `www.`.
   Equal scores are ordered by doc id: Lucene would order them by internal doc id, which
   concurrent loading assigns differently in every build. Anserini fixed the same problem
@@ -583,6 +585,64 @@ It holds. The other scripts of batch 20 pass only because the upper bound is exa
     against 110,000 to 134,000 before. The planner sent the same number of jobs and Host2's
     CPU was over 70 % idle, so the cause is open.
 
+### Second round on dev, 2026-11-08
+
+The ranking above, R0, was the simplest of three candidates that dev could not tell apart. A
+second rule (`rank-r2/rule.md`), written before any candidate was scored, asked whether a
+scheme from the literature beats it. Only the dev halves of batches 20 and 21 were read
+(1,021 keywords, 1,946 pairs, the same fixed present set); the test halves were not read
+again. Deltas are against R0 with a paired bootstrap over keyword texts, 10,000 draws.
+
+| Family, 107 candidates | Best against R0 |
+|---|---|
+| Sigmoid or saturation of the rank, as `rank_feature` sigmoid ([Craswell et al., SIGIR 2005](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/craswell_sigir05.pdf)) | +0.001 |
+| Log with a floor at rank 1M or 10M | −0.011 |
+| BM25 over its top-10 mean per query ([Long and Suel, VLDB 2003](https://research.engineering.nyu.edu/~suel/papers/order.pdf)); z-scores per query | +0.002; −0.003 |
+| Reciprocal rank fusion of BM25 and list rank ([Cormack et al., SIGIR 2009](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)) | −0.045 |
+| The sum, windows 375 to 10,000 | −0.029 at 375, +0.009 at 4,500, −0.002 at 10,000 |
+| **BM25 × (1 + 4 (g + 1) / 9)**, g = 8 − log10(rank + 1), window 1,500 | +0.008 (SE 0.004) |
+| The same, window 4,500 | **+0.017** (SE 0.005) |
+| The same at 1,500, plus the 50 docs of highest prior with every token in the title or URL | +0.018 (SE 0.005) |
+
+The scale beats the sum because BM25's scale changes by query while the sum adds the same
+points to every query: the best weight per keyword gave 0.472 against 0.418 above.
+
+| Window | Sum (R0's score) | Scale | Scale plus the 50 strong matches |
+|---|---|---|---|
+| 1,500 | 0.4178 | 0.4255 | 0.4358 |
+| 2,000 | 0.4203 | 0.4291 | 0.4353 |
+| 3,000 | 0.4250 | 0.4332 | 0.4358 |
+| 4,500 | 0.4265 | 0.4347 | 0.4363 |
+| 6,000 | 0.4209 | 0.4342 | 0.4363 |
+| 10,000 | 0.4157 | 0.4347 | 0.4358 |
+
+- **The sum peaks at 4,500 and falls after it.** A deeper window lets in more popular pages
+  with a weak match, and a fixed bonus lifts them into the top 10. The scale holds them to
+  their own low text score, so it rises to 4,500 and holds to 10,000.
+- **The 50 strong matches and a deeper window find the same pages.** Together they add
+  nothing, so the second request is not worth it.
+- **Online, on the live alias, 8 shards, window N / 8 per shard:** the scale at 4,500 gives
+  0.4342 (offline 0.4347), and with the strong matches 0.4347. The sum at 1,500 gives 0.4173.
+  The server's `took` p50 is 52 ms for the scale at 4,500, 53 ms for the scale at 1,500 and
+  50 ms for the sum at 1,500.
+- **Who gains.** Against R0, no list-rank bin, script or token count is lower:
+
+  | List rank | Pairs | R0 | Scale, 4,500 |
+  |---|---|---|---|
+  | under 0.1M | 681 | 0.564 | 0.579 |
+  | 0.1–1M | 441 | 0.562 | 0.569 |
+  | 1–5M | 324 | 0.321 | 0.327 |
+  | 5–10M | 153 | 0.222 | 0.268 |
+  | 10–20M | 139 | 0.130 | 0.158 |
+  | 20M or more | 208 | 0.120 | 0.154 |
+
+  Kana (115 pairs, 0.365) and the other scripts (81 pairs, 0.173) do not change. Against BM25
+  alone, pages at list rank 20M or more still lose: 0.231 before any prior.
+- **Limits.** 107 candidates read on the same dev pairs bias the best upward by about 2 to
+  3 SE. +0.017 clears the simultaneous half-width of its own family, the 18 window candidates
+  (0.012), but that family was read after the other two, so it is not claimed across all 107.
+  Batch 22 (created 11-16) is its first clean read, and one batch detects about +0.03.
+
 ## Decision
 
 **OpenSearch 3.9.0 with `config/text_index/icu.json`.** Q, S and M hold:
@@ -613,6 +673,12 @@ crawler restarted, unless much recovery source survives the load.
 [+0.233, +0.302] on batch 20 and +0.240 [+0.188, +0.292] on batch 21, in H/F over the
 query before it. Online stayed within 0.004 of the offline value on both halves of both
 batches.
+
+**Ranking, 2026-11-08: the list rank scales BM25 over the best 4,500.** `prior_score_mode =
+"multiply"`, `prior_boost = 0.19302` (4 / 9 / ln 10), `prior_depth = 4500`. On dev it gives
++0.017 over the 11-07 ranking, offline and online. It was chosen on dev only, before batch 22
+exists. Batch 22 is read once: the ranking stays if the 95 % interval of its gain over the
+11-07 ranking is above 0, and else goes back to `"total"`, 1.7372 and 1,500, with no rebuild.
 
 ## Found on the way
 
@@ -773,3 +839,12 @@ Scripts (sha256 prefix), kept outside the repo:
 | `rk_ltr.py` | `fd02066d0d9d5039` | a learned re-ranker over the same top 1,500, on dev |
 | `rk_golden_rank.py` | `ac37e03a13ef8408` | the true list rank of every present golden doc |
 | `rk_outside.py` | `dac908cb5c74fef1` | where a keyword's tokens occur in the pages outside the top 1,500, on dev |
+| `rank-r2/rule.md` | `8c73111cfe9d7cc6` | the rule of the second round, with its deviations and the frozen batch 22 read |
+| `rk_r2.py` | `308c37b2a5283553` | the 85 transform, scale, normalization and fusion candidates offline, on dev |
+| `rk_dump_firstm.py` | `db77bbc1ef6bd58e` | the strong matches of highest prior and their BM25, for dev keywords |
+| `rk_online_r2.py` | `4c5cdff9fcd7cbc0` | the sum and the scale online at 1,500, on dev |
+| `rk_online_firstm.py` | `4536d0ccad4b5af3` | the scale with the strong matches online, on dev |
+| `rk_dump_deep.py` | `8f60850e97504f2e` | top 10,000 of the query for dev keywords |
+| `rk_deep.py` | `d1d9dc36c01e95a0` | the sum, the scale and the strong matches at windows 1,500 to 10,000, on dev |
+| `rk_online_deep.py` | `39c615abda7778f5` | the scale at deeper windows online, with latency, on dev |
+| `rk_deep_groups.py` | `9b7e99ecedb34320` | H/F by list rank, script and tokens for the sum at 1,500 and the scale at 4,500 |
