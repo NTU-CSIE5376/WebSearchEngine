@@ -294,6 +294,8 @@ prior_file = ""                          # Parquet glob of the list's doc_id and
 prior_scale = 1e9                        # sel_prior = prior_scale / (rank + 1); above the largest
                                          # rank, so log(1 + S) stays close to log(S)
 prior_scaling_factor = 1.0               # rank_feature's log(scaling_factor + S)
+prior_score_mode = "total"               # "total" adds the prior to BM25; "multiply" scales
+                                         # BM25 by 1 + prior_boost × log(scaling_factor + S)
 prior_boost = 1.7372                     # 4 / ln(10): 4 points of score per factor of 10 in rank,
                                          # chosen on 51M docs; 0 drops the prior from the query
 prior_depth = 1500                       # best text matches the prior reorders, split over the

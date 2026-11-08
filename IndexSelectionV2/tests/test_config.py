@@ -64,6 +64,7 @@ def test_base_config_loads(base_cfg):
     ("[text_index]\nfetch_k = 5\n", "fetch_k must be >= k"),
     ("[text_index]\nhost_cap = -1\n", "host_cap must be >= 0"),
     ("[text_index]\nprior_boost = -1.0\n", "prior_boost must be >= 0"),
+    ("[text_index]\nprior_score_mode = \"max\"\n", "prior_score_mode must be one of"),
     ("[text_index]\nprior_depth = 100\n", "prior_depth must be >= fetch_k"),
     ("[text_index]\nprior_scale = 0.0\n", "prior_scale and prior_scaling_factor must be > 0"),
     ("[text_index]\nprior_scaling_factor = 0.0\n", "prior_scale and prior_scaling_factor"),

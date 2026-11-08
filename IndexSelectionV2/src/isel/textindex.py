@@ -499,6 +499,11 @@ def query_body(t: TextIndexCfg, text: str) -> dict[str, Any]:
     lets a popular page with a weak match replace a good match. `rescore` rules out the
     doc id sort, so `search` breaks those ties. `collapse` keeps one hit per host, while
     Google's top 10 often has two, so `search` also applies the host cap.
+
+    With `prior_score_mode` "total" the prior adds `prior_boost × ln(scaling + S)` points;
+    with "multiply" it scales the text score by `1 + prior_boost × ln(scaling + S)`, so its
+    effect follows each query's BM25 scale. The constant 1 keeps a doc without a prior at
+    its text score.
     """
     if t.query_type == "combined_fields":
         query = {"combined_fields": {"query": text, "fields": t.fields}}
@@ -508,11 +513,16 @@ def query_body(t: TextIndexCfg, text: str) -> dict[str, Any]:
                             "_source": ["url"] if t.host_cap else False,
                             "track_total_hits": False}
     if t.prior_boost > 0:
-        body["rescore"] = {
-            "window_size": ceil(t.prior_depth / t.shards),  # the window is per shard
-            "query": {"rescore_query": {"rank_feature": {
-                "field": PRIOR_FIELD, "boost": t.prior_boost,
-                "log": {"scaling_factor": t.prior_scaling_factor}}}}}
+        prior = {"rank_feature": {"field": PRIOR_FIELD, "boost": t.prior_boost,
+                                  "log": {"scaling_factor": t.prior_scaling_factor}}}
+        if t.prior_score_mode == "multiply":
+            one = {"constant_score": {"filter": {"match_all": {}}, "boost": 1.0}}
+            rescore = {"score_mode": "multiply", "query_weight": 1.0, "rescore_query_weight": 1.0,
+                       "rescore_query": {"bool": {"should": [prior, one]}}}
+        else:
+            rescore = {"rescore_query": prior}
+        body["rescore"] = {"window_size": ceil(t.prior_depth / t.shards),  # per shard
+                           "query": rescore}
     else:
         body["sort"] = [{"_score": "desc"}, {"doc_id": "asc"}]
     return body
@@ -591,7 +601,8 @@ def evaluate_golden(cfg: Config, client: OpenSearch, batch_id: int,
     present = present_ids(client, t.alias, every, t.lookup_chunk)
     out = {"batch_id": batch_id, "alias": t.alias, "index": _aliased(client, t.alias),
            "k": t.k, "query_type": t.query_type, "fields": t.fields,
-           "prior_boost": t.prior_boost, "prior_depth": t.prior_depth, "host_cap": t.host_cap,
+           "prior_score_mode": t.prior_score_mode, "prior_boost": t.prior_boost,
+           "prior_depth": t.prior_depth, "host_cap": t.host_cap,
            **run_eval(judged, ranked, took, present, tags, t.k, cfg.eval.bootstrap_samples,
                       cfg.eval.bootstrap_seed)}
     run = utc_id(now)

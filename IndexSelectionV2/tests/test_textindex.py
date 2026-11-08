@@ -254,8 +254,9 @@ def test_build_stops_when_too_few_docs_have_a_rank(cfg, stub, tmp_path):
 
 
 def test_query_body_rescores_the_best_text_matches_with_the_prior(base_cfg):
-    t = replace(base_cfg, "text_index", prior_boost=1.5, prior_scaling_factor=2.0,
-                host_cap=2, fetch_k=50, prior_depth=1500, shards=8).text_index
+    t = replace(base_cfg, "text_index", prior_score_mode="total", prior_boost=1.5,
+                prior_scaling_factor=2.0, host_cap=2, fetch_k=50, prior_depth=1500,
+                shards=8).text_index
     body = query_body(t, "a b")
     # Only the text query selects docs, and the prior reorders the best of them.
     assert body["query"]["multi_match"]["query"] == "a b"
@@ -263,6 +264,21 @@ def test_query_body_rescores_the_best_text_matches_with_the_prior(base_cfg):
         "field": PRIOR_FIELD, "boost": 1.5, "log": {"scaling_factor": 2.0}}}}}
     assert body["size"] == 50 and body["_source"] == ["url"]
     # OpenSearch rejects `rescore` beside a sort on anything but the score.
+    assert "sort" not in body
+
+
+def test_query_body_multiplies_the_text_score_by_the_prior(base_cfg):
+    t = replace(base_cfg, "text_index", prior_score_mode="multiply", prior_boost=0.193,
+                prior_scaling_factor=1.0, host_cap=2, fetch_k=200, prior_depth=4500,
+                shards=8).text_index
+    body = query_body(t, "a b")
+    assert body["query"]["multi_match"]["query"] == "a b"
+    # The window is per shard; the constant 1 keeps a doc without a prior at its text score.
+    assert body["rescore"] == {"window_size": 563, "query": {
+        "score_mode": "multiply", "query_weight": 1.0, "rescore_query_weight": 1.0,
+        "rescore_query": {"bool": {"should": [
+            {"rank_feature": {"field": PRIOR_FIELD, "boost": 0.193, "log": {"scaling_factor": 1.0}}},
+            {"constant_score": {"filter": {"match_all": {}}, "boost": 1.0}}]}}}}
     assert "sort" not in body
 
 
