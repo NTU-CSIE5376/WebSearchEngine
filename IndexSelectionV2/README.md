@@ -27,7 +27,7 @@ is in the table (WebSearchEngine #7).
 
 ```mermaid
 flowchart LR
-    C[(crawlerdb<br/>read-only, rate-limited)] --> E[export<br/>every crawled row]
+    C[(crawlerdb on YugabyteDB<br/>read-only, rate-limited)] --> E[export<br/>every crawled row]
     G[(metricdb<br/>golden batches)] --> F
     E --> F[point-in-time features]
     F --> T[LightGBM<br/>frozen before the batch]
@@ -39,7 +39,7 @@ flowchart LR
 
 | Step | Command | Reads | Writes |
 |---|---|---|---|
-| Export | `pull-golden`, `pull-dims`, `pull-full` | metricdb, crawlerdb (read-only) | Parquet in the work dir |
+| Export | `pull-golden`, `pull-dims`, `pull-full` | metricdb, crawlerdb on YugabyteDB (read-only) | Parquet in the work dir |
 | Sample | `derive-sample`, `derive-positives` | the export | 2 % hash sample, golden rows |
 | Model | `backtest`, `train` | the sample | backtest report, frozen model |
 | Select | `score-full`, `select-full` | the export, the model | the 128M-URL manifest |

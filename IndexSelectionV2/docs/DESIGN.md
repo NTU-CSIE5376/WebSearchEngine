@@ -52,20 +52,78 @@
 | Long statements | `statement_timeout` defaults to 120 s and never exceeds `guard.timeout_cap_s`. A shard that hits a timeout is retried on the next run. |
 | Server temp files | No server-side sort or aggregate; `temp_file_limit = 0`, `work_mem = 16MB`, no parallel workers. |
 | Reading while the metric works | `ReadGuard` runs before every statement. A statement may not reach into the 1st and 16th 00:00–20:00 UTC or any hour's :58–:10, even at its full timeout. It pauses while more than `guard.max_io_waiters` other sessions wait on IO (median of 3 probes). |
-| Read load | `pull-full` reads `full.chunk_blocks` heap blocks per `COPY` (a TID range scan). All sessions share one byte budget of `full.max_heap_mb_s` (2,000 MB/s, about a quarter of the metric's hourly scan). |
+| Read load | `pull-full` reads one `yb_hash_code(url)` range per `COPY`, `full.hash_chunks` ranges per shard table (§4.1). All sessions share one budget of `full.max_mb_s` CSV bytes per second, to be set from a one-shard run on the cluster. |
 | Leaking credentials | DSNs come from env variables or secret files; JSON output passes `assert_no_secrets`. |
 
 **Full export.** `pull-full` opens `full.connections` sessions. Each takes whole shards
 from a shared queue and writes `full/export/shard=NNN/part-<lo>-<hi>.parquet`. Output is
 `FORMAT CSV`, parsed by pyarrow. The session settings `datestyle`, `extra_float_digits`
 and `client_encoding` fix the CSV text, and the config check refuses other values. The
-run is resumable: a rerun reads only the missing block ranges.
+run is resumable: a rerun reads only the missing files.
 
 **S0.** S0 is the start of `pull-full`. The sample, the positives and the scored rows
 all come from this one export, so they describe one crawl state.
 
 **Golden.** `pull-golden` copies metricdb's batches, queries and URLs to
 `golden/golden.parquet`. Each row keeps the raw URL and its canonical spelling.
+
+### 4.1 crawlerdb on YugabyteDB
+
+crawlerdb moved from PostgreSQL 16 on Host1 to YugabyteDB 2026.1.2 (YSQL, PG15 based;
+tservers on .2, .3 and .4, RF 3) at the cutover of 2026-10-30, about 18:00 UTC. Host1's
+`:5432` has not changed since, so isel reads only YugabyteDB. metricdb (Host1 `:5433`)
+and our selectdb (Host1 `:5445`) did not move. `ISEL_CRAWLERDB_DSN` lists every tserver
+with `load_balance_hosts=random` (libpq 16 or later; psycopg's binary wheel ships libpq
+18), and `full.connections` opens one session per tserver.
+
+- **Key space.** A shard table is hash-sharded on `url`: `yb_hash_code(url)` spans
+  `[0, 65536)`. Each COPY reads one of `full.hash_chunks` equal ranges, an `Index Cond`
+  on the primary key, so only the tablets holding the range are asked.
+- **Why equal hash ranges.** Ranges cut at tablet boundaries (`yb_tablet_metadata`) would
+  save a second tablet per chunk, but tablets split while data grows, so the ranges of
+  a resumed export would move. Keyset pages on `url` sort every tablet, because the key
+  is hashed.
+- **Rate and timeout.** The size of a range is not known before the read, so its CSV
+  bytes are charged to `full.max_mb_s` after it. Every COPY runs under
+  `guard.timeout_cap_s` (900 s).
+- **Read restarts.** A COPY under concurrent writes can fail with SQLSTATE 40001 once
+  its output passes `ysql_output_buffer_size`; YSQL does not retry it then. A follower
+  read (`yb_read_from_followers`, 30 s back) uses a read time older than any clock skew,
+  so it does not restart. Any 40001 still rereads that chunk up to `full.chunk_retries`
+  times; after that the shard resumes on the next run like a timeout.
+- **One snapshot for the whole export** is not taken. `yb_read_time` and
+  `pg_export_snapshot` work only inside the history retention (900 s by default), and
+  raising it to hours keeps more MVCC versions under the crawler's writes. `as_of`
+  filters the pool.
+- **Load guard.** The read windows stay: the metric reads crawlerdb wherever it lives.
+  `guard.max_io_waiters` counts `crawlerdb.io_wait_types` in the local node's
+  `pg_stat_activity`; the YugabyteDB wait types are still to be measured.
+- **No write or frozen counters.** YugabyteDB has no `pg_stat_io`, no PostgreSQL WAL, and
+  counts `n_tup_*` per node, so `_meta.json` records only rows and seconds per shard.
+- **Layout.** `_meta.json` records `hash_chunks` and `chunks_per_file`; a resumed run
+  with other values, or an export directory from the old PostgreSQL path, is refused.
+
+**Checked locally** (`pytest -m yugabyte`, image `yugabytedb/yugabyte:2026.1.2.0-b137`):
+every crawlerdb session setting is accepted; the server refuses writes; a hash range
+plans as `Index Scan using <table>_pkey` with `Index Cond: yb_hash_code(url) >= ... AND
+< ...` and `last_fetch_ok IS NOT NULL` as a `Storage Filter` (on 200,000 rows, 1/8 of the
+hash space scanned 25,080 rows); the export equals psycopg's decoding of the same rows.
+Follower reads hide rows written in the last 30 s.
+
+**To check on the course cluster before the first full read** (needs a read-only role;
+the YugabyteDB `crawler` role could not log in on 2026-10-31, WebSearchEngine #21):
+
+| Check | How | If it fails |
+|---|---|---|
+| `url` is the HASH primary key of every `url_state_current_NNN` | `\d url_state_current_000` | every hash range becomes a full scan; split on the real key instead |
+| A hash range is pushed down | `EXPLAIN` of one `full_sql` range shows `Index Cond` on `yb_hash_code(url)` | as above |
+| `shard_split_subdomain` and the 17 columns exist | `pull-dims`, then `pull-full --dry-run` | follow the cluster's schema |
+| One range ends well inside 900 s | `pull-full --shards 0`; read the per-file MB/s in the log | raise `full.hash_chunks` |
+| Followers serve the COPY; the crawl does not slow | tservers' read metrics; Loki `request.end` rate during the shard | lower `full.max_mb_s` |
+| Wait types to count | `pg_stat_activity` during the metric's hourly scan | set `crawlerdb.io_wait_types` |
+
+Set `full.max_mb_s` from the one-shard run. Do not read while tablet counts still grow
+(split compactions), nor in the golden windows (`guard.month_days`).
 
 ## 5. Point in time and features (`features.py`, `derive.py`, `dataset.py`)
 
@@ -263,7 +321,7 @@ distinct canonical golden URLs.
 
 | Part | Host | Why |
 |---|---|---|
-| isel jobs (`deploy/compose.compute.yaml`) | Host2 | free RAM and disk; reads Host1's databases over the LAN |
+| isel jobs (`deploy/compose.compute.yaml`) | Host2 | free RAM and disk; reads crawlerdb on the YugabyteDB tservers (.2, .3, .4) and Host1's metricdb over the LAN |
 | selectdb `:5445` (`deploy/compose.selectdb.yaml`) | Host1 | data on the root NVMe, not on crawlerdb's `/data` |
 
 **Image**
@@ -295,13 +353,18 @@ The env file `~/isel/compose.env` (not in the repo) sets `ISEL_PROJECT`, `ISEL_I
 Each step below needs the owner's approval. `pull-full` also needs the TA's approval.
 
 ```bash
+# Mac: ship one commit of this directory; the server needs no repo access
+SHA=$(git rev-parse --short HEAD)
+git archive --format=tar "$SHA:IndexSelectionV2" | ssh ntu-sa2 "mkdir -p ~/isel/src-$SHA && tar -x -C ~/isel/src-$SHA"
+# Host2, in ~/isel/src-$SHA
 D="docker compose --env-file $HOME/isel/compose.env -f deploy/compose.compute.yaml"
 GIT_SHA=$SHA $D build --build-arg GIT_SHA=$SHA isel
 J="$D run --rm isel"
 $J check-config
 $J pull-golden
 $J pull-dims
-$J pull-full --dry-run                 # catalog only: heap bytes, chunks, free disk
+$J pull-full --dry-run                 # catalog only: chunks, tservers, free disk
+$J pull-full --shards 0                # first time on the cluster: the §4.1 checks
 $J pull-full                           # rerun until shards_missing = 0
 $J derive-sample
 $J derive-positives

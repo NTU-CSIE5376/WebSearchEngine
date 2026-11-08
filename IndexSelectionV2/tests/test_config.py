@@ -28,16 +28,18 @@ def test_base_config_loads(base_cfg):
     ("[guard]\ntimeout_cap_s = 2880\n", "hourly open gap"),
     ("[guard]\nmonth_window = ['20:00', '00:00']\n", "wrap"),
     ("[guard]\nmonth_window = ['00:00', '25:00']\n", "HH:MM"),
-    ("[full]\nchunk_blocks = 1000000\n", "readable at guard.min_mb_s"),
     ("[full]\nparse_threads = 0\n", "full.parse_threads must be > 0"),
-    ("[full]\nconnections = 0\n", "full.connections and full.max_heap_mb_s must be > 0"),
-    ("[full]\nmax_heap_mb_s = 0.0\n", "full.connections and full.max_heap_mb_s must be > 0"),
+    ("[full]\nconnections = 0\n", "full.connections and full.max_mb_s must be > 0"),
+    ("[full]\nmax_mb_s = 0.0\n", "full.connections and full.max_mb_s must be > 0"),
     # extra_float_digits = 0 would round url_score in the CSV text the full export parses.
     ("[crawlerdb.session]\nextra_float_digits = '0'\n", "CSV text"),
     ("[crawlerdb.session]\ndatestyle = 'SQL'\n", "CSV text"),
     ("[full]\nsample_percent = 'x'\n", "expected float"),
     ("[full]\nsample_percent = 0.00001\n", "at most 4 decimals"),
     ("[full]\nsample_salt = 'isel'\n", "differ from dataset.neg_salt"),
+    ("[crawlerdb]\nio_wait_types = []\n", "io_wait_types must not be empty"),
+    ("[full]\nhash_chunks = 3\n", "divide 65536"),
+    ("[full]\nchunk_retries = -1\n", "chunk_retries must be >= 0"),
     ("[full]\nagg_share = 1.0\n", "agg_share must be in"),
     ("[full]\nagg_salt = 'sample-v1'\n", "agg_salt must be set and differ"),
     ("[eval]\nk_headline = 5\n", "k_headline"),
@@ -82,6 +84,12 @@ def test_host2_overlay_sets_the_text_index():
     assert (ROOT / Path(t.settings_file).relative_to("/app")).is_file()   # the image's copy
     assert t.keep_prev is False and t.shards == 8
     assert cfg.duckdb.threads == 4 and cfg.duckdb.memory_limit == "16GB"
+
+
+def test_crawlerdb_reads_yugabyte_followers(base_cfg):
+    assert base_cfg.crawlerdb.session["yb_read_from_followers"] == "on"
+    assert base_cfg.full.connections == 3       # one session per tserver
+
 
 
 def test_config_rejects_missing_key(tmp_path):
