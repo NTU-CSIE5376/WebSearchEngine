@@ -47,9 +47,10 @@ convention = "google"
 testpaths = ["tests"]
 markers = [
     "integration: needs a local Docker daemon with the postgres:16 image",
+    "opensearch: needs Docker and the isel-opensearch:3.9.0 image (deploy/compose.opensearch.yaml)",
     "yugabyte: needs Docker with the yugabytedb/yugabyte:2026.1.2.0-b137 image",
 ]
-addopts = "-m 'not integration and not yugabyte'"
+addopts = "-m 'not integration and not opensearch and not yugabyte'"
 
 [dependency-groups]
 dev = [

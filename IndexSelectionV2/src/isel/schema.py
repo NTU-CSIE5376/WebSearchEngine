@@ -7,11 +7,12 @@
 V1 readers expect them there.
 
 `recrawl` holds the recrawl frontier and is not readable by the `select` role.
-`host` is one back queue per hostname, the unit of the 0.2 qps rule; `doc` is
-one row per page ever selected, keyed by `doc_id` as a signed BIGINT. A doc is
-on the live list while `rank` is set; `fetched` docs come due again through
-`doc_stale`. `job` is one manual-bulk-crawl job at the crawler API (WebCrawler
-PR #84): the docs it carries, in the order their URLs were sent, and how far it got.
+`host` is one back queue per hostname, the unit of the one-open-job rule and
+the throttle pause; `doc` is one row per page ever selected, keyed by `doc_id`
+as a signed BIGINT. A doc is on the live list while `rank` is set; `fetched`
+docs come due again through `doc_stale`. `job` is one manual-bulk-crawl job at
+the crawler API (WebCrawler PR #84): the docs it carries, in the order their
+URLs were sent, and how far it got.
 A job is `completed` once the API's status says so; the archive then applies it.
 An applied job's results are deleted at the API; `deleted_at` records that.
 
@@ -93,7 +94,7 @@ recrawl_host = sa.Table(
     sa.Column("host", sa.Text, nullable=False),
     sa.Column("best_rank", sa.BigInteger),          # min rank of its due docs; NULL: none
     _tstz("next_at"),                               # no job before this (pacing, backoff)
-    sa.Column("batch_id", sa.BigInteger),           # its open job; NULL: none
+    sa.Column("batch_id", sa.BigInteger),           # job of its batch not yet done; NULL: none
     sa.PrimaryKeyConstraint("host_id", name="host_pkey"),
     sa.UniqueConstraint("host", name="host_host_key"),
     sa.Index("host_ready", "best_rank",

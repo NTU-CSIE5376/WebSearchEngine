@@ -10,6 +10,7 @@ import json
 import logging
 import sys
 from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -84,7 +85,6 @@ def cmd_pull_dims(cfg: Config, args: argparse.Namespace) -> Any:
 
 def cmd_pull_full(cfg: Config, args: argparse.Namespace) -> Any:
     import shutil
-    from datetime import UTC, datetime
 
     from isel.pg import next_allowed_start, next_forbidden_window, open_crawlerdb
     from isel.pull import estimate_full, pull_full
@@ -309,7 +309,8 @@ def cmd_recrawl_plan(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.recrawl import capacity_report, run_planner
 
     if args.dry_run:
-        return _recrawl(cfg, lambda conn: capacity_report(cfg, conn), read_only=True)
+        return _recrawl(cfg, lambda conn: capacity_report(cfg.recrawl, conn, datetime.now(UTC)),
+                        read_only=True)
     return _recrawl(cfg, lambda conn: run_planner(cfg, conn, args.once))
 
 
@@ -317,6 +318,25 @@ def cmd_recrawl_archive(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.recrawl import run_archiver
 
     return _recrawl(cfg, lambda conn: run_archiver(cfg, conn, args.once))
+
+
+def _text_index_client(cfg: Config):
+    from isel.textindex import OpenSearch
+
+    t = cfg.text_index
+    return OpenSearch(t.url, t.timeout_s, t.retries, t.backoff_s)
+
+
+def cmd_text_index_build(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.textindex import build
+
+    return build(cfg, _text_index_client(cfg), Path(args.text_root or cfg.recrawl.text_root))
+
+
+def cmd_text_index_eval(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.textindex import evaluate_golden
+
+    return evaluate_golden(cfg, _text_index_client(cfg), args.batch)
 
 
 def cmd_validate_manifest(cfg: Config, args: argparse.Namespace) -> Any:
@@ -389,6 +409,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print the per-host capacity report; send nothing")
     p = sub.add_parser("recrawl-archive", help="apply finished jobs; store page text (loop)")
     p.add_argument("--once", action="store_true", help="run one cycle and exit")
+    p = sub.add_parser("text-index-build",
+                       help="index the newest text of each doc; swap the alias to it")
+    p.add_argument("--text-root", help="text Parquet root (default recrawl.text_root)")
+    p = sub.add_parser("text-index-eval", help="Recall@k of a golden batch on the alias")
+    p.add_argument("--batch", type=int, required=True)
     p = sub.add_parser("validate-manifest")
     p.add_argument("--run-dir", required=True)
     return parser
@@ -418,6 +443,8 @@ COMMANDS = {
     "recrawl-sync": cmd_recrawl_sync,
     "recrawl-plan": cmd_recrawl_plan,
     "recrawl-archive": cmd_recrawl_archive,
+    "text-index-build": cmd_text_index_build,
+    "text-index-eval": cmd_text_index_eval,
     "validate-manifest": cmd_validate_manifest,
 }
 

@@ -1,7 +1,7 @@
 """Stand-ins for the crawler side of the recrawl: WebCrawler PR #84's job API and workers.
 
 `ApiStub` serves `POST /v1/manual-bulk-crawls` and `GET` / `DELETE .../{job_id}`
-as PR #84 at bd40191 does. A POST canonicalizes each URL with w3lib, drops later
+as PR #84 at cc96500 does. A POST canonicalizes each URL with w3lib, drops later
 duplicates, routes each URL to one of `CRAWLERS` crawlers by hostname, and
 creates `results/{job}/request.json` with an empty `crawler_NN/` partition per
 crawler, a queue entry `pending/crawler_NN/{job}.json` per crawler, and the
@@ -125,7 +125,7 @@ class ApiStub:
         job_id = uuid.uuid4().hex
         created = self.clock()
         listed = list(normalized)
-        payload = {"version": 1, "urls": listed, "max_concurrency_ratio": 0.5,
+        payload = {"version": 1, "urls": listed,
                    "crawler_ids": [crawler_of(u) for u in listed],
                    "result_dir": str(self.results), "created_at": created.isoformat(),
                    "ttl_days": ttl, "expires_at": (created + timedelta(days=ttl)).isoformat()}
@@ -262,27 +262,38 @@ class FakeCrawler:
             fetched += self._finish_part(job_id, payload, crawler_id, now)
         return fetched
 
+    def fetch(self, job_id: str, urls: Iterable[str], now: datetime) -> None:
+        """Writes the results of these URLs only, as a job still running has them."""
+        payload = self.stub.manifest(job_id)
+        for url in urls:
+            index = payload["urls"].index(url)
+            part = partition(self.stub.results, job_id, payload["crawler_ids"][index])
+            self._write(part, payload, index, now)
+
     def _finish_part(self, job_id: str, payload: dict, crawler_id: int, now: datetime) -> int:
         part = partition(self.stub.results, job_id, crawler_id)
         indices = [i for i, c in enumerate(payload["crawler_ids"]) if c == crawler_id]
         for index in indices:
-            url = payload["urls"][index]
-            page = self.web.get(url, Page(status=None, error="DNSLookupError"))
-            item = {"url": url, "final_url": page.final_url or url, "status_code": page.status,
-                    "error": page.error, "html_file": None,
-                    "fetched_at": (now + timedelta(seconds=index)).isoformat()}
-            if page.status is not None:
-                ctype = page.content_type.split(";")[0].strip().lower()
-                html = ctype in ("text/html", "application/xhtml+xml")
-                item["error"] = None if 200 <= page.status < 300 else f"HTTP {page.status}"
-                if not html:
-                    item["error"] = item["error"] or "NonHTML content-type"
-                else:
-                    item["html_file"] = f"{index:05d}.html"
-                    (part / item["html_file"]).write_bytes(page.body)
-            (part / f"{index:05d}.json").write_text(json.dumps(item))
+            self._write(part, payload, index, now)
         (part / "progress.json").write_text(json.dumps({
             "started_at": now.isoformat(), "completed_at": now.isoformat(),
             "completed_urls": len(indices)}))
         (self.stub.pending / f"crawler_{crawler_id:02d}" / f"{job_id}.json").unlink()
         return len(indices)
+
+    def _write(self, part: Path, payload: dict, index: int, now: datetime) -> None:
+        url = payload["urls"][index]
+        page = self.web.get(url, Page(status=None, error="DNSLookupError"))
+        item = {"url": url, "final_url": page.final_url or url, "status_code": page.status,
+                "error": page.error, "html_file": None,
+                "fetched_at": (now + timedelta(seconds=index)).isoformat()}
+        if page.status is not None:
+            ctype = page.content_type.split(";")[0].strip().lower()
+            html = ctype in ("text/html", "application/xhtml+xml")
+            item["error"] = None if 200 <= page.status < 300 else f"HTTP {page.status}"
+            if not html:
+                item["error"] = item["error"] or "NonHTML content-type"
+            else:
+                item["html_file"] = f"{index:05d}.html"
+                (part / item["html_file"]).write_bytes(page.body)
+        (part / f"{index:05d}.json").write_text(json.dumps(item))

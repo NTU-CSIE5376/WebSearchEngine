@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import tomllib
 import types
 import typing
@@ -168,6 +169,9 @@ class SelectDbCfg:
     reader_password_env: str
     forbidden_ports: list[int]
     connect_timeout_s: int
+    keepalives_idle_s: int
+    keepalives_interval_s: int
+    keepalives_count: int
     copy_block_bytes: int
     maintenance_work_mem: str
     swap_lock_timeout: str
@@ -214,8 +218,42 @@ class RecrawlCfg:
     min_free_gb: int
     max_body_chars: int
     sync_chunk_rows: int
-    min_gap_s: float
-    report_days: list[int]
+    real_text_min_chars: int
+    challenge_sha1: list[str]
+
+
+@dataclass(frozen=True)
+class TextIndexCfg:
+    url: str
+    timeout_s: float
+    alias: str
+    settings_file: str
+    shards: int
+    query_type: str
+    fields: list[str]
+    k: int
+    read_batch_rows: int
+    bulk_bytes: int
+    bulk_workers: int
+    retries: int
+    backoff_s: float
+    lease_wait_s: float
+    force_merge_segments: int
+    keep_prev: bool
+    lookup_chunk: int
+    warmup_queries: int
+    flood_free_ratio: float
+    expected_bytes_per_doc: int
+    progress_every: int
+    fetch_k: int
+    host_cap: int
+    prior_file: str
+    prior_scale: float
+    prior_scaling_factor: float
+    prior_score_mode: str
+    prior_boost: float
+    prior_depth: int
+    prior_min_coverage: float
 
 
 @dataclass(frozen=True)
@@ -237,6 +275,7 @@ class Config:
     selectdb: SelectDbCfg
     schedule: ScheduleCfg
     recrawl: RecrawlCfg
+    text_index: TextIndexCfg
 
     @property
     def work_dir(self) -> Path:
@@ -258,8 +297,15 @@ LGBM_THREAD_ALIASES = ("n_jobs", "nthread", "nthreads", "num_thread")
 # crawlerdb session settings that fix the CSV text the full export parses: other
 # values fail the parse, or round url_score (extra_float_digits < 1).
 CSV_SESSION = {"datestyle": "ISO", "extra_float_digits": "1", "client_encoding": "UTF8"}
+QUERY_TYPES = ("combined_fields", "most_fields", "best_fields")
+PRIOR_SCORE_MODES = ("total", "multiply")
+# OpenSearch index names are lowercase; the physical indices add "-<utc id>".
+INDEX_ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+
+
 # yb_hash_code() returns a uint16, so a YugabyteDB shard table spans [0, 65536).
 YB_HASH_SPACE = 65536
+
 
 
 def _deep_merge(base: dict[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
@@ -442,6 +488,7 @@ def _validate(cfg: Config) -> None:
     _validate_full(cfg, need)
     _validate_selectdb(cfg, need)
     _validate_recrawl(cfg, need)
+    _validate_text_index(cfg, need)
 
 
 def _validate_recrawl(cfg: Config, need: Any) -> None:
@@ -456,11 +503,13 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
              r.host_pause_max_s, r.sync_chunk_rows, r.max_body_chars, r.archive_workers) > 0,
          "recrawl sizes, counts and intervals must be > 0")
     need(r.job_size <= 10000, "recrawl.job_size must be <= 10000, the API's max_urls")
+    need(r.max_jobs_inflight <= 64,
+         "recrawl.max_jobs_inflight must be <= 64, the jobs a crawler process admits")
     need(r.host_docs_per_job <= r.job_size, "recrawl.host_docs_per_job must be <= job_size")
     need(r.max_resend >= 0, "recrawl.max_resend must be >= 0")
-    need(min(r.plan_interval_s, r.archive_interval_s, r.min_gap_s, r.api_timeout_s,
+    need(min(r.plan_interval_s, r.archive_interval_s, r.api_timeout_s,
              r.api_backoff_s) > 0,
-         "recrawl.plan_interval_s, archive_interval_s, min_gap_s, api_timeout_s and "
+         "recrawl.plan_interval_s, archive_interval_s, api_timeout_s and "
          "api_backoff_s must be > 0")
     need(r.claim_timeout_s > r.api_timeout_s,
          "recrawl.claim_timeout_s must be > api_timeout_s, or a slow reply looks lost")
@@ -471,8 +520,54 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "result_ttl_days")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
-    need(bool(r.report_days) and all(d > 0 for d in r.report_days),
-         "recrawl.report_days must be non-empty and > 0")
+    need(r.real_text_min_chars >= 0, "recrawl.real_text_min_chars must be >= 0")
+    need(all(re.fullmatch(r"[0-9a-f]{40}", h) for h in r.challenge_sha1),
+         "recrawl.challenge_sha1 must be 40-char lowercase hex SHA-1s")
+
+
+def _field_weight(spec: str) -> float | None:
+    """The weight of a `name^weight` field spec (1.0 without `^`); None if malformed."""
+    name, sep, weight = spec.partition("^")
+    if not name or (sep and not weight):
+        return None
+    try:
+        return float(weight) if sep else 1.0
+    except ValueError:
+        return None
+
+
+def _validate_text_index(cfg: Config, need: Any) -> None:
+    t = cfg.text_index
+    need(t.url.startswith(("http://", "https://")) and not t.url.endswith("/"),
+         "text_index.url must be an http(s) URL without a trailing slash")
+    need(INDEX_ALIAS_RE.fullmatch(t.alias) is not None,
+         "text_index.alias must be lowercase letters, digits, '_' or '-'")
+    need(bool(t.settings_file), "text_index.settings_file must be set")
+    need(t.query_type in QUERY_TYPES, f"text_index.query_type must be one of {QUERY_TYPES}")
+    weights = [_field_weight(f) for f in t.fields]
+    need(bool(weights) and all(w is not None and w > 0 for w in weights),
+         "text_index.fields must be non-empty `name` or `name^weight` with weight > 0")
+    # Lucene's CombinedFieldQuery rejects weights below 1.
+    need(t.query_type != "combined_fields" or all(w >= 1 for w in weights),
+         "text_index.fields weights must be >= 1 with combined_fields")
+    need(min(t.timeout_s, t.lease_wait_s) > 0,
+         "text_index.timeout_s and lease_wait_s must be > 0")
+    need(min(t.shards, t.k, t.read_batch_rows, t.bulk_bytes, t.bulk_workers,
+             t.force_merge_segments, t.lookup_chunk, t.expected_bytes_per_doc,
+             t.progress_every) > 0,
+         "text_index sizes and counts must be > 0")
+    need(0 < t.flood_free_ratio < 1, "text_index.flood_free_ratio must be in (0, 1)")
+    need(min(t.retries, t.backoff_s, t.warmup_queries) >= 0,
+         "text_index.retries, backoff_s and warmup_queries must be >= 0")
+    need(t.fetch_k >= t.k, "text_index.fetch_k must be >= k")
+    need(t.host_cap >= 0, "text_index.host_cap must be >= 0")
+    need(t.prior_boost >= 0, "text_index.prior_boost must be >= 0")
+    need(t.prior_score_mode in PRIOR_SCORE_MODES,
+         f"text_index.prior_score_mode must be one of {PRIOR_SCORE_MODES}")
+    need(t.prior_depth >= t.fetch_k, "text_index.prior_depth must be >= fetch_k")
+    need(min(t.prior_scale, t.prior_scaling_factor) > 0,
+         "text_index.prior_scale and prior_scaling_factor must be > 0")
+    need(0 <= t.prior_min_coverage <= 1, "text_index.prior_min_coverage must be in [0, 1]")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:
@@ -506,7 +601,8 @@ def _validate_selectdb(cfg: Config, need: Any) -> None:
          "selectdb DSN env vars must differ from each other and from the read-only DBs")
     need(bool(s.forbidden_ports), "selectdb.forbidden_ports must not be empty")
     need(min(s.copy_block_bytes, s.swap_retry_attempts, s.max_db_bytes, s.est_bytes_per_row,
-             s.verify_chunk, s.connect_timeout_s) > 0,
+             s.verify_chunk, s.connect_timeout_s, s.keepalives_idle_s,
+             s.keepalives_interval_s, s.keepalives_count) > 0,
          "selectdb sizes, counts and timeouts must be > 0")
     need(s.swap_retry_backoff_s >= 0, "selectdb.swap_retry_backoff_s must be >= 0")
     w = cfg.schedule.swap_freeze_window

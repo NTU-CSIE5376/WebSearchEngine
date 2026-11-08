@@ -172,7 +172,7 @@ verbose = -1
 [eval]
 test_batches = [6, 7, 8, 18, 19]
 k_values = [32000000, 64000000, 128000000]
-k_headline = 128000000
+k_headline = 64000000                    # TY Huang 2026-10-27: 64M fits the crawl bandwidth
 fractions = [0.019, 0.039, 0.077]        # K as a share of the pool at each batch's as_of
 gain_curve_k = [1000000, 2000000, 4000000, 8000000, 16000000, 32000000, 64000000,
                 128000000, 256000000, 512000000]
@@ -227,6 +227,12 @@ reader_role = "select"                   # WebSearchEngine measure.py hardcodes 
 reader_password_env = "ISEL_SELECTDB_READER_PASSWORD"   # only init-selectdb needs it
 forbidden_ports = [5432, 5433, 5444]     # crawlerdb, metricdb, V1 selectdb
 connect_timeout_s = 10
+# TCP keepalive on both ends of every selectdb connection: a peer that vanished
+# without a reset (Host1 -> Host2, 2026-11-02) is found after idle + interval x count
+# (60 s), not the OS default of 2 h 11 min. The server end holds our advisory locks.
+keepalives_idle_s = 30
+keepalives_interval_s = 10
+keepalives_count = 3
 copy_block_bytes = 8388608
 maintenance_work_mem = "4GB"             # primary key build on 128M URLs
 swap_lock_timeout = "5s"                 # readers wait at most this long for a swap
@@ -248,16 +254,21 @@ result_root = "work/recrawl/result"      # the API's results dir: {job_id}/reque
                                          # {job_id}/crawler_NN/NNNNN.{json,html}; read-only
 text_root = "work/recrawl/text"          # permanent extracted text, fetch_date=YYYYMMDD/job-*.parquet
 log_root = "work/recrawl/log"            # permanent per-URL results, YYYYMMDD/job-*.jsonl.gz
-job_size = 3000                          # URLs per job; the API takes up to 10000. A job
+job_size = 10000                         # URLs per job: the API's max_urls. A job
                                          # completes only when all its URLs finish
-host_docs_per_job = 120                  # docs per host and job: 600 s at min_gap_s
-max_jobs_inflight = 48                   # jobs at the crawler (each process holds up to 64);
-                                         # also the most completed jobs left to the archive
+host_docs_per_job = 240                  # docs per host and job; the crawler sends them at
+                                         # the host's slot rate. The host's next batch goes
+                                         # out once all of these have results, even while
+                                         # their job still waits for other hosts
+max_jobs_inflight = 64                   # jobs at the crawler: each process admits 64
+                                         # (MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS); other teams'
+                                         # jobs queue behind. Also the most completed jobs
+                                         # left to the archive
 plan_max_jobs = 8                        # jobs claimed per plan cycle
 plan_interval_s = 30.0
 api_backoff_s = 300.0                    # no new jobs after the API refused a whole job
 claim_timeout_s = 600                    # a job whose POST got no answer is lost after this
-status_poll_s = 60                       # status query of each unapplied job, at most this often
+status_poll_s = 15                       # status query of each unapplied job, at most this often
 result_ttl_days = 3                      # the job's ttl_days: the API stops it and deletes its
                                          # results this long after the POST; isel deletes sooner
 max_resend = 20                          # 400 "at index N" drops one URL and sends again
@@ -268,12 +279,65 @@ retry_max_s = 86400
 max_attempts = 5                         # then wait stale_days instead of retry_max_s
 robots_retry_days = 30                   # a robots.txt refusal is asked again after this
 host_pause_max_s = 86400                 # cap on a 429/503 pause
-archive_interval_s = 60.0
+archive_interval_s = 15.0
 archive_workers = 8                      # text extraction: 6.5 ms per 590 KB page each
 min_free_gb = 800                        # no new jobs below this free space under text_root;
                                          # Host2 /data has ~2 TB free while the crawler runs
 max_body_chars = 200000                  # extracted body text kept per page
 sync_chunk_rows = 1000000                # docs per recrawl-sync transaction
-min_gap_s = 5.0                          # 0.2 qps per hostname: a host gets its next job no
-                                         # sooner than docs * min_gap_s after the last one
-report_days = [1, 7, 14, 28]             # capacity report horizons
+real_text_min_chars = 200                # report only: a fetched 200 with this much body
+                                         # text and no challenge_sha1 is real text
+challenge_sha1 = [                       # report only: payload sha1 of shared bot-challenge
+                                         # pages, measured on Host2 2026-11-08
+    "f1dbc6923af7384830c2b832bc9859adacbc3b70",  # "Client Challenge", Hearst sites
+    "6a92d6cd49d457a65207172eaa43ea3046dc8154",  # walmart "Robot or human?"
+]
+
+[text_index]                             # full-text index of the recrawl text; docs/TEXT_INDEX.md
+url = "http://127.0.0.1:9200"            # OpenSearch (deploy/compose.opensearch.yaml locally)
+timeout_s = 120.0
+alias = "isel-text"                      # searches go through the alias; each build is a new
+                                         # physical index isel-text-<utc id>, swapped in at once
+settings_file = "config/text_index/icu.json"   # index settings and mappings
+shards = 1                               # primary shards of a new index; host-specific
+query_type = "best_fields"               # the best field's BM25; or most_fields, combined_fields
+fields = ["title^2", "description", "body", "url.text^2"]   # tuned on golden batch 20, the
+                                         # URL weight on 51M docs; combined_fields needs one
+                                         # analyzer and weights >= 1
+k = 10                                   # hits per query: the metric's top 10
+fetch_k = 200                            # hits read per query, so a host cap can refill the top k
+host_cap = 2                             # hits per host in the top k; 0 turns the cap off
+prior_file = ""                          # Parquet glob of the list's doc_id and rank; "" gives
+                                         # docs no prior. Host-specific (host2.toml)
+prior_scale = 1e9                        # sel_prior = prior_scale / (rank + 1); above the largest
+                                         # rank, so log(1 + S) stays close to log(S)
+prior_scaling_factor = 1.0               # rank_feature's log(scaling_factor + S)
+prior_score_mode = "multiply"            # "multiply" scales BM25 by 1 + prior_boost ×
+                                         # log(scaling_factor + S); "total" adds the prior. On
+                                         # 52M docs, dev, the scale beat the sum by 0.008 at
+                                         # 1,500 and 0.008 at 4,500 (docs/TEXT_INDEX.md)
+prior_boost = 0.19302                    # 4 / 9 / ln(10): the factor grows by 0.444 per factor
+                                         # of 10 in rank. With "total", 1.7372 (4 points per
+                                         # factor of 10); 0 drops the prior from the query
+prior_depth = 4500                       # best text matches the prior reorders, split over the
+                                         # shards. On dev the scaled prior rises to 4,500 and
+                                         # holds to 10,000, while the sum falls after 4,500.
+                                         # Over every match, popular pages with a weak match
+                                         # took 40 % of the top 10
+prior_min_coverage = 0.99                # share of docs with a rank a build needs
+read_batch_rows = 10000                  # text rows per Arrow batch read for the bulk load
+bulk_bytes = 8388608                     # per _bulk request; OpenSearch suggests 5-15 MiB
+bulk_workers = 2                         # concurrent _bulk requests
+retries = 5                              # resends of a _bulk refused with 429 or 503
+backoff_s = 2.0                          # doubles per resend
+lease_wait_s = 120.0                     # wait for the retention leases before the force
+                                         # merge, which then drops the _recovery_source copy
+force_merge_segments = 1                 # segments per shard after the build
+keep_prev = true                         # keep the previous index for rollback
+lookup_chunk = 1000                      # doc ids per presence lookup
+warmup_queries = 20                      # unmeasured queries before an eval
+flood_free_ratio = 0.05                  # free share the node's flood stage keeps (95 %,
+                                         # the default); a build that would cross it stops
+expected_bytes_per_doc = 1003            # icu.json on 44k crawled pages; a build needs
+                                         # twice this per doc free before it loads
+progress_every = 1000                    # _bulk requests between progress log lines
