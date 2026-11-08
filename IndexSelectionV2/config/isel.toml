@@ -222,6 +222,12 @@ reader_role = "select"                   # WebSearchEngine measure.py hardcodes 
 reader_password_env = "ISEL_SELECTDB_READER_PASSWORD"   # only init-selectdb needs it
 forbidden_ports = [5432, 5433, 5444]     # crawlerdb, metricdb, V1 selectdb
 connect_timeout_s = 10
+# TCP keepalive on both ends of every selectdb connection: a peer that vanished
+# without a reset (Host1 -> Host2, 2026-11-02) is found after idle + interval x count
+# (60 s), not the OS default of 2 h 11 min. The server end holds our advisory locks.
+keepalives_idle_s = 30
+keepalives_interval_s = 10
+keepalives_count = 3
 copy_block_bytes = 8388608
 maintenance_work_mem = "4GB"             # primary key build on 128M URLs
 swap_lock_timeout = "5s"                 # readers wait at most this long for a swap
@@ -274,6 +280,13 @@ min_free_gb = 800                        # no new jobs below this free space und
                                          # Host2 /data has ~2 TB free while the crawler runs
 max_body_chars = 200000                  # extracted body text kept per page
 sync_chunk_rows = 1000000                # docs per recrawl-sync transaction
+real_text_min_chars = 200                # report only: a fetched 200 with this much body
+                                         # text and no challenge_sha1 is real text
+challenge_sha1 = [                       # report only: payload sha1 of shared bot-challenge
+                                         # pages, measured on Host2 2026-11-08
+    "f1dbc6923af7384830c2b832bc9859adacbc3b70",  # "Client Challenge", Hearst sites
+    "6a92d6cd49d457a65207172eaa43ea3046dc8154",  # walmart "Robot or human?"
+]
 
 [text_index]                             # full-text index of the recrawl text; docs/TEXT_INDEX.md
 url = "http://127.0.0.1:9200"            # OpenSearch (deploy/compose.opensearch.yaml locally)

@@ -56,6 +56,18 @@ the batch-20 list.
 - `recrawl-plan --dry-run` reports progress from `fetched_at` instead: docs left, docs
   fetched in the last day, and the days left at that pace, for the list and for its
   largest host.
+- `fetched` overstates progress: it counts every 2xx HTML. In the 24 h to 2026-11-08,
+  20.5 % of 934,909 fetched docs were AWS WAF 202 challenge pages. 453,326 fetched docs
+  on 7,595 hosts were one shared "Client Challenge" page: status 200 with
+  `text_len = 211`, so a length test alone counts it as real.
+- So the report also gives two counts over on-list docs, next to `states`. `real_text`
+  is the fetched docs with status 200, at least `real_text_min_chars` (200) of body
+  text, and a `payload_sha1` not in `challenge_sha1`. `waf_202` is the fetched 202s.
+- These docs stay `fetched`, on the list and in the index. On the dev half of golden
+  batches 20 and 21, 202 docs still hit at 0.533 and 0.426, through URL terms and list
+  rank. Their outcome, retry and host
+  handling do not change: PR #29 removed the blanket 202/403 host block, because host
+  probing starved healthy URLs.
 - Round 6 (2026-11-01, `index-selection` experiment 2026-10-29, with that isel wait):
   two capped hosts got 0.196–0.202 req/s (13.8–14.5 days). One whose simulated slot is
   0.33 req/s got 0.159–0.171 (16.4–17.6 days), held back by its slot. Host2's capped
@@ -256,12 +268,15 @@ committed, then sent.
    crawler regroups them by host anyway. Docs become `dispatched`, each host gets
    `batch_id`, its `next_at` stays as it is, and the claim commits. The host is ready
    again once that batch is drained, or its job is applied or lost.
-7. **Send** each job and record the answer:
+7. **Send** each job and record the answer. URLs go out percent-encoded (`wire_url`):
+   path, query and fragment escape what RFC 3986 does not allow there, such as `[`, `]`
+   and `|`, which the API's `validators.url` rejects; existing `%XX` escapes, scheme and
+   host stay as they are. A doc keeps its stored URL, its `doc_id` and its text rows' `url`.
 
 | Response | Verdict |
 |---|---|
 | 200 with a `job_id` | `submitted` |
-| 400 "Invalid HTTP(S) URL at index N" | doc N becomes `gone` (`invalid_url`); the rest is sent again, at most `max_resend` (20) times |
+| 400 "Invalid HTTP(S) URL at index N" | the API rejects doc N even encoded: it becomes `gone` (`invalid_url`); the rest is sent again, at most `max_resend` (20) times |
 | other 400, 415, 500, 503 | nothing accepted: `lost`, docs released; pause `api_backoff_s`; unsent jobs released |
 | no reply, or 200 without a usable `job_id` | unknown: the job stays `claimed` until the claim timeout; unsent jobs released |
 
@@ -280,7 +295,10 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 2. Read `request.json` (`urls` and `crawler_ids`, one crawler per URL) and, for every
    listed position N, `NNNNN.json` in partition `crawler_{crawler_ids[N]:02d}`. Check
    each record: required keys and types, `url` equal to `request.json`'s N-th URL,
-   `html_file` only `NNNNN.html`, timestamps with a UTC offset.
+   `html_file` only `NNNNN.html`, timestamps with a UTC offset. `status_code` is checked
+   for type only (integer or null): the crawler passes on whatever integer the site sent
+   (781 and 901 were seen), so a value is never a breach. A status outside 100–999 is
+   stored as NULL `http_status`; its number stays in `fail_reason` (`http_<n>`).
 3. Map results to docs (`map_results`):
    - Same length: result i is doc i. If a URL differs and equals another sent URL, the
      order changed: a contract breach. Canonicalization alone is fine (PR #84's w3lib
@@ -302,7 +320,7 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 
 | Result | New state | Next attempt |
 |---|---|---|
-| 2xx HTML | `fetched`; `text_file`, `text_len`, `lang`, `payload_sha1` set | after `stale_days` (30) |
+| 2xx HTML, challenge pages included (§3) | `fetched`; `text_file`, `text_len`, `lang`, `payload_sha1` set | after `stale_days` (30) |
 | 2xx non-HTML, 404, 410 | `gone` | never |
 | `IgnoreRequest` (robots.txt) | `failed` | after `robots_retry_days` (30) |
 | 429, 503 | `failed`, `attempts + 1`; host paused `retry_base_s` | exponential backoff |
@@ -336,6 +354,22 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 - `recrawl-plan`: `network_mode: host`, because the API listens on `127.0.0.1:4000`
   only; the API has no auth, so no token. It also sends the DELETEs. 2 CPUs, 4 GB.
 - `recrawl-archive`: 8 CPUs for `archive_workers`, 8 GB.
+- Threads: `pids_limit` 512 counts threads, and libraries size their pools by the host's
+  144 cores, not by `cpus`. Each archive worker is a spawn process that imports
+  `isel.cli` and `isel.recrawl`, so neither may import DuckDB at module level: DuckDB
+  1.4–1.5 starts one thread per core on `import duckdb` (fixed in 2.0). On 2026-11-02
+  that gave 208 threads per process, and 9 processes broke the pool 39 times in 40
+  minutes. `OPENBLAS_NUM_THREADS=1` caps the numpy that pyarrow loads. A test checks the
+  worker imports.
+- Dead connections: a selectdb connection can die on one end only. On 2026-11-02 Host1
+  reset the planner's connection while sending a large `_drain` result (11:48 and
+  17:30); the second time the reset never reached Host2, and `recrawl-plan` waited in
+  `poll()` for 16 minutes until restarted by hand. `selectdb.connect` sets TCP keepalive
+  on both ends (`[selectdb] keepalives_*`): the client finds a dead server in 60 s and
+  exits for `restart: unless-stopped`; the server drops a dead client in 60 s, which
+  frees its instance lock for the restarted loop. libpq's own default keeps the OS
+  idle time of 2 h. `tcp_user_timeout` is left at the OS default (about 15 min of
+  retransmits) so a long publish `COPY` survives a server that stalls for a minute.
 - Both: profile `recrawl`, `restart: unless-stopped`, `/data/manual_bulk_crawls/results`
   read-only, `/data/isel` read-write. Run `mkdir -p /data/isel` as the isel user before
   `up`, or Docker creates it as root.

@@ -55,6 +55,8 @@ services:
     command: ["recrawl-plan"]
     restart: unless-stopped
     network_mode: host                  # the API listens on 127.0.0.1:4000 only
+    environment:
+      OPENBLAS_NUM_THREADS: "1"         # pyarrow loads numpy; OpenBLAS starts 64 threads
     volumes:
       - /data/manual_bulk_crawls/results:/data/manual_bulk_crawls/results:ro  # job status
       - /data/isel:/data/isel                                  # min_free_gb is measured here
@@ -67,6 +69,10 @@ services:
     profiles: [recrawl]
     command: ["recrawl-archive"]
     restart: unless-stopped
+    # pids_limit (512) counts threads. Each spawn worker loads numpy through pyarrow:
+    # OpenBLAS would start 64 threads in each of the 9 processes.
+    environment:
+      OPENBLAS_NUM_THREADS: "1"
     volumes:
       - /data/manual_bulk_crawls/results:/data/manual_bulk_crawls/results:ro
       - /data/isel:/data/isel
