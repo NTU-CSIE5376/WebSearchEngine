@@ -327,7 +327,7 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 | 2xx HTML, challenge pages included (§3) | `fetched`; `text_file`, `text_len`, `lang`, `payload_sha1` set | after `stale_days` (30) |
 | 2xx non-HTML, 404, 410 | `gone` | never |
 | `IgnoreRequest` (robots.txt) | `failed` | after `robots_retry_days` (30) |
-| 429, 503 | `failed`, `attempts` unchanged; host paused `retry_base_s · 2^throttle_streak`, cap `host_pause_max_s` (24 h) | when the host's pause ends |
+| 429, 503 | `failed`, `attempts` unchanged; host paused `retry_base_s` (10 min), or `retry_base_s · 2^throttle_streak` up to `host_pause_max_s` (6 h) when its batch had no 200 page | when the host's pause ends |
 | 401, 402, 403 (`refusal_reasons`) | `failed`, `attempts + 1` | as below, but `stale_days` after `refusal_max_attempts` (2) |
 | other failure, `unmatched`, extraction failure | `failed`, `attempts + 1` | `retry_base_s · 2^attempts`, cap 24 h; `stale_days` after `max_attempts` (5) |
 
@@ -335,10 +335,24 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
   the doc still waits on this job. A doc of the job with no result is retried
   (`no_result`).
 - A 429 or 503 is about the host, not the doc, so it uses none of the doc's attempts.
-  `throttle_streak` counts the host's batches in a row with one and is reset by a batch
-  without one, so a host that answers only 429 waits 10 min, 20 min, 40 min, ... up to
-  24 h between batches. This is the existing 429/503 pause made to grow, not a host
-  block: a host with no 429 or 503 is never paused (#29).
+  The host's pause depends on its own results in the batch:
+
+  | Its results in the batch | Pause | `throttle_streak` |
+  |---|---|---|
+  | a 429 or 503 and no 200 page | `retry_base_s · 2^throttle_streak`, cap `host_pause_max_s` | + 1 until the pause reaches the cap |
+  | a 429 or 503 and a 200 page | `retry_base_s` | 0 |
+  | no 429 or 503 | none | 0 |
+
+  A host that answers only 429 (or 429 and 202 challenges) waits 10, 20, 40 min, ... up
+  to 6 h between batches; a host that still serves pages keeps the 10-min pause. This
+  is the existing 429/503 pause made to grow, not a host block: a host with no 429 or
+  503 is never paused (#29). Replayed on Host2's batches of 11-05 to 11-08: 3,496 host
+  batches had a 429 and pages. Growing on any 429 would have made the 115 hosts with
+  one take 70,919 h for the same batches, against 2,067 h with a fixed 10-min pause.
+  The 207 spells with
+  no page need the growth: a fixed 10-min pause would send 1.56M requests into them,
+  against 0.21M with a 6-h cap and 0.16M with 24 h, which re-finds a recovered host
+  later (4,270 vs 5,194 docs lost to the delay).
 - On 11-06 to 11-07, 0.18 % of the docs whose first failure was a 403 were fetched
   later, against 57.9 % after a 429 (#32), so a refusal gets 2 attempts, not 5.
 

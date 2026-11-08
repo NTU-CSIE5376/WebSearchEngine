@@ -750,17 +750,23 @@ def test_recrawl_plan_frees_a_host_whose_docs_are_done_while_its_job_runs(select
         admin.close()
 
 
-def test_recrawl_drain_frees_a_throttled_host_and_pauses_it_once(selectdb, tmp_path, stub):
+# A1's answer beside A2's 429, the pause (in retry_base_s) and the streak after it, from a
+# streak of 2: a 200 page means a rate limit, a 202 challenge alone counts as no page.
+@pytest.mark.parametrize("first, pause, streak", [(ENGLISH, 1, 0),
+                                                  (Page(status=202, body=ENGLISH.body), 4, 3)])
+def test_recrawl_drain_frees_a_throttled_host_and_pauses_it_once(selectdb, tmp_path, stub,
+                                                                 first, pause, streak):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub)
     r = cfg.recrawl
     _setup(cfg)
     admin = _admin(cfg)
     try:
         _live(cfg, admin, tmp_path, [A1, A2, A3, B1])
+        admin.execute("UPDATE recrawl.host SET throttle_streak = 2")
         api = _api(stub)
         plan_cycle(cfg, admin, T0, api)
         ((batch, job_id, _, _),) = _jobs(admin)
-        crawler = FakeCrawler(stub, {A1: ENGLISH, A2: Page(status=429), A3: ENGLISH,
+        crawler = FakeCrawler(stub, {A1: first, A2: Page(status=429), A3: ENGLISH,
                                      B1: ENGLISH})
         crawler.fetch(job_id, [A1, A2], T0)
         # A's docs are done, one with a 429: A is freed and paused now, while B still
@@ -768,9 +774,9 @@ def test_recrawl_drain_frees_a_throttled_host_and_pauses_it_once(selectdb, tmp_p
         drained = T0 + timedelta(seconds=1)
         got = plan_cycle(cfg, admin, drained, api)
         assert (got["drained"], got["jobs"]) == (1, 0)
-        pause_end = drained + timedelta(seconds=r.retry_base_s)
+        pause_end = drained + timedelta(seconds=pause * r.retry_base_s)
         assert _host(admin, "a.example") == (None, pause_end)
-        assert _streak(admin, "a.example") == 1
+        assert _streak(admin, "a.example") == streak
         assert _host(admin, "b.example")[0] == batch
 
         # After the pause A's next batch goes out, though its first job is still open.
@@ -783,7 +789,7 @@ def test_recrawl_drain_frees_a_throttled_host_and_pauses_it_once(selectdb, tmp_p
         _poll(cfg, admin, stub, applied)
         assert archive_cycle(cfg, admin, applied)["jobs"] == 1
         assert _host(admin, "a.example")[1] == pause_end
-        assert _streak(admin, "a.example") == 1
+        assert _streak(admin, "a.example") == streak
         assert _doc(admin, A2, "state", "attempts", "due_at") == ("failed", 0, applied)
     finally:
         admin.close()
@@ -850,6 +856,48 @@ def test_recrawl_pause_grows_with_throttled_batches_in_a_row(selectdb, tmp_path,
         _round(cfg, admin, stub, api, crawler, at)
         assert stub.posts[-1] == [A2]
         assert _host(admin, "a.example") == (None, at + timedelta(seconds=600))
+        assert _doc(admin, A2, "attempts") == (0,)
+    finally:
+        admin.close()
+
+
+def test_recrawl_pause_grows_only_when_a_batch_fetched_no_page(selectdb, tmp_path, stub):
+    """A host that still serves 200 pages next to its 429s is rate limited, not blocking:
+    it keeps the base pause however long its streak was. A 202 challenge is no page."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, job_size=2, host_docs_per_job=2)
+    base = timedelta(seconds=cfg.recrawl.retry_base_s)
+    a4 = "https://a.example/4"
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, a4])
+        api = _api(stub)
+        crawler = FakeCrawler(stub, {A1: ENGLISH, A2: Page(status=429)})
+        _round(cfg, admin, stub, api, crawler, T0)
+        assert stub.posts[-1] == [A1, A2]
+        assert _host(admin, "a.example") == (None, T0 + base)
+        assert _streak(admin, "a.example") == 0
+        # A long streak does not survive a batch that fetched a page.
+        admin.execute("UPDATE recrawl.host SET throttle_streak = 3")
+        crawler.web[A3] = ENGLISH
+        at = T0 + base
+        _round(cfg, admin, stub, api, crawler, at)
+        assert sorted(stub.posts[-1]) == [A2, A3]
+        assert _host(admin, "a.example") == (None, at + base)
+        assert _streak(admin, "a.example") == 0
+        # 429 beside a 202 challenge: no page, so the pause starts to grow.
+        crawler.web[a4] = Page(status=202, body=ENGLISH.body)
+        at += base
+        _round(cfg, admin, stub, api, crawler, at)
+        assert sorted(stub.posts[-1]) == [A2, a4]
+        assert _doc(admin, a4, "state", "http_status") == ("fetched", 202)
+        assert _host(admin, "a.example") == (None, at + base)
+        assert _streak(admin, "a.example") == 1
+        at += base
+        _round(cfg, admin, stub, api, crawler, at)
+        assert stub.posts[-1] == [A2]
+        assert _host(admin, "a.example") == (None, at + 2 * base)
+        assert _streak(admin, "a.example") == 2
         assert _doc(admin, A2, "attempts") == (0,)
     finally:
         admin.close()

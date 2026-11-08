@@ -516,7 +516,9 @@ def _drain(cfg: Config, conn: psycopg.Connection, now: datetime,
     most one unfinished batch per host. The docs stay `dispatched` until the
     archive applies the job. A host with a 429 or 503 among them gets its pause
     here, in the same transaction, so the pause still lands before its next
-    job; the apply leaves a host it no longer holds alone. A job whose
+    job; the apply leaves a host it no longer holds alone. A page is judged from
+    the record alone, before text extraction, so a page the archive later fails
+    to extract still counts as one here. A job whose
     `request.json` is missing or dropped duplicates (positions differ from the
     docs sent) is left to the archive.
     """
@@ -536,13 +538,14 @@ def _drain(cfg: Config, conn: psycopg.Connection, now: datetime,
         held.setdefault(batch, {}).setdefault(host, []).append(doc_id)
     r = cfg.recrawl
     free: list[tuple[int, int]] = []
-    throttled: set[int] = set()
+    throttled: dict[int, bool] = {}      # host -> no page in its batch (the pause grows)
     for batch, job_id, doc_ids in jobs:
         if batch in held:
-            for host, hit in _drained(Path(r.result_root) / job_id, doc_ids, held[batch]):
+            for host, hit, paged in _drained(Path(r.result_root) / job_id, doc_ids,
+                                             held[batch]):
                 free.append((host, batch))
                 if hit:
-                    throttled.add(host)
+                    throttled[host] = not paged
     if not free:
         return
     with conn.transaction(), conn.cursor() as cur:
@@ -552,9 +555,12 @@ def _drain(cfg: Config, conn: psycopg.Connection, now: datetime,
                     "WHERE h.host_id = u.host_id AND h.batch_id = u.batch_id RETURNING h.host_id",
                     tuple(map(list, zip(*free, strict=True))))
         freed = [h for (h,) in cur.fetchall()]
-        cur.execute(_THROTTLE.format("WHERE h.host_id = ANY(%(hosts)s::bigint[])"),
+        paused = [h for h in freed if h in throttled]
+        cur.execute(_THROTTLE.format("u.grow", "FROM unnest(%(hosts)s::bigint[], "
+                                     "%(grow)s::bool[]) AS u(host_id, grow) "
+                                     "WHERE h.host_id = u.host_id"),
                     {"now": now, "base": r.retry_base_s, "pause": r.host_pause_max_s,
-                     "hosts": [h for h in freed if h in throttled]})
+                     "hosts": paused, "grow": [throttled[h] for h in paused]})
         cur.execute("UPDATE recrawl.host SET throttle_streak = 0 "
                     "WHERE host_id = ANY(%s::bigint[]) AND throttle_streak > 0",
                     ([h for h in freed if h not in throttled],))
@@ -563,8 +569,8 @@ def _drain(cfg: Config, conn: psycopg.Connection, now: datetime,
 
 
 def _drained(job_dir: Path, doc_ids: list[int],
-             docs: dict[int, list[int]]) -> list[tuple[int, bool]]:
-    """(host, any 429/503) for each host in `docs` (host -> doc_ids) with all results on disk."""
+             docs: dict[int, list[int]]) -> list[tuple[int, bool, bool]]:
+    """(host, any 429/503, any 200 page) per host in `docs` with all results on disk."""
     try:
         listing = json.loads((job_dir / "request.json").read_text(encoding="utf-8"))
         urls, owners = listing["urls"], listing["crawler_ids"]
@@ -587,11 +593,13 @@ def _drained(job_dir: Path, doc_ids: list[int],
         if not all(f"{n:05d}.json" in names[owners[n]] for n in spots):
             continue
         try:
-            outcomes = [classify(read_item(job_dir / f"crawler_{owners[n]:02d}", n, urls[n]))[0]
-                        for n in spots]
+            items = [read_item(job_dir / f"crawler_{owners[n]:02d}", n, urls[n]) for n in spots]
         except (OSError, ValueError):
             continue                     # the archive reports a bad record
-        out.append((host, "throttled" in outcomes))
+        outcomes = [classify(item)[0] for item in items]
+        out.append((host, "throttled" in outcomes,
+                     any(o == "fetched" and item["status_code"] == 200
+                         for o, item in zip(outcomes, items, strict=True))))
     return out
 
 
@@ -609,13 +617,16 @@ def _delete_applied(conn: psycopg.Connection, api: CrawlerApi, now: datetime,
         stats["deleted"] += 1
 
 
-# A batch with a 429 or 503 pauses its host retry_base_s * 2^throttle_streak, at most
-# host_pause_max_s, and adds one to the streak until the pause reaches that cap. {} picks
-# the hosts.
+# A batch with a 429 or 503 pauses its host. If it fetched no 200 page ({0} is true), the
+# host blocks us: the pause is retry_base_s * 2^throttle_streak, at most host_pause_max_s,
+# and the streak grows until the pause reaches that cap. A batch that also fetched a page
+# only meets a rate limit: the pause is retry_base_s and the streak resets. Both SET
+# expressions read the old streak. {1} picks the hosts.
 _THROTTLE = ("UPDATE recrawl.host h SET next_at = greatest(coalesce(h.next_at, %(now)s), "
-             "%(now)s + make_interval(secs => least(%(base)s * power(2, h.throttle_streak), "
-             "%(pause)s))), throttle_streak = h.throttle_streak + CASE WHEN %(base)s * "
-             "power(2, h.throttle_streak) < %(pause)s THEN 1 ELSE 0 END {}")
+             "%(now)s + make_interval(secs => least(%(base)s * power(2, CASE WHEN {0} "
+             "THEN h.throttle_streak ELSE 0 END), %(pause)s))), throttle_streak = CASE "
+             "WHEN {0} THEN h.throttle_streak + CASE WHEN %(base)s * "
+             "power(2, h.throttle_streak) < %(pause)s THEN 1 ELSE 0 END ELSE 0 END {1}")
 
 # A throttle pause ends within host_pause_max_s, so a later next_at was set by _claim for
 # docs in backoff; it must not hold back docs that are due now.
@@ -1139,8 +1150,12 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
         throttled = ("SELECT 1 FROM r JOIN recrawl.doc d USING (doc_id) "
                      "WHERE r.outcome = 'throttled' AND d.host_id = h.host_id "
                      "AND d.state = 'dispatched' AND d.batch_id = %(batch)s")
-        cur.execute(_THROTTLE.format(f"WHERE h.batch_id = %(batch)s AND EXISTS ({throttled})"),
-                    args)
+        # The docs fetched here are no longer `dispatched`, so r alone names them.
+        no_page = ("NOT EXISTS (SELECT 1 FROM r JOIN recrawl.doc d USING (doc_id) "
+                   "WHERE d.host_id = h.host_id AND r.outcome = 'fetched' "
+                   "AND r.http_status = 200)")
+        cur.execute(_THROTTLE.format(
+            no_page, f"WHERE h.batch_id = %(batch)s AND EXISTS ({throttled})"), args)
         cur.execute("UPDATE recrawl.host h SET throttle_streak = 0 WHERE h.batch_id = %(batch)s "
                     f"AND h.throttle_streak > 0 AND NOT EXISTS ({throttled})", args)
         # The host's pause alone paces a throttled doc, so it keeps its attempts.
