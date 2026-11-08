@@ -251,9 +251,13 @@ committed, then sent.
    freed once every one of its docs there has a result file. `request.json`'s
    `crawler_ids` locate the files, as the archive does; one `scandir` per partition
    lists them. The docs stay `dispatched` until the archive applies the job. A host
-   stays held if one of those results is a 429 or 503, so the apply sets its pause
-   before its next batch. A job whose `request.json` is missing or shorter than the docs
-   sent (dropped duplicates) is left to the apply.
+   with a 429 or 503 among those results is freed too, and gets its pause in the same
+   transaction, so the pause lands before its next batch. The apply then leaves it
+   alone, since the job no longer holds it. Until 11-08 such a host stayed held until
+   the whole job was applied: in the 24 h to 11-08 01:49Z it finished its own docs in
+   a median 5.6 min, then waited a median 45.3 min for the job (#31). A job whose
+   `request.json` is missing or shorter than the docs sent (dropped duplicates) is left
+   to the apply.
 4. **Delete.** Every `applied` job without `deleted_at` gets a `DELETE`. 204 or 404 sets
    `deleted_at`; anything else reports `api_error` and is tried next cycle. This runs even
    while the planner is halted.

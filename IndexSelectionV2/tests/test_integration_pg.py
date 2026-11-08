@@ -750,7 +750,7 @@ def test_recrawl_plan_frees_a_host_whose_docs_are_done_while_its_job_runs(select
         admin.close()
 
 
-def test_recrawl_drain_holds_a_throttled_host_until_its_pause_is_set(selectdb, tmp_path, stub):
+def test_recrawl_drain_frees_a_throttled_host_and_pauses_it_once(selectdb, tmp_path, stub):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub)
     r = cfg.recrawl
     _setup(cfg)
@@ -760,15 +760,31 @@ def test_recrawl_drain_holds_a_throttled_host_until_its_pause_is_set(selectdb, t
         api = _api(stub)
         plan_cycle(cfg, admin, T0, api)
         ((batch, job_id, _, _),) = _jobs(admin)
-        crawler = FakeCrawler(stub, {A1: ENGLISH, A2: Page(status=429), B1: ENGLISH})
+        crawler = FakeCrawler(stub, {A1: ENGLISH, A2: Page(status=429), A3: ENGLISH,
+                                     B1: ENGLISH})
         crawler.fetch(job_id, [A1, A2], T0)
-        assert plan_cycle(cfg, admin, T0, api)["drained"] == 0
-        assert _host(admin, "a.example")[0] == batch
+        # A's docs are done, one with a 429: A is freed and paused now, while B still
+        # holds the job open.
+        drained = T0 + timedelta(seconds=1)
+        got = plan_cycle(cfg, admin, drained, api)
+        assert (got["drained"], got["jobs"]) == (1, 0)
+        pause_end = drained + timedelta(seconds=r.retry_base_s)
+        assert _host(admin, "a.example") == (None, pause_end)
+        assert _streak(admin, "a.example") == 1
+        assert _host(admin, "b.example")[0] == batch
 
-        crawler.take(T0)
-        _poll(cfg, admin, stub, T0)
-        archive_cycle(cfg, admin, T0)
-        assert _host(admin, "a.example") == (None, T0 + timedelta(seconds=r.retry_base_s))
+        # After the pause A's next batch goes out, though its first job is still open.
+        assert plan_cycle(cfg, admin, pause_end, api)["jobs"] == 1
+        assert stub.posts[-1] == [A3]
+        second = _jobs(admin)[1][1]
+        # Applying the first job does not pause A again: that job no longer holds A.
+        applied = pause_end + timedelta(minutes=1)
+        crawler.take(applied, hold={second})
+        _poll(cfg, admin, stub, applied)
+        assert archive_cycle(cfg, admin, applied)["jobs"] == 1
+        assert _host(admin, "a.example")[1] == pause_end
+        assert _streak(admin, "a.example") == 1
+        assert _doc(admin, A2, "state", "attempts", "due_at") == ("failed", 0, applied)
     finally:
         admin.close()
 

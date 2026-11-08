@@ -14,7 +14,8 @@ isel puts its docs back in line.
 - `plan` (loop): packs the due docs of the best-ranked ready hosts into jobs
   and POSTs them. A host has at most one batch not yet done at the crawler:
   once all its docs in a job have results, its next batch goes out in a new
-  job, even while the old job waits for other hosts. The crawler's
+  job, even while the old job waits for other hosts; a host with a 429 or
+  503 among them is paused first. The crawler's
   AutoThrottle slot sets how fast a host's docs go out; isel adds no rate of
   its own. A job is recorded
   `claimed` before it is sent, so no HTTP call runs inside a transaction. Plan
@@ -395,7 +396,7 @@ def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
         _wake(cur, swept, now, r.host_pause_max_s)
         _refresh_best_rank(cur, swept)
     _check_jobs(cfg, conn, api, now, stats)
-    _drain(cfg, conn, stats)
+    _drain(cfg, conn, now, stats)
     _delete_applied(conn, api, now, stats)
 
     counts = dict(conn.execute("SELECT state, count(*) FROM recrawl.job "
@@ -505,17 +506,19 @@ def _check_jobs(cfg: Config, conn: psycopg.Connection, api: CrawlerApi, now: dat
                      (now, batch))
 
 
-def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None:
+def _drain(cfg: Config, conn: psycopg.Connection, now: datetime,
+           stats: dict[str, Any]) -> None:
     """Frees each host whose docs in its open job all have a result on disk.
 
     A job completes only when all its URLs are done, so without this a host
     would wait for the slowest host of its job. Once freed, its next docs go out
     in a new job while the old one is still open; the crawler still holds at
     most one unfinished batch per host. The docs stay `dispatched` until the
-    archive applies the job. A host with a 429 or 503 among them stays held, so
-    its pause is set before its next job. A job whose `request.json` is missing
-    or dropped duplicates (positions differ from the docs sent) is left to the
-    archive.
+    archive applies the job. A host with a 429 or 503 among them gets its pause
+    here, in the same transaction, so the pause still lands before its next
+    job; the apply leaves a host it no longer holds alone. A job whose
+    `request.json` is missing or dropped duplicates (positions differ from the
+    docs sent) is left to the archive.
     """
     jobs = conn.execute(
         "SELECT batch_id, job_id, doc_ids FROM recrawl.job j "
@@ -531,11 +534,15 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
             "WHERE d.state = 'dispatched' AND d.batch_id = ANY(%s::bigint[])",
             ([b for b, _, _ in jobs],)):
         held.setdefault(batch, {}).setdefault(host, []).append(doc_id)
+    r = cfg.recrawl
     free: list[tuple[int, int]] = []
+    throttled: set[int] = set()
     for batch, job_id, doc_ids in jobs:
         if batch in held:
-            free += [(host, batch) for host in _drained(
-                Path(cfg.recrawl.result_root) / job_id, doc_ids, held[batch])]
+            for host, hit in _drained(Path(r.result_root) / job_id, doc_ids, held[batch]):
+                free.append((host, batch))
+                if hit:
+                    throttled.add(host)
     if not free:
         return
     with conn.transaction(), conn.cursor() as cur:
@@ -545,14 +552,19 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
                     "WHERE h.host_id = u.host_id AND h.batch_id = u.batch_id RETURNING h.host_id",
                     tuple(map(list, zip(*free, strict=True))))
         freed = [h for (h,) in cur.fetchall()]
+        cur.execute(_THROTTLE.format("WHERE h.host_id = ANY(%(hosts)s::bigint[])"),
+                    {"now": now, "base": r.retry_base_s, "pause": r.host_pause_max_s,
+                     "hosts": [h for h in freed if h in throttled]})
         cur.execute("UPDATE recrawl.host SET throttle_streak = 0 "
-                    "WHERE host_id = ANY(%s::bigint[]) AND throttle_streak > 0", (freed,))
+                    "WHERE host_id = ANY(%s::bigint[]) AND throttle_streak > 0",
+                    ([h for h in freed if h not in throttled],))
         _refresh_best_rank(cur, freed)
     stats["drained"] = len(freed)
 
 
-def _drained(job_dir: Path, doc_ids: list[int], docs: dict[int, list[int]]) -> list[int]:
-    """The hosts in `docs` (host -> its doc_ids) whose results are all on disk, unthrottled."""
+def _drained(job_dir: Path, doc_ids: list[int],
+             docs: dict[int, list[int]]) -> list[tuple[int, bool]]:
+    """(host, any 429/503) for each host in `docs` (host -> doc_ids) with all results on disk."""
     try:
         listing = json.loads((job_dir / "request.json").read_text(encoding="utf-8"))
         urls, owners = listing["urls"], listing["crawler_ids"]
@@ -579,8 +591,7 @@ def _drained(job_dir: Path, doc_ids: list[int], docs: dict[int, list[int]]) -> l
                         for n in spots]
         except (OSError, ValueError):
             continue                     # the archive reports a bad record
-        if "throttled" not in outcomes:
-            out.append(host)
+        out.append((host, "throttled" in outcomes))
     return out
 
 
