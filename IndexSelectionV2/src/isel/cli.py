@@ -309,7 +309,7 @@ def cmd_recrawl_plan(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.recrawl import capacity_report, run_planner
 
     if args.dry_run:
-        return _recrawl(cfg, lambda conn: capacity_report(conn, datetime.now(UTC)),
+        return _recrawl(cfg, lambda conn: capacity_report(cfg.recrawl, conn, datetime.now(UTC)),
                         read_only=True)
     return _recrawl(cfg, lambda conn: run_planner(cfg, conn, args.once))
 

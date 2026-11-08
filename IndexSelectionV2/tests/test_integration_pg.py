@@ -303,6 +303,28 @@ def _list_constraints(table):
     return [(f"{table}_pkey", "p", None), (f"{table}_run_id_fkey", "f", "r")]
 
 
+@pytest.mark.parametrize("read_only", [False, True])
+def test_selectdb_connections_find_a_dead_peer_within_a_minute(selectdb, read_only):
+    # On 2026-11-02 Host1 reset the planner's connection mid-result; the reset never
+    # reached Host2, so recrawl-plan waited in poll() on a socket with the OS default
+    # keepalive (2 h idle). Both ends must probe; the server's end holds our locks.
+    s = selectdb.selectdb
+    conn = connect(selectdb, s.admin_dsn_env, read_only=read_only)
+    try:
+        params = conn.info.get_parameters()
+        assert (params["keepalives"], params["keepalives_idle"],
+                params["keepalives_interval"], params["keepalives_count"]) == (
+            "1", str(s.keepalives_idle_s), str(s.keepalives_interval_s),
+            str(s.keepalives_count))
+        server = [conn.execute(f"SHOW {g}").fetchone()[0] for g in (
+            "tcp_keepalives_idle", "tcp_keepalives_interval", "tcp_keepalives_count",
+            "default_transaction_read_only")]
+        assert server == [str(s.keepalives_idle_s), str(s.keepalives_interval_s),
+                          str(s.keepalives_count), "on" if read_only else "off"]
+    finally:
+        conn.close()
+
+
 def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
     cfg = selectdb
     admin = _admin(cfg)
@@ -538,7 +560,7 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         _go_live(cfg, admin, tmp_path, "r1", [A1, A2, "https://a.example/x/../2", A3, B1, C1])
         synced = sync(cfg, admin, now=lambda: OPEN)
         assert (synced["docs"], synced["dropped"], synced["hosts_due"]) == (5, 0, 3)
-        report = capacity_report(admin, OPEN)
+        report = capacity_report(r, admin, OPEN)
         assert (report["docs"], report["left"], report["fetched_1d"]) == (5, 5, 0)
         assert report["days_left"] is None and report["largest_left"]["left"] == 3
 
@@ -595,7 +617,7 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         assert _jobs(admin)[0][2] == "applied"
         assert archive_cycle(cfg, admin, done)["jobs"] == 0      # applied once only
         # Progress is measured from fetched_at: A1 and B1 in the last day, 3 docs left.
-        report = capacity_report(admin, done + timedelta(seconds=10))
+        report = capacity_report(r, admin, done + timedelta(seconds=10))
         assert (report["left"], report["fetched_1d"], report["days_left"]) == (3, 2, 1.5)
         assert report["largest_left"] == {"left": 2, "fetched_1d": 1, "days_left": 2.0}
 
@@ -616,6 +638,28 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         stale = later + timedelta(days=r.stale_days, seconds=1)
         revisit = plan_cycle(cfg, admin, stale, api)
         assert revisit["swept"] == 4 and stub.posts[-1] == [A1, A2, B1, C1]
+    finally:
+        admin.close()
+
+
+def test_recrawl_report_counts_real_text_apart_from_challenge_pages(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, B1, C1])
+        long_text, short_text = r.real_text_min_chars, r.real_text_min_chars - 1
+        # A real page, a WAF 202, a shared challenge page with long text, a short page.
+        for url, status, text_len, sha in [
+                (A1, 200, long_text, "0" * 40), (A2, 202, long_text, "1" * 40),
+                (A3, 200, long_text, r.challenge_sha1[0]), (B1, 200, short_text, "2" * 40)]:
+            admin.execute("UPDATE recrawl.doc SET state = 'fetched', fetched_at = %s, "
+                          "http_status = %s, text_len = %s, payload_sha1 = %s "
+                          "WHERE doc_id = %s", (OPEN, status, text_len, sha, pg_doc_id(url)))
+        report = capacity_report(r, admin, OPEN + timedelta(seconds=1))
+        assert report["states"] == {"fetched": 4, "pending": 1}
+        assert (report["real_text"], report["waf_202"]) == (1, 1)
     finally:
         admin.close()
 
@@ -760,6 +804,34 @@ def test_recrawl_plan_drops_an_invalid_url_and_sends_the_rest(selectdb, tmp_path
         ((_, _, state, doc_ids),) = _jobs(admin)
         assert (state, doc_ids) == ("submitted", [pg_doc_id(A1), pg_doc_id(C1)])
         assert _host(admin, "b.example")[0] is None          # nothing of B left in the job
+    finally:
+        admin.close()
+
+
+def test_recrawl_sends_a_url_percent_encoded_and_keeps_the_stored_one(selectdb, tmp_path,
+                                                                     stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    brackets, pipe = "https://d.example/matches/[seo]/[h2h]", "https://e.example/a|b/c"
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, brackets, pipe])
+        stub.reject = {brackets}             # as `validators.url` judges it; the stub rejects "|"
+        got = plan_cycle(cfg, admin, T0, _api(stub))
+        assert (got["jobs"], got["invalid"], got["docs"]) == (1, 0, 3)
+        assert stub.posts == [[A1, "https://d.example/matches/%5Bseo%5D/%5Bh2h%5D",
+                               "https://e.example/a%7Cb/c"]]
+        ((batch, job_id, _, doc_ids),) = _jobs(admin)
+        assert doc_ids == [pg_doc_id(u) for u in (A1, brackets, pipe)]
+        assert _doc(admin, brackets, "url") == (brackets,)
+        FakeCrawler(stub, {u: ENGLISH for u in stub.manifest(job_id)["urls"]}).take(T0)
+        _poll(cfg, admin, stub, T0)
+        assert archive_cycle(cfg, admin, T0)["texts"] == 3
+        for url in (brackets, pipe):
+            assert _doc(admin, url, "state", "url") == ("fetched", url)
+        text = Path(cfg.recrawl.text_root) / f"fetch_date=20261015/job-{batch}.parquet"
+        assert sorted(pq.read_table(text, columns=["url"]).column("url").to_pylist()) == sorted(
+            [A1, brackets, pipe])
     finally:
         admin.close()
 

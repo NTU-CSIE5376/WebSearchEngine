@@ -29,7 +29,9 @@ Results map to docs by position: `request.json` lists the URLs in the order
 sent, after the API canonicalizes them and drops duplicates, and the crawler
 that owns each one (`crawler_ids`). Result n is `crawler_{crawler_ids[n]:02d}/
 {n:05d}.json`, as the API resolves its downloads. The archive checks the order
-before it trusts it (`map_results`).
+before it trusts it (`map_results`). URLs go out percent-encoded (`wire_url`),
+as the API rejects a raw `[`, `]` or `|`; a doc keeps its stored URL in
+`recrawl.doc` and in its text rows.
 
 Every frontier transaction takes one advisory lock, so plan, archive and sync
 never interleave their updates and cannot deadlock.
@@ -62,10 +64,8 @@ import pyarrow as pa
 from isel.config import Config, RecrawlCfg
 from isel.extract import extract
 from isel.io import TMP_SUFFIX, commit_file, open_duckdb, sql_str, write_parquet_atomic
-from isel.manifest import validate_run
-from isel.publish import swap_allowed
 from isel.schema import DUE_STATES, OPEN_JOB_STATES
-from isel.urlnorm import md5_number_lower
+from isel.urlnorm import md5_number_lower, wire_url
 
 LOCK_CYCLE = 0x15E1_DB02      # xact lock held by every frontier transaction
 LOCK_INSTANCE = {"sync": 0x15E1_DB03, "plan": 0x15E1_DB04, "archive": 0x15E1_DB05}
@@ -73,6 +73,7 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 BAD_INDEX_RE = re.compile(r"\bat index (\d+)$")
 NON_HTML = "NonHTML content-type"       # the crawler's error for a 2xx without HTML
 ITEM_KEYS = frozenset({"url", "final_url", "status_code", "error", "html_file", "fetched_at"})
+HTTP_STATUS = range(100, 1000)          # three digits (RFC 9110 §15); fits SMALLINT
 RESULT_COLUMNS = ("doc_id", "outcome", "http_status", "final_url", "fail_reason",
                   "payload_sha1", "fetched_at", "text_len", "lang")
 # One row per fetched page, the input of the inverted index (docs/RECRAWL.md).
@@ -159,6 +160,11 @@ def run_loop(cycle: Callable[[], dict[str, Any]], interval_s: float, once: bool,
 def sync(cfg: Config, conn: psycopg.Connection,
          now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> dict[str, Any]:
     """Makes the frontier match the live run: new docs, new ranks, docs off the list."""
+    # Imported here: both import DuckDB, which starts one thread per host core on
+    # import, and the archive workers import this module.
+    from isel.manifest import validate_run
+    from isel.publish import swap_allowed
+
     at = now()
     if not swap_allowed(at, cfg.schedule):
         raise RecrawlError("swap freeze window: the metric may be reading selectdb")
@@ -341,7 +347,7 @@ def run_planner(cfg: Config, conn: psycopg.Connection, once: bool) -> dict[str, 
 
 @dataclass
 class Job:
-    """A claimed job: its docs in the order their URLs are sent."""
+    """A claimed job: its docs and, in the same order, their URLs as sent (`wire_url`)."""
 
     batch_id: int
     doc_ids: list[int]
@@ -675,7 +681,7 @@ def _claim(cfg: Config, cur: psycopg.Cursor, now: datetime, n_jobs: int) -> list
     jobs = []
     for (batch,), groups in zip(cur.fetchall(), packed, strict=True):
         order = [d for _, docs in groups for d in docs]
-        jobs.append(Job(batch, [d for d, _ in order], [u for _, u in order]))
+        jobs.append(Job(batch, [d for d, _ in order], [wire_url(u) for _, u in order]))
     cur.executemany("INSERT INTO recrawl.job (batch_id, doc_ids, state, claimed_at) "
                     "VALUES (%s, %s, 'claimed', %s)",
                     [(j.batch_id, j.doc_ids, now) for j in jobs])
@@ -700,8 +706,8 @@ def _send(cfg: Config, conn: psycopg.Connection, api: CrawlerApi, jobs: list[Job
     """POSTs claimed jobs in order and records each answer (docs/03 §3.6).
 
     - 200: the job is `submitted` under its `job_id`.
-    - 400 "... at index N": that URL is unfetchable; it becomes `gone` and the
-      rest is sent again, at most `max_resend` times.
+    - 400 "... at index N": the API rejects that URL even percent-encoded; it
+      becomes `gone` and the rest is sent again, at most `max_resend` times.
     - Any other 4xx or 5xx: the API accepted nothing. The job is released,
       sending stops, and the planner pauses `api_backoff_s`.
     - No answer: acceptance is unknown, so the job stays `claimed` (the claim
@@ -775,11 +781,14 @@ def _days(left: int, per_day: int) -> float | None:
     return round(left / per_day, 1) if per_day else None
 
 
-def capacity_report(conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
+def capacity_report(r: RecrawlCfg, conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
     """Progress of the live list, measured: docs left and docs fetched in the last day.
 
     No rate is assumed: the crawler's pace shows in `fetched_at`. Days left are the
     docs left over the last day's fetches, for the list and for its largest host.
+    `fetched` counts every 2xx HTML; `real_text` counts the fetched 200s with at least
+    `real_text_min_chars` of body that are not a shared challenge page, and `waf_202` the
+    fetched 202s (AWS WAF challenges). Both only report: outcomes do not change.
     """
     rows = conn.execute(
         "SELECT count(*), count(*) FILTER (WHERE state <> 'fetched'), "
@@ -788,9 +797,16 @@ def capacity_report(conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
         (now - timedelta(days=1),)).fetchall()
     docs, left, day = (np.array(c, dtype=np.int64) for c in zip(*rows, strict=True)) \
         if rows else (np.zeros(0, dtype=np.int64),) * 3
-    states = dict(conn.execute("SELECT state, count(*) FROM recrawl.doc "
-                               "WHERE rank IS NOT NULL GROUP BY state").fetchall())
+    counts = conn.execute(
+        "SELECT state, count(*), count(*) FILTER (WHERE state = 'fetched' "
+        "AND http_status = 200 AND text_len >= %s AND payload_sha1 IS NOT NULL "
+        "AND payload_sha1 <> ALL(%s::text[])), "
+        "count(*) FILTER (WHERE state = 'fetched' AND http_status = 202) "
+        "FROM recrawl.doc WHERE rank IS NOT NULL GROUP BY state",
+        (r.real_text_min_chars, r.challenge_sha1)).fetchall()
+    states = {state: n for state, n, _, _ in counts}
     report = {"docs": int(docs.sum()), "hosts": int(docs.size), "states": states,
+              "real_text": sum(c[2] for c in counts), "waf_202": sum(c[3] for c in counts),
               "max_host_docs": int(docs.max()) if docs.size else 0,
               "left": int(left.sum()), "fetched_1d": int(day.sum()),
               "days_left": _days(int(left.sum()), int(day.sum())), "largest_left": None}
@@ -889,6 +905,11 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _http_status(value: int | None) -> int | None:
+    """The status as stored: anything but three digits is kept only in `fail_reason`."""
+    return value if value in HTTP_STATUS else None
+
+
 def _timestamp(value: Any, key: str) -> datetime:
     if not isinstance(value, str):
         raise ValueError(f"{key} must be an ISO 8601 string")
@@ -909,9 +930,9 @@ def read_item(part: Path, index: int, url: str) -> dict[str, Any]:
         raise ValueError(f"{name} lacks a result key")
     if item["url"] != url:
         raise ValueError(f"{name} is for another URL than request.json lists")
-    status = item["status_code"]
-    if status is not None and not (_is_int(status) and 100 <= status <= 599):
-        raise ValueError(f"{name}: status_code must be an HTTP status or null")
+    # Only the type: the value is whatever integer the site sent (781, 901, ...).
+    if item["status_code"] is not None and not _is_int(item["status_code"]):
+        raise ValueError(f"{name}: status_code must be an integer or null")
     for key in ("final_url", "error"):
         if item[key] is not None and not isinstance(item[key], str):
             raise ValueError(f"{name}: {key} must be a string or null")
@@ -1009,7 +1030,7 @@ def _record(r: RecrawlCfg, part: Path, job: JobInput, i: int, item: dict[str, An
         rec["outcome"], rec["fail_reason"] = "retry", "unmatched"
         return rec
     rec["outcome"], rec["fail_reason"] = classify(item)
-    rec.update(http_status=item["status_code"], final_url=item["final_url"],
+    rec.update(http_status=_http_status(item["status_code"]), final_url=item["final_url"],
                fetched_at=item["fetched_at"])
     if rec["outcome"] != "fetched":
         return rec

@@ -53,9 +53,18 @@ def connect(cfg: Config, dsn_env: str, read_only: bool) -> psycopg.Connection:
     dsn = require_env(dsn_env)
     if int(conninfo_to_dict(dsn).get("port") or 5432) in s.forbidden_ports:
         raise ForbiddenTarget(f"{dsn_env} points at a forbidden port")
+    # The server's tcp_keepalives_* are per-session GUCs: setting them at startup makes
+    # the server drop a dead client (and its locks) as fast as we notice a dead server.
+    options = [f"-c tcp_keepalives_idle={s.keepalives_idle_s}",
+               f"-c tcp_keepalives_interval={s.keepalives_interval_s}",
+               f"-c tcp_keepalives_count={s.keepalives_count}"]
+    if read_only:
+        options.append("-c default_transaction_read_only=on")
     conn = psycopg.connect(dsn, autocommit=True, application_name=f"{cfg.run.app_name}_select",
-                           connect_timeout=s.connect_timeout_s,
-                           options="-c default_transaction_read_only=on" if read_only else "")
+                           connect_timeout=s.connect_timeout_s, keepalives=1,
+                           keepalives_idle=s.keepalives_idle_s,
+                           keepalives_interval=s.keepalives_interval_s,
+                           keepalives_count=s.keepalives_count, options=" ".join(options))
     try:
         if conn.info.port in s.forbidden_ports:
             raise ForbiddenTarget(f"{dsn_env} reached a forbidden port")
