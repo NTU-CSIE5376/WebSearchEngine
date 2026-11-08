@@ -268,6 +268,11 @@ result_ttl_days = 3                      # the job's ttl_days: the API stops it 
                                          # results this long after the POST; isel deletes sooner
 max_resend = 20                          # 400 "at index N" drops one URL and sends again
 sweep_rows = 100000                      # fetched docs made due again per plan cycle
+revisit = false                          # sweep due fetched docs back in line. Off since
+                                         # 2026-11-08: under manual_first each revisit goes
+                                         # before the normal crawl (at 0.88 of baseline),
+                                         # and its gain on the metric is unmeasured. due_at
+                                         # is still set, so turning it on resumes revisits
 stale_days = 30                          # uniform revisit interval
 retry_base_s = 600                       # failed doc: retry_base_s * 2^attempts
 retry_max_s = 86400

@@ -207,6 +207,7 @@ class RecrawlCfg:
     result_ttl_days: int
     max_resend: int
     sweep_rows: int
+    revisit: bool
     stale_days: int
     retry_base_s: int
     retry_max_s: int

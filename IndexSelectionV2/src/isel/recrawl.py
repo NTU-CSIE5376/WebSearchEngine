@@ -364,6 +364,7 @@ def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
     """One planning pass; returns counts.
 
     1. Recover: a job whose POST got no answer is lost after `claim_timeout_s`.
+       With `revisit` on, fetched docs past `due_at` return to `pending`.
     2. Poll: every unapplied job is asked for its status every `status_poll_s`.
        A submitted job the API reports done becomes `completed`; a job the API
        no longer knows is lost (its TTL passed).
@@ -391,14 +392,15 @@ def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
         stats["lost"] = len(lost)
         _release(cur, lost)
         stats["orphans"] = _release_orphans(cur)
-        cur.execute(
-            "UPDATE recrawl.doc SET state = 'pending' WHERE doc_id IN (SELECT doc_id "
-            "FROM recrawl.doc WHERE state = 'fetched' AND rank IS NOT NULL AND due_at <= %s "
-            "LIMIT %s) RETURNING host_id", (now, r.sweep_rows))
-        swept = [h for (h,) in cur.fetchall()]
-        stats["swept"] = len(swept)
-        _wake(cur, swept, now, r.host_pause_max_s)
-        _refresh_best_rank(cur, swept)
+        if r.revisit:
+            cur.execute(
+                "UPDATE recrawl.doc SET state = 'pending' WHERE doc_id IN (SELECT doc_id "
+                "FROM recrawl.doc WHERE state = 'fetched' AND rank IS NOT NULL "
+                "AND due_at <= %s LIMIT %s) RETURNING host_id", (now, r.sweep_rows))
+            swept = [h for (h,) in cur.fetchall()]
+            stats["swept"] = len(swept)
+            _wake(cur, swept, now, r.host_pause_max_s)
+            _refresh_best_rank(cur, swept)
     _check_jobs(cfg, conn, api, now, stats)
     _drain(cfg, conn, now, stats)
     _delete_applied(conn, api, now, stats)

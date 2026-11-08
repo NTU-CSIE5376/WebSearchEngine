@@ -518,7 +518,7 @@ def _recrawl_cfg(cfg, tmp_path, stub, **kw):
     values = {"api_url": stub.url, "result_root": str(stub.results),
               "text_root": str(root / "text"), "log_root": str(root / "log"), "job_size": 4,
               "host_docs_per_job": 2, "max_jobs_inflight": 3, "plan_max_jobs": 2,
-              "min_free_gb": 0, "archive_workers": 1, "status_poll_s": 0}
+              "min_free_gb": 0, "archive_workers": 1, "status_poll_s": 0, "revisit": True}
     return replace(cfg, "recrawl", **{**values, **kw})
 
 
@@ -648,6 +648,27 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         stale = later + timedelta(days=r.stale_days, seconds=1)
         revisit = plan_cycle(cfg, admin, stale, api)
         assert revisit["swept"] == 4 and stub.posts[-1] == [C1, A1, A2, B1]
+    finally:
+        admin.close()
+
+
+def test_recrawl_sends_no_revisit_while_revisit_is_off(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1])
+        api = _api(stub)
+        _round(cfg, admin, stub, api, FakeCrawler(stub, {A1: ENGLISH}), T0)
+        (due,) = _doc(admin, A1, "due_at")
+        assert due == T0 + timedelta(days=r.stale_days)      # still set while off
+        stale = due + timedelta(seconds=1)
+        assert plan_cycle(cfg, admin, stale, api)["swept"] == 0
+        assert _doc(admin, A1, "state") == ("fetched",) and len(stub.posts) == 1
+        # Turned on, the next cycle sweeps it back in line and sends it.
+        got = plan_cycle(replace(cfg, "recrawl", revisit=True), admin, stale, api)
+        assert (got["swept"], got["jobs"]) == (1, 1) and stub.posts[-1] == [A1]
     finally:
         admin.close()
 

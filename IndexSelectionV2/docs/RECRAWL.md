@@ -232,8 +232,12 @@ committed, then sent.
 
 1. **Recover.** A `claimed` job older than `claim_timeout_s` (600 s) is `lost` and its
    docs return to `pending`. Docs and hosts held by a job that is no longer open are
-   released. Up to `sweep_rows` (100,000) `fetched` docs past `due_at` return to
-   `pending`.
+   released. With `revisit` on, up to `sweep_rows` (100,000) `fetched` docs past
+   `due_at` return to `pending`. `revisit` is off since 2026-11-08: the crawler serves
+   API requests first (`manual_first`), so each revisit goes before a normal-crawl
+   request, and presence, which the normal crawl drives, loses more pairs than stale
+   text can (§11). `due_at` is still set, so turning it on resumes revisits by due date,
+   behind first fetches (step 6).
 2. **Poll.** Each `submitted`, `completed` or `error` job gets a `GET` at most every
    `status_poll_s` (15 s); 128 jobs (64 at the crawler, 64 completed) make about 8.5
    requests a second.
