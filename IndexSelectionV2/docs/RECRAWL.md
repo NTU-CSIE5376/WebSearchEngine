@@ -56,6 +56,17 @@ the batch-20 list.
 - `recrawl-plan --dry-run` reports progress from `fetched_at` instead: docs left, docs
   fetched in the last day, and the days left at that pace, for the list and for its
   largest host.
+- `fetched` overstates progress: it counts every 2xx HTML. In the 24 h to 2026-11-08,
+  20.5 % of 934,909 fetched docs were AWS WAF 202 challenge pages. 453,326 fetched docs
+  on 7,595 hosts were one shared "Client Challenge" page: status 200 with
+  `text_len = 211`, so a length test alone counts it as real.
+- So the report also gives two counts over on-list docs, next to `states`. `real_text`
+  is the fetched docs with status 200, at least `real_text_min_chars` (200) of body
+  text, and a `payload_sha1` not in `challenge_sha1`. `waf_202` is the fetched 202s.
+- These docs stay `fetched`, on the list and in the index. They still hit golden on dev
+  through URL terms and list rank (0.533 / 0.426). Their outcome, retry and host
+  handling do not change: PR #29 removed the blanket 202/403 host block, because host
+  probing starved healthy URLs.
 - Round 6 (2026-11-01, `index-selection` experiment 2026-10-29, with that isel wait):
   two capped hosts got 0.196–0.202 req/s (13.8–14.5 days). One whose simulated slot is
   0.33 req/s got 0.159–0.171 (16.4–17.6 days), held back by its slot. Host2's capped
@@ -305,7 +316,7 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 
 | Result | New state | Next attempt |
 |---|---|---|
-| 2xx HTML | `fetched`; `text_file`, `text_len`, `lang`, `payload_sha1` set | after `stale_days` (30) |
+| 2xx HTML, challenge pages included (§3) | `fetched`; `text_file`, `text_len`, `lang`, `payload_sha1` set | after `stale_days` (30) |
 | 2xx non-HTML, 404, 410 | `gone` | never |
 | `IgnoreRequest` (robots.txt) | `failed` | after `robots_retry_days` (30) |
 | 429, 503 | `failed`, `attempts + 1`; host paused `retry_base_s` | exponential backoff |

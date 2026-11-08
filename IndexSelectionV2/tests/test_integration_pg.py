@@ -560,7 +560,7 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         _go_live(cfg, admin, tmp_path, "r1", [A1, A2, "https://a.example/x/../2", A3, B1, C1])
         synced = sync(cfg, admin, now=lambda: OPEN)
         assert (synced["docs"], synced["dropped"], synced["hosts_due"]) == (5, 0, 3)
-        report = capacity_report(admin, OPEN)
+        report = capacity_report(r, admin, OPEN)
         assert (report["docs"], report["left"], report["fetched_1d"]) == (5, 5, 0)
         assert report["days_left"] is None and report["largest_left"]["left"] == 3
 
@@ -617,7 +617,7 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         assert _jobs(admin)[0][2] == "applied"
         assert archive_cycle(cfg, admin, done)["jobs"] == 0      # applied once only
         # Progress is measured from fetched_at: A1 and B1 in the last day, 3 docs left.
-        report = capacity_report(admin, done + timedelta(seconds=10))
+        report = capacity_report(r, admin, done + timedelta(seconds=10))
         assert (report["left"], report["fetched_1d"], report["days_left"]) == (3, 2, 1.5)
         assert report["largest_left"] == {"left": 2, "fetched_1d": 1, "days_left": 2.0}
 
@@ -638,6 +638,28 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         stale = later + timedelta(days=r.stale_days, seconds=1)
         revisit = plan_cycle(cfg, admin, stale, api)
         assert revisit["swept"] == 4 and stub.posts[-1] == [A1, A2, B1, C1]
+    finally:
+        admin.close()
+
+
+def test_recrawl_report_counts_real_text_apart_from_challenge_pages(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, B1, C1])
+        long_text, short_text = r.real_text_min_chars, r.real_text_min_chars - 1
+        # A real page, a WAF 202, a shared challenge page with long text, a short page.
+        for url, status, text_len, sha in [
+                (A1, 200, long_text, "0" * 40), (A2, 202, long_text, "1" * 40),
+                (A3, 200, long_text, r.challenge_sha1[0]), (B1, 200, short_text, "2" * 40)]:
+            admin.execute("UPDATE recrawl.doc SET state = 'fetched', fetched_at = %s, "
+                          "http_status = %s, text_len = %s, payload_sha1 = %s "
+                          "WHERE doc_id = %s", (OPEN, status, text_len, sha, pg_doc_id(url)))
+        report = capacity_report(r, admin, OPEN + timedelta(seconds=1))
+        assert report["states"] == {"fetched": 4, "pending": 1}
+        assert (report["real_text"], report["waf_202"]) == (1, 1)
     finally:
         admin.close()
 
