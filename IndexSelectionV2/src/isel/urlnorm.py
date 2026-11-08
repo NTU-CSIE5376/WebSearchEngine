@@ -11,13 +11,17 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable, Mapping
 from functools import lru_cache
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import tldextract
 from w3lib.url import canonicalize_url
 
 # DuckDB twin of `host_of`: group 1 is the host of an absolute URL.
 HOST_RE = r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/?#]*@)?([^:/?#]+)"
+# RFC 3986 §3.3-3.5 beyond the unreserved set `quote` always keeps: sub-delims, ":" and
+# "@" (pchar) and "/", plus "?" in a query or fragment, plus "%" so escapes stay as they are.
+PATH_SAFE = "!$&'()*+,;=:@/%"
+QUERY_SAFE = PATH_SAFE + "?"
 
 
 def canonicalize(url: str) -> str:
@@ -26,6 +30,26 @@ def canonicalize(url: str) -> str:
         return canonicalize_url(url)
     except Exception:
         return url
+
+
+def wire_url(url: str) -> str:
+    """Returns `url` as sent to the crawler API: path, query and fragment percent-encoded.
+
+    The API's `validators.url` rejects a raw `[`, `]` or `|` there. Scheme and netloc
+    are kept, so an IPv6 literal keeps its brackets, and a URL that is already valid
+    comes back unchanged. Non-ASCII characters become UTF-8 escapes, as w3lib's
+    `canonicalize_url` spells them anyway, so the API lists the same canonical URL.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    path = quote(parts.path, safe=PATH_SAFE)
+    query = quote(parts.query, safe=QUERY_SAFE)
+    fragment = quote(parts.fragment, safe=QUERY_SAFE)
+    if (path, query, fragment) == (parts.path, parts.query, parts.fragment):
+        return url
+    return urlunsplit(parts._replace(path=path, query=query, fragment=fragment))
 
 
 def md5_number_lower(text: str) -> int:
