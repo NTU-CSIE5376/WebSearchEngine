@@ -185,11 +185,11 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 - A job expires `ttl_days` after the POST. Past that, the crawler drops it, `GET` answers
   404, and the API's hourly GC deletes its files.
 
-## 5. Frontier schema (`schema.py`, revision `0003_recrawl`)
+## 5. Frontier schema (`schema.py`, revisions `0003_recrawl` and `0004_host_throttle_streak`)
 
 | Table | One row per | Main columns |
 |---|---|---|
-| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank`, `next_at` (end of a 429/503 pause, or its next due doc), `batch_id` (the job of its batch not yet done) |
+| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank`, `next_at` (end of a 429/503 pause, or its next due doc), `batch_id` (the job of its batch not yet done), `throttle_streak` (batches in a row with a 429/503) |
 | `recrawl.doc` | `doc_id` (signed BIGINT) | `url` (canonical), `host_id`, `rank`, `model_run_id`, `state`, `due_at`, `attempts`, `batch_id`, fetch fields, `text_file`, `text_len`, `lang` |
 | `recrawl.job` | job sent to the API | `batch_id`, `job_id`, `doc_ids` (in the order sent), `state`, timestamps, `deleted_at`, `records`, `error` |
 | `recrawl.batch_seq` | (sequence) | source of `batch_id` |
@@ -323,12 +323,20 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 | 2xx HTML, challenge pages included (§3) | `fetched`; `text_file`, `text_len`, `lang`, `payload_sha1` set | after `stale_days` (30) |
 | 2xx non-HTML, 404, 410 | `gone` | never |
 | `IgnoreRequest` (robots.txt) | `failed` | after `robots_retry_days` (30) |
-| 429, 503 | `failed`, `attempts + 1`; host paused `retry_base_s` | exponential backoff |
+| 429, 503 | `failed`, `attempts` unchanged; host paused `retry_base_s · 2^throttle_streak`, cap `host_pause_max_s` (24 h) | when the host's pause ends |
+| 401, 402, 403 (`refusal_reasons`) | `failed`, `attempts + 1` | as below, but `stale_days` after `refusal_max_attempts` (2) |
 | other failure, `unmatched`, extraction failure | `failed`, `attempts + 1` | `retry_base_s · 2^attempts`, cap 24 h; `stale_days` after `max_attempts` (5) |
 
 - A 2xx applies whenever it is newer than the stored fetch. A failure applies only while
   the doc still waits on this job. A doc of the job with no result is retried
   (`no_result`).
+- A 429 or 503 is about the host, not the doc, so it uses none of the doc's attempts.
+  `throttle_streak` counts the host's batches in a row with one and is reset by a batch
+  without one, so a host that answers only 429 waits 10 min, 20 min, 40 min, ... up to
+  24 h between batches. This is the existing 429/503 pause made to grow, not a host
+  block: a host with no 429 or 503 is never paused (#29).
+- On 11-06 to 11-07, 0.18 % of the docs whose first failure was a 403 were fetched
+  later, against 57.9 % after a 429 (#32), so a refusal gets 2 attempts, not 5.
 
 **Text Parquet.** `doc_id` (uint64, as in the manifest), `batch_id`, `url`, `final_url`,
 `fetched_at`, `http_status`, `lang`, `title`, `description`, `body`, `text_len`,

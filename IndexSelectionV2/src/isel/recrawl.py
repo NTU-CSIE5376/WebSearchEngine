@@ -545,6 +545,8 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
                     "WHERE h.host_id = u.host_id AND h.batch_id = u.batch_id RETURNING h.host_id",
                     tuple(map(list, zip(*free, strict=True))))
         freed = [h for (h,) in cur.fetchall()]
+        cur.execute("UPDATE recrawl.host SET throttle_streak = 0 "
+                    "WHERE host_id = ANY(%s::bigint[]) AND throttle_streak > 0", (freed,))
         _refresh_best_rank(cur, freed)
     stats["drained"] = len(freed)
 
@@ -595,6 +597,14 @@ def _delete_applied(conn: psycopg.Connection, api: CrawlerApi, now: datetime,
                      (now, batch))
         stats["deleted"] += 1
 
+
+# A batch with a 429 or 503 pauses its host retry_base_s * 2^throttle_streak, at most
+# host_pause_max_s, and adds one to the streak until the pause reaches that cap. {} picks
+# the hosts.
+_THROTTLE = ("UPDATE recrawl.host h SET next_at = greatest(coalesce(h.next_at, %(now)s), "
+             "%(now)s + make_interval(secs => least(%(base)s * power(2, h.throttle_streak), "
+             "%(pause)s))), throttle_streak = h.throttle_streak + CASE WHEN %(base)s * "
+             "power(2, h.throttle_streak) < %(pause)s THEN 1 ELSE 0 END {}")
 
 # A throttle pause ends within host_pause_max_s, so a later next_at was set by _claim for
 # docs in backoff; it must not hold back docs that are due now.
@@ -1051,6 +1061,16 @@ def _record(r: RecrawlCfg, part: Path, job: JobInput, i: int, item: dict[str, An
     return rec
 
 
+# A failed doc retries after retry_base_s * 2^attempts, or waits stale_days once its
+# attempts reach {} (an SQL expression).
+_BACKOFF = ("state = 'failed', attempts = d.attempts + 1, due_at = %(now)s + CASE "
+            "WHEN d.attempts + 1 >= {} THEN make_interval(days => %(stale)s) "
+            "ELSE make_interval(secs => least(%(base)s * power(2, d.attempts), %(max)s)) END")
+# A refusal (403 ...) almost never turns into a page on retry, so it gets fewer attempts.
+_RETRY_LIMIT = ("CASE WHEN r.fail_reason = ANY(%(refusals)s::text[]) "
+                "THEN %(refusal_attempts)s ELSE %(attempts)s END")
+
+
 def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJob,
            now: datetime) -> int:
     """Applies one job's results idempotently; returns the number of docs changed.
@@ -1063,6 +1083,7 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
     r = cfg.recrawl
     args = {"now": now, "stale": r.stale_days, "robots": r.robots_retry_days,
             "base": r.retry_base_s, "max": r.retry_max_s, "attempts": r.max_attempts,
+            "refusals": r.refusal_reasons, "refusal_attempts": r.refusal_max_attempts,
             "pause": r.host_pause_max_s, "text_file": done.text_file, "batch": job.batch_id,
             "n": len(done.records)}
     changed = 0
@@ -1103,24 +1124,28 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
             "due_at = %(now)s + make_interval(days => %(robots)s) "
             + current.format("'robots'"), args)
         changed += cur.rowcount
+        # Hosts this job still holds; a drained host had its batch judged by the drain.
+        throttled = ("SELECT 1 FROM r JOIN recrawl.doc d USING (doc_id) "
+                     "WHERE r.outcome = 'throttled' AND d.host_id = h.host_id "
+                     "AND d.state = 'dispatched' AND d.batch_id = %(batch)s")
+        cur.execute(_THROTTLE.format(f"WHERE h.batch_id = %(batch)s AND EXISTS ({throttled})"),
+                    args)
+        cur.execute("UPDATE recrawl.host h SET throttle_streak = 0 WHERE h.batch_id = %(batch)s "
+                    f"AND h.throttle_streak > 0 AND NOT EXISTS ({throttled})", args)
+        # The host's pause alone paces a throttled doc, so it keeps its attempts.
         cur.execute(
-            "UPDATE recrawl.host h SET next_at = greatest(coalesce(h.next_at, %(now)s), "
-            "%(now)s + make_interval(secs => least(%(base)s, %(pause)s))) "
-            "FROM (SELECT DISTINCT d.host_id FROM r JOIN recrawl.doc d USING (doc_id) "
-            "WHERE r.outcome = 'throttled' AND d.state = 'dispatched' "
-            "AND d.batch_id = %(batch)s) p WHERE h.host_id = p.host_id", args)
-        backoff = ("state = 'failed', attempts = d.attempts + 1, due_at = %(now)s + CASE "
-                   "WHEN d.attempts + 1 >= %(attempts)s THEN make_interval(days => %(stale)s) "
-                   "ELSE make_interval(secs => least(%(base)s * power(2, d.attempts), %(max)s)) "
-                   "END")
+            "UPDATE recrawl.doc d SET state = 'failed', due_at = %(now)s, "
+            "http_status = r.http_status, final_url = r.final_url, fail_reason = r.fail_reason "
+            + current.format("'throttled'"), args)
+        changed += cur.rowcount
         cur.execute(
-            f"UPDATE recrawl.doc d SET {backoff}, http_status = r.http_status, "
-            "final_url = r.final_url, fail_reason = r.fail_reason "
-            "FROM r WHERE r.outcome IN ('throttled', 'retry') AND d.doc_id = r.doc_id "
-            "AND d.state = 'dispatched' AND d.batch_id = %(batch)s", args)
+            f"UPDATE recrawl.doc d SET {_BACKOFF.format(_RETRY_LIMIT)}, "
+            "http_status = r.http_status, final_url = r.final_url, fail_reason = r.fail_reason "
+            + current.format("'retry'"), args)
         changed += cur.rowcount
         # A doc of this job with no record at all: never expected, never left waiting.
-        cur.execute(f"UPDATE recrawl.doc d SET {backoff}, fail_reason = 'no_result' "
+        cur.execute(f"UPDATE recrawl.doc d SET {_BACKOFF.format('%(attempts)s')}, "
+                    "fail_reason = 'no_result' "
                     "WHERE d.state = 'dispatched' AND d.batch_id = %(batch)s", args)
         changed += cur.rowcount
         cur.execute("UPDATE recrawl.host SET batch_id = NULL WHERE batch_id = %(batch)s "

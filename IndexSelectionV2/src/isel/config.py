@@ -211,6 +211,8 @@ class RecrawlCfg:
     retry_base_s: int
     retry_max_s: int
     max_attempts: int
+    refusal_reasons: list[str]
+    refusal_max_attempts: int
     robots_retry_days: int
     host_pause_max_s: int
     archive_interval_s: float
@@ -474,6 +476,10 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "recrawl.status_poll_s must be >= 0 (every plan cycle) and shorter than "
          "result_ttl_days")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
+    need(1 <= r.refusal_max_attempts <= r.max_attempts,
+         "recrawl.refusal_max_attempts must be 1 to max_attempts")
+    need(all(re.fullmatch(r"http_\d{3}", x) for x in r.refusal_reasons),
+         "recrawl.refusal_reasons must be fail reasons like http_403")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
     need(r.real_text_min_chars >= 0, "recrawl.real_text_min_chars must be >= 0")
     need(all(re.fullmatch(r"[0-9a-f]{40}", h) for h in r.challenge_sha1),

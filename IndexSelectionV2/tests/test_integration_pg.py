@@ -333,8 +333,8 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
     with pytest.raises(NeedsBaselineStamp):
         migrate(_admin(cfg))
     first = migrate(_admin(cfg), stamp_baseline=True)
-    assert first == {"revision_before": None, "revision": "0003", "stamped_baseline": True}
-    assert migrate(_admin(cfg))["revision_before"] == "0003"     # a rerun changes nothing
+    assert first == {"revision_before": None, "revision": "0004", "stamped_baseline": True}
+    assert migrate(_admin(cfg))["revision_before"] == "0004"     # a rerun changes nothing
     with pytest.raises(RuntimeError, match="only fits a pre-Alembic"):
         migrate(_admin(cfg), stamp_baseline=True)
     admin = _admin(cfg)
@@ -358,12 +358,15 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
 
 def test_migrate_builds_an_empty_selectdb_and_downgrades(selectdb):
     cfg = selectdb
-    assert _setup(cfg)["revision"] == "0003"
+    assert _setup(cfg)["revision"] == "0004"
     dsn = os.environ[cfg.selectdb.admin_dsn_env]
     engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://"))
     acfg = _alembic_config()
     with engine.begin() as conn:
         acfg.attributes["connection"] = conn
+        command.downgrade(acfg, "0003")
+        assert "throttle_streak" not in {
+            c["name"] for c in sa.inspect(conn).get_columns("host", schema="recrawl")}
         command.downgrade(acfg, "base")
         assert sa.inspect(conn).get_table_names() == ["alembic_version"]
         assert "recrawl" not in sa.inspect(conn).get_schema_names()
@@ -603,7 +606,9 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
             "颱風假", "停班停課", "zh")
         assert "防颱準備" in rows[A1]["body"] and "首頁" not in rows[A1]["body"]
         assert rows[B1]["fetched_at"] == done + timedelta(seconds=2)   # its position in the job
-        assert _doc(admin, A2, "state", "attempts", "fail_reason") == ("failed", 1, "http_503")
+        # A 503 is about the host: the doc keeps its attempts and waits for the pause.
+        assert _doc(admin, A2, "state", "attempts", "fail_reason", "due_at") == (
+            "failed", 0, "http_503", done)
         assert _doc(admin, C1, "state", "fail_reason", "due_at") == (
             "failed", "ignore_request", done + timedelta(days=r.robots_retry_days))
         assert _host(admin, "a.example") == (None, done + timedelta(seconds=r.retry_base_s))
@@ -764,6 +769,72 @@ def test_recrawl_drain_holds_a_throttled_host_until_its_pause_is_set(selectdb, t
         _poll(cfg, admin, stub, T0)
         archive_cycle(cfg, admin, T0)
         assert _host(admin, "a.example") == (None, T0 + timedelta(seconds=r.retry_base_s))
+    finally:
+        admin.close()
+
+
+def _streak(admin, host):
+    return admin.execute("SELECT throttle_streak FROM recrawl.host WHERE host_id = %s",
+                         (host_id(host),)).fetchone()[0]
+
+
+def _round(cfg, admin, stub, api, crawler, at):
+    """One job sent, fetched, polled and applied, all at `at`."""
+    assert plan_cycle(cfg, admin, at, api)["jobs"] == 1
+    crawler.take(at)
+    _poll(cfg, admin, stub, at)
+    assert archive_cycle(cfg, admin, at)["jobs"] == 1
+
+
+def test_recrawl_attempts_depend_on_the_failure_reason(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, B1, C1])
+        admin.execute("UPDATE recrawl.doc SET attempts = 1")
+        crawler = FakeCrawler(stub, {A1: Page(status=403), B1: Page(status=500),
+                                     C1: Page(status=429)})
+        _round(cfg, admin, stub, _api(stub), crawler, T0)
+        # A refusal waits stale_days after refusal_max_attempts (2), not max_attempts (5).
+        assert _doc(admin, A1, "state", "attempts", "due_at") == (
+            "failed", r.refusal_max_attempts, T0 + timedelta(days=r.stale_days))
+        assert _doc(admin, B1, "state", "attempts", "due_at") == (
+            "failed", 2, T0 + timedelta(seconds=2 * r.retry_base_s))
+        # A 429 keeps the doc's attempts; the host's pause paces it.
+        assert _doc(admin, C1, "state", "attempts", "due_at") == ("failed", 1, T0)
+        assert _host(admin, "c.example") == (None, T0 + timedelta(seconds=r.retry_base_s))
+        assert _streak(admin, "c.example") == 1
+    finally:
+        admin.close()
+
+
+def test_recrawl_pause_grows_with_throttled_batches_in_a_row(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, job_size=1, host_docs_per_job=1,
+                       host_pause_max_s=1500)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2])
+        api = _api(stub)
+        crawler = FakeCrawler(stub, {A1: Page(status=429), A2: Page(status=429)})
+        at = T0
+        # 600 s, 1200 s, then the 1500 s cap; the streak stops growing at the cap.
+        for pause, streak in ((600, 1), (1200, 2), (1500, 2), (1500, 2)):
+            _round(cfg, admin, stub, api, crawler, at)
+            assert stub.posts[-1] == [A1]
+            assert _host(admin, "a.example") == (None, at + timedelta(seconds=pause))
+            assert _streak(admin, "a.example") == streak
+            at += timedelta(seconds=pause)
+        # A batch without a 429 resets the streak, so the next 429 pauses 600 s again.
+        crawler.web[A1] = ENGLISH
+        _round(cfg, admin, stub, api, crawler, at)
+        assert _streak(admin, "a.example") == 0 and _doc(admin, A1, "state") == ("fetched",)
+        _round(cfg, admin, stub, api, crawler, at)
+        assert stub.posts[-1] == [A2]
+        assert _host(admin, "a.example") == (None, at + timedelta(seconds=600))
+        assert _doc(admin, A2, "attempts") == (0,)
     finally:
         admin.close()
 

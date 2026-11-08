@@ -272,8 +272,13 @@ stale_days = 30                          # uniform revisit interval
 retry_base_s = 600                       # failed doc: retry_base_s * 2^attempts
 retry_max_s = 86400
 max_attempts = 5                         # then wait stale_days instead of retry_max_s
+refusal_reasons = ["http_401", "http_402", "http_403"]  # retries almost never succeed:
+                                         # 0.18 % of first-403 docs were fetched later
+refusal_max_attempts = 2                 # max_attempts for a doc that failed on one of these
 robots_retry_days = 30                   # a robots.txt refusal is asked again after this
-host_pause_max_s = 86400                 # cap on a 429/503 pause
+host_pause_max_s = 86400                 # cap on a 429/503 pause: retry_base_s * 2^n after n
+                                         # batches in a row with one; a 429/503 doc keeps
+                                         # its attempts
 archive_interval_s = 15.0
 archive_workers = 8                      # text extraction: 6.5 ms per 590 KB page each
 min_free_gb = 800                        # no new jobs below this free space under text_root;

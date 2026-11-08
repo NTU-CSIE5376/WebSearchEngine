@@ -95,6 +95,8 @@ recrawl_host = sa.Table(
     sa.Column("best_rank", sa.BigInteger),          # min rank of its due docs; NULL: none
     _tstz("next_at"),                               # no job before this (pacing, backoff)
     sa.Column("batch_id", sa.BigInteger),           # job of its batch not yet done; NULL: none
+    # Batches in a row with a 429 or 503; the next pause is retry_base_s * 2^this.
+    sa.Column("throttle_streak", sa.SmallInteger, nullable=False, server_default=sa.text("0")),
     sa.PrimaryKeyConstraint("host_id", name="host_pkey"),
     sa.UniqueConstraint("host", name="host_host_key"),
     sa.Index("host_ready", "best_rank",
