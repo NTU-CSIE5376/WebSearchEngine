@@ -155,7 +155,42 @@ def test_build_search_and_eval(node, tmp_path):
     assert multi["docs"] == first["docs"] and multi["segments"] == 3
     assert multi["recovery_source_pruned"] is True
     # With global term statistics the twins tie across shards, and the unsigned_long sort
-    # still puts the two ids above 2^63 after the two below.
+    # still puts the two ids above 2^63 after the two below. A `rescore` rules out that
+    # sort, so it needs the prior off.
+    plain = replace(sharded, "text_index", prior_boost=0.0).text_index
     reply = client.call("POST", "/isel-text-sharded/_search?search_type=dfs_query_then_fetch",
-                        query_body(sharded.text_index, TWINS[0][2]))
+                        query_body(plain, TWINS[0][2]))
     assert [h["_id"] for h in reply["hits"]["hits"]] == [str(i) for i in twin_ids]
+
+
+# The sum adds 4 points per factor of 10 in rank; the scale multiplies by 1 + 0.444 per factor.
+@pytest.mark.parametrize(("mode", "boost"), [("total", 1.7372), ("multiply", 0.193)])
+def test_the_prior_reorders_only_the_best_text_matches(node, tmp_path, mode, boost):
+    bodies = {"strong": "zebra zebra zebra other", "middle": "zebra zebra other other",
+              "weak": "zebra other other other", "unrelated": "other other other other"}
+    docs = [(f"https://{name}.example.org/", "en", "page", None, body)
+            for name, body in bodies.items()]
+    doc_id = {name: md5_number_lower(canonicalize(f"https://{name}.example.org/"))
+              for name in bodies}
+    ranks = {"strong": 10**6, "middle": 10**6, "weak": 0, "unrelated": 0}
+    root = tmp_path / "text"
+    write_parquet_atomic(_text(docs, datetime(2026, 10, 20, tzinfo=UTC)), root / "job-1.parquet")
+    prior = tmp_path / "list" / "run.parquet"
+    write_parquet_atomic(pa.table({"doc_id": pa.array([doc_id[n] for n in ranks], pa.uint64()),
+                                   "rank": pa.array(list(ranks.values()), pa.int64())}), prior)
+    cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
+                  alias=f"isel-text-prior-{mode}", host_cap=0, prior_file=str(prior),
+                  prior_score_mode=mode, prior_boost=boost,
+                  settings_file=str(ROOT / "config/text_index/icu.json"))
+    client = OpenSearch(node, 60.0, 2, 1.0)
+    assert build(cfg, client, root, datetime(2026, 10, 24, tzinfo=UTC))["prior_docs"] == len(docs)
+
+    # Over all the matches, the best rank wins. The doc without the word stays out.
+    ids, _ = search(client, replace(cfg, "text_index", k=3).text_index, "zebra")
+    assert ids[0] == str(doc_id["weak"])
+    assert set(ids) == {str(doc_id[n]) for n in ("strong", "middle", "weak")}
+    # Over the best two, the weak match stays out, whatever its rank. A `should` clause
+    # would let it in: on 52M docs, such pages took 40 % of the top 10.
+    narrow = replace(cfg, "text_index", k=2, fetch_k=2, prior_depth=2).text_index
+    ids, _ = search(client, narrow, "zebra")
+    assert set(ids) == {str(doc_id[n]) for n in ("strong", "middle")}

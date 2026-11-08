@@ -245,6 +245,15 @@ class TextIndexCfg:
     flood_free_ratio: float
     expected_bytes_per_doc: int
     progress_every: int
+    fetch_k: int
+    host_cap: int
+    prior_file: str
+    prior_scale: float
+    prior_scaling_factor: float
+    prior_score_mode: str
+    prior_boost: float
+    prior_depth: int
+    prior_min_coverage: float
 
 
 @dataclass(frozen=True)
@@ -289,6 +298,7 @@ LGBM_THREAD_ALIASES = ("n_jobs", "nthread", "nthreads", "num_thread")
 # values fail the parse, or round url_score (extra_float_digits < 1).
 CSV_SESSION = {"datestyle": "ISO", "extra_float_digits": "1", "client_encoding": "UTF8"}
 QUERY_TYPES = ("combined_fields", "most_fields", "best_fields")
+PRIOR_SCORE_MODES = ("total", "multiply")
 # OpenSearch index names are lowercase; the physical indices add "-<utc id>".
 INDEX_ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
@@ -544,6 +554,15 @@ def _validate_text_index(cfg: Config, need: Any) -> None:
     need(0 < t.flood_free_ratio < 1, "text_index.flood_free_ratio must be in (0, 1)")
     need(min(t.retries, t.backoff_s, t.warmup_queries) >= 0,
          "text_index.retries, backoff_s and warmup_queries must be >= 0")
+    need(t.fetch_k >= t.k, "text_index.fetch_k must be >= k")
+    need(t.host_cap >= 0, "text_index.host_cap must be >= 0")
+    need(t.prior_boost >= 0, "text_index.prior_boost must be >= 0")
+    need(t.prior_score_mode in PRIOR_SCORE_MODES,
+         f"text_index.prior_score_mode must be one of {PRIOR_SCORE_MODES}")
+    need(t.prior_depth >= t.fetch_k, "text_index.prior_depth must be >= fetch_k")
+    need(min(t.prior_scale, t.prior_scaling_factor) > 0,
+         "text_index.prior_scale and prior_scaling_factor must be > 0")
+    need(0 <= t.prior_min_coverage <= 1, "text_index.prior_min_coverage must be in [0, 1]")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:

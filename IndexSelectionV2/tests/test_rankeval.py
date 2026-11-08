@@ -46,6 +46,8 @@ def test_summarize():
     assert out["recall_pairs"] == pytest.approx(1 / 3)
     assert out["presence"] == pytest.approx(2 / 3)
     assert out["recall_given_present"] == pytest.approx(1 / 2)
+    glo, ghi = out["recall_given_present_ci95"]
+    assert 0 <= glo <= out["recall_given_present"] <= ghi <= 1
     assert out["zero_hit_rate"] == 0.0
     assert out["took_ms_p50"] == 3.0
     lo, hi = out["recall_pairs_ci95"]

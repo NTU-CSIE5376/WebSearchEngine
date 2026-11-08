@@ -32,6 +32,7 @@ class OpenSearchStub:
         self.count_offset = 0
         self.merge_failed = 0                     # shards the force merge task fails on
         self.hits: dict[str, list[str]] = {}      # query text -> ids, best first
+        self.scores: dict[str, float] = {}        # id -> score; else falling with position
         self.drop: list[str] = []                 # path parts: apply, then close unanswered
         self.fail: list[str] = []                 # path parts: answer 500, apply nothing
         self.lease_lag = 0
@@ -82,7 +83,11 @@ class OpenSearchStub:
         else:
             text = next(iter(query.values()))["query"]
             ids = [i for i in self.hits.get(text, []) if i in docs]
-        return 200, {"took": 1, "hits": {"hits": [{"_id": i} for i in ids[:body["size"]]]}}
+        hits = [{"_id": i, "_score": self.scores.get(i, float(len(ids) - pos)),
+                 **({"_source": {k: docs[i].get(k) for k in body["_source"]}}
+                    if body.get("_source") else {})}
+                for pos, i in enumerate(ids[:body["size"]])]
+        return 200, {"took": 1, "hits": {"hits": hits}}
 
     def _route(self, method: str, path: str, query: str, raw: bytes) -> tuple[int, object]:
         parts = [unquote(p) for p in path.strip("/").split("/")]

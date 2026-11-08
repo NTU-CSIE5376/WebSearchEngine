@@ -7,12 +7,13 @@ the design, and the local trial that backs both.
 Status: engine decided (OpenSearch, see [Decision](#decision)); built and measured
 locally on 2026-10-23. The query and a URL field were then tuned on golden batch 20's
 own pages ([Golden batch 20 with its own pages](#golden-batch-20-with-its-own-pages)).
-Not deployed. A real Recall@10 needs the list's page text, which arrives only after
-WebCrawler#84 is deployed and `recrawl-archive` runs (`docs/RECRAWL.md`). A review the
-same evening indexed the body without positions, fixed the build's disk peak and its
-failure handling, added the Host2 services, and measured batch 20 as the official
+A review the same evening indexed the body without positions, fixed the build's disk peak
+and its failure handling, added the Host2 services, and measured batch 20 as the official
 metric would count it ([Golden batch 20 as the official metric counts
-it](#golden-batch-20-as-the-official-metric-counts-it)).
+it](#golden-batch-20-as-the-official-metric-counts-it)). On 2026-11-07 the index was built
+on Host2 from the list's recrawl text, 52M docs, and the ranking was reworked for that size
+([Golden batches 20 and 21 on 52M docs](#golden-batches-20-and-21-on-52m-docs)). The official
+metric does not read this index yet.
 
 ## Commands
 
@@ -34,21 +35,29 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   `description` and `body` are full text, and `body` is left out of `_source`. The body
   is indexed without positions (`index_options: freqs`): BM25 needs only term counts,
   and positions were 45 % of the index. The URL's words are searchable as `url.text`.
-  `doc_id` holds the same id as doc values only, for sorting.
+  `doc_id` holds the same id as doc values only, for sorting. `sel_prior` is a
+  `rank_feature`, `prior_scale / (rank + 1)`, from the doc's rank in the selection manifest
+  (`prior_file`). A build fails if under `prior_min_coverage` of the docs have a rank.
   `config/text_index/icu.json` holds the settings and mappings.
 - **Analysis.** One analyzer for every text field and language: `icu_tokenizer` (Unicode
   word breaks with dictionaries for CJK and Thai) and `icu_folding` (case, accents,
   width). A keyword's language is unknown, so per-language analyzers would need routing;
   the trial measures what they would add. `url.text` uses the same two steps after a
   character filter turns each run of punctuation and percent escapes into one space.
-- **Query.** `best_fields` over `title^2`, `description`, `body` and `url.text`, top 10:
-  a doc scores by its best-matching field. The type and weights were chosen on half of
-  golden batch 20's keywords and confirmed on the other half ([Tuning on batch
-  20](#tuning-on-batch-20)). The keyword is never parsed as query syntax. Equal scores
-  are ordered by `doc_id`.
-  Lucene would order them by internal doc id, which concurrent loading assigns
-  differently in every build. Anserini fixed the same problem the same way ([Lin and
-  Yang, SIGIR 2019](https://arxiv.org/abs/1807.05798)).
+- **Query.** `best_fields` over `title^2`, `description`, `body` and `url.text^2`: a doc
+  scores by its best-matching field. The type and weights were chosen on half of golden
+  batch 20's keywords and confirmed on the other half ([Tuning on batch
+  20](#tuning-on-batch-20)); the URL weight came later, on 51M docs. The keyword is never
+  parsed as query syntax. A `rescore` then applies the prior to the best `prior_depth` matches:
+  with `prior_score_mode = "multiply"` it scales BM25 by `1 + prior_boost × ln(1 + sel_prior)`,
+  with `"total"` it adds `prior_boost × ln(1 + sel_prior)`. The client reads `fetch_k` hits and
+  keeps the best `k`
+  with at most `host_cap` per host, without `www.`.
+  Equal scores are ordered by doc id: Lucene would order them by internal doc id, which
+  concurrent loading assigns differently in every build. Anserini fixed the same problem
+  the same way ([Lin and Yang, SIGIR 2019](https://arxiv.org/abs/1807.05798)). `rescore`
+  rules out a sort on `doc_id`, so the client breaks these ties on the hits it reads.
+  With the prior off, the query sorts on `doc_id` as before.
 - **Build.** A new index per build, in bulk-load mode (no replica, no refresh, async
   translog).
   - One build runs at a time: it holds a lock file in the work dir. It first deletes
@@ -440,6 +449,200 @@ Test half, 44k crawl pages:
 - **The first weeks.** Until the recrawl has fetched the list, fewer on-list pages have
   text, so F/I and the ranked rate start lower.
 
+### Golden batches 20 and 21 on 52M docs
+
+The first full build, on 2026-11-06, held 51,213,540 docs of recrawl text. Recall given
+present (H/F) was 0.150 on batch 20, far under what the small indexes showed: 1.5 points per
+doubling from 44k docs would have left about 0.65. The ranking was reworked under a rule
+written before any variant ran (`rule.md`).
+
+H/F uses one fixed denominator: the pairs present in the 51.2M index. The other rows are
+each index's own. Intervals resample keyword texts, 10,000 draws.
+
+| | Batch 20, before | Batch 20, after | Batch 21, before | Batch 21, after |
+|---|---|---|---|---|
+| Docs | 51,213,540 | 52,044,958 | 51,213,540 | 52,044,958 |
+| Presence (pairs) | 18.3 % | 18.4 % | 6.8 % | 6.9 % |
+| **H/F, fixed pairs** | **0.150** | **0.415** | **0.157** | **0.384** |
+| H/F, head | 0.119 | 0.392 | 0.135 | 0.396 |
+| H/F, random | 0.176 | 0.436 | 0.182 | 0.371 |
+| Pairs recall | 2.73 % | 7.61 % | 1.07 % | 2.65 % |
+| Distinct-URL recall | 2.82 % | 7.68 % | 1.07 % | 2.61 % |
+| nDCG@10 | 0.031 | 0.094 | 0.012 | 0.036 |
+| Latency p50, p95 | 23, 59 ms | 58, 116 ms | 22, 62 ms | 59, 125 ms |
+
+- **Batch 21's data.** 9,041 of its 15,008 official pairs are
+  `https://www.google.com/goto?url=<token>`, at Google ranks 4 and below; batches 8, 9, 18,
+  19 and 20 have none. Those pairs can never be present, so H/F holds, but batch 21 labels
+  only Google's top 3. Without them its pairs recall is 2.7 % before and 6.7 % after.
+- **Not the text.** An index of only batch 20's present golden pages, with the same recrawl
+  text and query, gives H/F 0.833 (0.864 on pages with text).
+- **Competition.** The golden pages are there but rank low. Recall given present at depth
+  10, 100, 200, 500, 1,000 and 1,500 is 0.150, 0.398, 0.459, 0.529, 0.591 and 0.617. BM25's
+  top 10 has 5.97 hosts and a median list rank of 25.8M; a keyword's golden pages have 7.17
+  hosts per 7.87 URLs and a median list rank of 0.45M. In 68.7 % of the keywords one host has
+  over 2 of the top 10, and in 10.6 % of the golden lists.
+- **Query shape and BM25 change little.** Of 18 shapes and a bundle on batches 18, 19 and 20
+  dev, `url.text^2` (+0.005, SE 0.002) is the simplest within 1 SE of the best (+0.007).
+  `most_fields` loses 0.040. Lower `b` loses 0.018 to 0.042, so BM25 stays at its defaults.
+- **The list rank is the signal.** Of 33 candidates re-ranking the top 1,500 offline on batch
+  20 and 21 dev (base 0.174), the best is 0.420. `BM25 + 4 × (8 − log10(rank + 1))` with at
+  most 2 hits per host is 0.418, the smallest weight within 1 SE. The host cap alone gives
+  0.179, and that prior without the cap 0.405. Batches up to 19 trained the selection model
+  and feed its history features, so they do not judge it; 20 and 21 came after its
+  features' snapshot.
+
+**The online form matters.** The first rebuild put the prior in a `should` clause, so it
+acted on every match. That missed the rule's check, online within 0.01 of offline:
+
+| H/F | 20 dev | 20 test | 21 dev | 21 test |
+|---|---|---|---|---|
+| Before | 0.166 | 0.133 | 0.169 | 0.143 |
+| Offline, top 1,500 | 0.429 | 0.400 | 0.389 | 0.381 |
+| `rank_feature` in `should`, every match | 0.372 | 0.354 | 0.356 | 0.341 |
+| **`rescore`, top 1,500** | **0.430** | **0.400** | **0.386** | **0.383** |
+
+On dev, 39 to 44 % of that form's top 10 came from outside BM25's top 1,500, with a median
+list rank near 400: popular pages with a weak text match. All 141 lost hits shared a top
+10 with such a page, against 43 hits gained from outside. Short lists (2 of 1,042 queries)
+and docs new since 51.2M (21 of 10,409) do not explain the gap. `rescore` needs no rebuild.
+
+**Adoption rule, on the test half, against the query before this work:**
+
+| | Batch 20 | Batch 21 |
+|---|---|---|
+| All pairs (98.3 % interval) | +0.267 [+0.233, +0.302] | +0.240 [+0.188, +0.292] |
+| Golden in no earlier batch | 0.146 → 0.358, [+0.181, +0.244] | 0.157 → 0.343, [+0.138, +0.232] |
+| ASCII | 0.112 → 0.410, [+0.265, +0.331] | 0.144 → 0.402, [+0.209, +0.308] |
+| Han | 0.247 → 0.427, [+0.100, +0.257] | 0.278 → 0.500, [+0.053, +0.429] |
+| Latin with diacritics | 0.178 → 0.446, [+0.172, +0.370] | 0.111 → 0.370, [+0.120, +0.400] |
+| Kana | 0.139 → 0.228, [+0.016, +0.156] | 0.097 → 0.161, [0, +0.167] |
+| Other scripts | 0.333 → 0.282, [−0.125, 0] | 0.091 → 0.182, [0, +0.300] |
+
+The rule asks for a lower bound above 0 on batch 20, and for no interval entirely below 0.
+It holds. The other scripts of batch 20 pass only because the upper bound is exactly 0, on
+39 pairs.
+
+**Where the other pairs stop** (batch 20 and 21 dev, 1,946 pairs, H/F 0.417):
+
+| Pair | Share |
+|---|---|
+| In the top 10 | 41.7 % |
+| In BM25's top 1,500, scored too low | 27.1 % |
+| Outside BM25's top 1,500 | 29.6 % |
+| Removed by the host cap | 1.6 % |
+
+| List rank | Pairs | In the top 1,500 | H/F, BM25 only | H/F, now |
+|---|---|---|---|---|
+| under 0.1M | 681 | 60.9 % | 0.109 | 0.564 |
+| 0.1–1M | 441 | 73.7 % | 0.186 | 0.558 |
+| 1–5M | 324 | 72.2 % | 0.216 | 0.321 |
+| 5–10M | 153 | 76.5 % | 0.235 | 0.229 |
+| 10–20M | 139 | 71.2 % | 0.209 | 0.122 |
+| 20M or more | 208 | 85.1 % | 0.231 | 0.125 |
+
+- **Re-ranking stops at about 0.68.** That is the share inside the top 1,500: 0.691 on batch
+  20 and 0.670 on batch 21. Without competition, H/F is 0.833.
+- **The pages the model trusts most are the ones BM25 drops most.** 65.8 % of the pairs outside
+  the top 1,500 have a list rank under 1M, so 19.5 % of all pairs are such pages. Most of them
+  do not hold the keyword: 36 % hold only some of its tokens and 27 % none, as with another
+  language (`turquia`, `wiki/Turkey`) or a broader page (`india vs west indies`, `wiki/India`).
+  22.5 % hold it all in the title or URL (`arsenal`, `wiki/Arsenal_F.C.`), and 14 % in the
+  body or description. 20 % have no text. These classes approximate the analyzer, and a whole
+  CJK keyword must occur as written. A deeper window gains little: 3,000 and 6,000 candidates give 0.431
+  and 0.427 on batch 20, and 0.406 and 0.402 on batch 21. The `should` form did not either:
+  it gained 43 of them and lost 141 others.
+- **The query shape was chosen for the wrong stage.** The shape family scored BM25's top 10, but
+  with a `rescore` the first stage only has to reach the top 1,500: `url.text^2` adds 0.008 at 10
+  and 0.074 at 1,500. Clauses for all tokens in the title or URL were never measured that way.
+  They could reach at most 6.2 % of the pairs, and about 4.6 % if those convert like the
+  same pages inside the top 1,500. New competitors would lower that.
+- **Inside the top 1,500, better weights have little left.** 430 of the 527 pairs scored too
+  low beat a top-10 doc on BM25, and lose to its list rank. The best weight per keyword, which no
+  query can know, gives 0.472 against 0.418.
+- **A learned re-ranker on the same signals did not win.** LightGBM `lambdarank` with 14
+  features, 5 folds by keyword, gives 0.423 on batch 20 and 0.386 on batch 21, against 0.429 and
+  0.389 (−0.006 [−0.022, +0.010] and −0.004 [−0.026, +0.020]). This was one exploratory
+  configuration, without per-field BM25 or anchor text. List rank, model score and BM25
+  position took 60 % of the gain; title and URL coverage took 6 %.
+
+- **Build.** 52,044,958 docs in 3.4 h: 2.6 h of load at 5,486 docs/s, the rest merge. 43.6 GB,
+  837 bytes per doc, against about 824 for the 51.2M index. All docs have a rank. With both
+  indices kept, `/data` stayed above 2,663 GiB free.
+- **Limits.**
+  - Batch 20 test was read by the 10-23 tuning and the descriptive tables, and both test
+    halves were read twice here, offline and for the online check. Nothing was chosen from
+    the second read. Batch 22 (created 11-16), if it holds no `goto` URLs, is the clean read.
+  - The gain falls where the model is sure: 27 % of the present URLs were golden in an
+    earlier batch. See the table above for who gains and who loses by list rank.
+  - The weight fits this size. BM25 scores are small on a small index, so on 2,653 golden
+    pages the same weight gives 0.650 against 0.833 without it. Tune again for another size.
+  - The scores come from one selection run. A new run needs a new `prior_file` and a rebuild.
+    A retrained model on batches 20 or 21 voids them as out-of-sample data.
+  - A window of 375 per shard scored 0.431 and 0.406 on dev, against 0.430 and 0.386. It
+    was read after the check failed and is not the frozen depth, so it was not adopted.
+  - The recrawl's `fetched` count grew by about 95,000 per 2 hours during the rebuild,
+    against 110,000 to 134,000 before. The planner sent the same number of jobs and Host2's
+    CPU was over 70 % idle, so the cause is open.
+
+### Second round on dev, 2026-11-08
+
+The ranking above, R0, was the simplest of three candidates that dev could not tell apart. A
+second rule (`rank-r2/rule.md`), written before any candidate was scored, asked whether a
+scheme from the literature beats it. Only the dev halves of batches 20 and 21 were read
+(1,021 keywords, 1,946 pairs, the same fixed present set); the test halves were not read
+again. Deltas are against R0 with a paired bootstrap over keyword texts, 10,000 draws.
+
+| Family, 107 candidates | Best against R0 |
+|---|---|
+| Sigmoid or saturation of the rank, as `rank_feature` sigmoid ([Craswell et al., SIGIR 2005](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/craswell_sigir05.pdf)) | +0.001 |
+| Log with a floor at rank 1M or 10M | −0.011 |
+| BM25 over its top-10 mean per query ([Long and Suel, VLDB 2003](https://research.engineering.nyu.edu/~suel/papers/order.pdf)); z-scores per query | +0.002; −0.003 |
+| Reciprocal rank fusion of BM25 and list rank ([Cormack et al., SIGIR 2009](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)) | −0.045 |
+| The sum, windows 375 to 10,000 | −0.029 at 375, +0.009 at 4,500, −0.002 at 10,000 |
+| **BM25 × (1 + 4 (g + 1) / 9)**, g = 8 − log10(rank + 1), window 1,500 | +0.008 (SE 0.004) |
+| The same, window 4,500 | **+0.017** (SE 0.005) |
+| The same at 1,500, plus the 50 docs of highest prior with every token in the title or URL | +0.018 (SE 0.005) |
+
+The scale beats the sum because BM25's scale changes by query while the sum adds the same
+points to every query: the best weight per keyword gave 0.472 against 0.418 above.
+
+| Window | Sum (R0's score) | Scale | Scale plus the 50 strong matches |
+|---|---|---|---|
+| 1,500 | 0.4178 | 0.4255 | 0.4358 |
+| 2,000 | 0.4203 | 0.4291 | 0.4353 |
+| 3,000 | 0.4250 | 0.4332 | 0.4358 |
+| 4,500 | 0.4265 | 0.4347 | 0.4363 |
+| 6,000 | 0.4209 | 0.4342 | 0.4363 |
+| 10,000 | 0.4157 | 0.4347 | 0.4358 |
+
+- **The sum peaks at 4,500 and falls after it.** A deeper window lets in more popular pages
+  with a weak match, and a fixed bonus lifts them into the top 10. The scale holds them to
+  their own low text score, so it rises to 4,500 and holds to 10,000.
+- **The 50 strong matches and a deeper window find the same pages.** Together they add
+  nothing, so the second request is not worth it.
+- **Online, on the live alias, 8 shards, window N / 8 per shard:** the scale at 4,500 gives
+  0.4342 (offline 0.4347), and with the strong matches 0.4347. The sum at 1,500 gives 0.4173.
+  The server's `took` p50 is 52 ms for the scale at 4,500, 53 ms for the scale at 1,500 and
+  50 ms for the sum at 1,500.
+- **Who gains.** Against R0, no list-rank bin, script or token count is lower:
+
+  | List rank | Pairs | R0 | Scale, 4,500 |
+  |---|---|---|---|
+  | under 0.1M | 681 | 0.564 | 0.579 |
+  | 0.1–1M | 441 | 0.562 | 0.569 |
+  | 1–5M | 324 | 0.321 | 0.327 |
+  | 5–10M | 153 | 0.222 | 0.268 |
+  | 10–20M | 139 | 0.130 | 0.158 |
+  | 20M or more | 208 | 0.120 | 0.154 |
+
+  Kana (115 pairs, 0.365) and the other scripts (81 pairs, 0.173) do not change. Against BM25
+  alone, pages at list rank 20M or more still lose: 0.231 before any prior.
+- **Limits.** 107 candidates read on the same dev pairs bias the best upward by about 2 to
+  3 SE. +0.017 clears the simultaneous half-width of its own family, the 18 window candidates
+  (0.012), but that family was read after the other two, so it is not claimed across all 107.
+  Batch 22 (created 11-16) is its first clean read, and one batch detects about +0.03.
+
 ## Decision
 
 **OpenSearch 3.9.0 with `config/text_index/icu.json`.** Q, S and M hold:
@@ -464,6 +667,18 @@ change, so the NanoMIRACL result stands.
 the tuned query and on NanoMIRACL, and it halves the index to 0.13 TB at 128M. With
 the merge fix, a rebuild then fits Host2's `/data` even on the worst day since the
 crawler restarted, unless much recovery source survives the load.
+
+**Ranking on 52M docs, 2026-11-07: `url.text^2`, the list rank as a `rescore` of the top
+1,500, and at most 2 hits per host.** It passed the rule on both test halves: +0.267
+[+0.233, +0.302] on batch 20 and +0.240 [+0.188, +0.292] on batch 21, in H/F over the
+query before it. Online stayed within 0.004 of the offline value on both halves of both
+batches.
+
+**Ranking, 2026-11-08: the list rank scales BM25 over the best 4,500.** `prior_score_mode =
+"multiply"`, `prior_boost = 0.19302` (4 / 9 / ln 10), `prior_depth = 4500`. On dev it gives
++0.017 over the 11-07 ranking, offline and online. It was chosen on dev only, before batch 22
+exists. Batch 22 is read once: the ranking stays if the 95 % interval of its gain over the
+11-07 ranking is above 0, and else goes back to `"total"`, 1.7372 and 1,500, with no rebuild.
 
 ## Found on the way
 
@@ -518,15 +733,23 @@ crawler restarted, unless much recovery source survives the load.
 - urllib raises `RemoteDisconnected`, `IncompleteRead` and timeouts as they are, not as
   `HTTPError`. The client turned only `HTTPError` into a `TextIndexError`, so one lost
   reply among the ~68k bulk requests of a full build would have deleted its index.
+- `rescore` fails beside a sort on anything but `_score`, and its `window_size` is per
+  shard: 188 on 8 shards is the top 1,504. `rank_feature` has `saturation`, `log` and
+  `sigmoid`, and no linear function. Its `log` is `ln(scaling_factor + S)`, so a boost of
+  `4 / ln(10)` is 4 points of score per factor of 10 in rank.
+- `collapse` needs a keyword or numeric field with doc values, fails beside `rescore`, and
+  keeps one hit per host. That would lose about 9 % of the golden pages, as Google's top 10
+  often has two from one host, so the cap runs in the client.
 
 ## Before Host2
 
-The Host2 pieces are in the repo, and nothing runs there yet:
+The Host2 pieces are in the repo. Steps 1 to 4 ran on 2026-11-06, and step 5 on
+2026-11-07 ([Golden batches 20 and 21 on 52M docs](#golden-batches-20-and-21-on-52m-docs)):
 - `deploy/compose.compute.yaml`: the `opensearch` service (profile `search`) and the
   `text-index` job service;
 - `config/text_index/host2.toml`: `settings_file` under `/app` (the image runs in
-  `/work`), 8 shards, no `keep_prev`, and a small DuckDB. The `text-index` service passes
-  it after `container.toml`.
+  `/work`), 8 shards, no `keep_prev`, a small DuckDB, and the `prior_file` of the live
+  selection run. The `text-index` service passes it after `container.toml`.
 - Hard limits, since Host2's CPU is rarely full and `cpu_shares` then does nothing: the node
   has `OS_CPUS` (16) CPUs and `OS_MEM` (64g) of memory, with an `OS_HEAP` (31g) heap, and the
   `text-index` job has 4 CPUs and 24 GB. A stage runs with smaller values. No I/O limit is
@@ -564,7 +787,8 @@ Choices and limits:
   - index only live docs, before the first list swap after the recrawl has run;
   - compact the text Parquet, before its first 30-day cycle ends;
   - fallback documents for docs without text;
-  - a `RankMeasure` for the metric.
+  - a `RankMeasure` for the metric;
+  - one read of batch 22 (created 11-16), if it holds no `goto` URLs, with the node restarted.
 
 ## Reproduction
 
@@ -598,3 +822,29 @@ Scripts (sha256 prefix), kept outside the repo:
 | `golden_flags.py` | `4c194f64dfb7c616` | batch 20's official `is_crawled` and `is_indexed` flags, read once from metricdb |
 | `golden_official.py` | `92a6f07cf46d3320` | batch 20 as the official metric counts it: on-list pages, four background sizes, paired bootstrap |
 | `host2_smoke.sh` | `d9ad011c446507fa` | the Host2 node's settings and data directory permissions on the local Docker VM |
+| `rule.md` | `ea789f1b9b920018` | the rule of the 52M work, written before any variant ran, with its deviations |
+| `rk_common.py` | `ca7a8c3013364c50` | shared config, golden batches, splits, the fixed present set and the bootstrap |
+| `rk_dump.py` | `44b8a2698055c645` | top 1,500 of one query shape for every golden keyword |
+| `rk_depth.py` | `a6437a88b91370e7` | recall at depth, ties at rank 10, hosts and list ranks of a top 10; its golden ranks lean deep, see `rk_golden_rank.py` |
+| `rk_ctrl.py` | `2183fb11e97ce16c` | the index of only batch 20's present golden pages |
+| `rk_shape.py` | `e4b22baae0cc8567` | the query shape family and the bundle |
+| `rk_bm25.py` | `02699587e88f52d4` | k1 and b by closing, updating and opening the index |
+| `rk_rerank.py` | `8e47640bf9a6bd1a` | the prior and host cap family offline, and the test read |
+| `rk_probe.py` | `e3f6426bbfeaa44e` | dev H/F of one candidate by new URLs, tag and script; its list rank bins are wrong, see `rk_miss.py` |
+| `rk_online.py` | `5de0e2884b7c8e8c` | a rebuilt index against the baseline and the offline values |
+| `rk_gap.py` | `5fc91ba415e33f6e` | what separates the online and the offline top 10 |
+| `rk_rescore.py` | `5a6e43bc4e4dfea8` | the prior as a `rescore`, by window, on dev |
+| `rk_gate.py` | `ef99be3cc8bcc633` | the adoption rule on the test half of a rebuilt index |
+| `rk_miss.py` | `e61d7325f461a344` | where the missing pairs stop, and H/F by true list rank, on dev |
+| `rk_ltr.py` | `fd02066d0d9d5039` | a learned re-ranker over the same top 1,500, on dev |
+| `rk_golden_rank.py` | `ac37e03a13ef8408` | the true list rank of every present golden doc |
+| `rk_outside.py` | `dac908cb5c74fef1` | where a keyword's tokens occur in the pages outside the top 1,500, on dev |
+| `rank-r2/rule.md` | `8c73111cfe9d7cc6` | the rule of the second round, with its deviations and the frozen batch 22 read |
+| `rk_r2.py` | `308c37b2a5283553` | the 85 transform, scale, normalization and fusion candidates offline, on dev |
+| `rk_dump_firstm.py` | `db77bbc1ef6bd58e` | the strong matches of highest prior and their BM25, for dev keywords |
+| `rk_online_r2.py` | `4c5cdff9fcd7cbc0` | the sum and the scale online at 1,500, on dev |
+| `rk_online_firstm.py` | `4536d0ccad4b5af3` | the scale with the strong matches online, on dev |
+| `rk_dump_deep.py` | `8f60850e97504f2e` | top 10,000 of the query for dev keywords |
+| `rk_deep.py` | `d1d9dc36c01e95a0` | the sum, the scale and the strong matches at windows 1,500 to 10,000, on dev |
+| `rk_online_deep.py` | `39c615abda7778f5` | the scale at deeper windows online, with latency, on dev |
+| `rk_deep_groups.py` | `9b7e99ecedb34320` | H/F by list rank, script and tokens for the sum at 1,500 and the scale at 4,500 |
