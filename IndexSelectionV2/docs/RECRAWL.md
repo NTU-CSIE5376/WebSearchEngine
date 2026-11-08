@@ -63,8 +63,9 @@ the batch-20 list.
 - So the report also gives two counts over on-list docs, next to `states`. `real_text`
   is the fetched docs with status 200, at least `real_text_min_chars` (200) of body
   text, and a `payload_sha1` not in `challenge_sha1`. `waf_202` is the fetched 202s.
-- These docs stay `fetched`, on the list and in the index. They still hit golden on dev
-  through URL terms and list rank (0.533 / 0.426). Their outcome, retry and host
+- These docs stay `fetched`, on the list and in the index. On the dev half of golden
+  batches 20 and 21, 202 docs still hit at 0.533 and 0.426, through URL terms and list
+  rank. Their outcome, retry and host
   handling do not change: PR #29 removed the blanket 202/403 host block, because host
   probing starved healthy URLs.
 - Round 6 (2026-11-01, `index-selection` experiment 2026-10-29, with that isel wait):
