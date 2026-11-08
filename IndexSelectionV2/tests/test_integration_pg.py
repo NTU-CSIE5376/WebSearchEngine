@@ -379,6 +379,39 @@ def test_migrate_builds_an_empty_selectdb_and_downgrades(selectdb):
     engine.dispose()
 
 
+def test_migrate_0004_sets_best_rank_of_hosts_with_revisits_due(selectdb):
+    """0003's best_rank is min(rank) over every due doc; 0004's puts first fetches before
+    revisits. Each direction recomputes the hosts with a revisit due to its own rule."""
+    cfg = selectdb
+    _setup(cfg)
+    dsn = os.environ[cfg.selectdb.admin_dsn_env]
+    engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://"))
+    acfg = _alembic_config()
+
+    def best(conn):
+        return dict(conn.exec_driver_sql("SELECT host, best_rank FROM recrawl.host").all())
+
+    with engine.begin() as conn:
+        acfg.attributes["connection"] = conn
+        command.downgrade(acfg, "0003")
+        conn.exec_driver_sql(
+            "INSERT INTO recrawl.host (host_id, host, best_rank) VALUES "
+            "(1, 'first.example', 10), (2, 'revisit.example', 20), (3, 'mixed.example', 5)")
+        conn.exec_driver_sql(
+            "INSERT INTO recrawl.doc (doc_id, url, host_id, rank, state, fetched_at) VALUES "
+            "(1, 'https://first.example/', 1, 10, 'pending', NULL), "
+            "(2, 'https://revisit.example/', 2, 20, 'pending', now()), "
+            "(3, 'https://mixed.example/a', 3, 5, 'failed', now()), "
+            "(4, 'https://mixed.example/b', 3, 7, 'pending', NULL), "
+            "(5, 'https://mixed.example/c', 3, 1, 'fetched', now())")
+        command.upgrade(acfg, "0004")
+        assert best(conn) == {"first.example": 10, "revisit.example": 20 + REVISIT_RANK,
+                              "mixed.example": 7}
+        command.downgrade(acfg, "0003")
+        assert best(conn) == {"first.example": 10, "revisit.example": 20, "mixed.example": 5}
+    engine.dispose()
+
+
 def test_the_reader_role_can_only_read(selectdb):
     cfg = selectdb
     _setup(cfg)
@@ -669,6 +702,22 @@ def test_recrawl_sends_no_revisit_while_revisit_is_off(selectdb, tmp_path, stub)
         # Turned on, the next cycle sweeps it back in line and sends it.
         got = plan_cycle(replace(cfg, "recrawl", revisit=True), admin, stale, api)
         assert (got["swept"], got["jobs"]) == (1, 1) and stub.posts[-1] == [A1]
+    finally:
+        admin.close()
+
+
+def test_recrawl_sends_a_queued_revisit_while_revisit_is_off(selectdb, tmp_path, stub):
+    """`revisit = false` stops only the sweep: a revisit already due still goes out,
+    behind its host's first fetches."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False, job_size=3,
+                       host_docs_per_job=3, plan_max_jobs=1)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3])
+        _revisit(admin, A1)
+        assert plan_cycle(cfg, admin, T0, _api(stub))["jobs"] == 1
+        assert stub.posts == [[A2, A3, A1]]
     finally:
         admin.close()
 

@@ -215,6 +215,13 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
   cover due live docs never fetched and fetched before; `doc_inflight (batch_id)`
   covers `dispatched`; `doc_stale (due_at)` covers live `fetched` docs; `job_open
   (state)` and `job_undeleted (batch_id)` cover jobs still to watch or delete.
+- A query on one host's due docs must name its tier (`fetched_at IS NULL` or `IS NOT
+  NULL`), or it matches neither `doc_due_*` index and scans all of `doc` (25 GB on
+  Host1). `_due_tiers` writes the two subqueries; `best_rank`, the idle-host wake-up and
+  sync use it.
+- `0004` recomputes `best_rank` of the hosts with a revisit due (found through
+  `doc_due_revisit`), and its downgrade sets them back to `min(rank)`. Other hosts keep
+  their value, which both revisions compute the same way.
 - Every frontier transaction takes one advisory lock, so sync, plan and archive never
   interleave or deadlock. An instance lock keeps each command to one copy.
 
@@ -237,7 +244,9 @@ committed, then sent.
    API requests first (`manual_first`), so each revisit goes before a normal-crawl
    request, and presence, which the normal crawl drives, loses more pairs than stale
    text can (§11). `due_at` is still set, so turning it on resumes revisits by due date,
-   behind first fetches (step 6).
+   behind first fetches (step 6). Turning it off stops only the sweep: a revisit already
+   `pending` or `failed` still goes out behind its host's first fetches. A 0.2 % sample
+   of the live `recrawl.doc` on 11-08 found none.
 2. **Poll.** Each `submitted`, `completed` or `error` job gets a `GET` at most every
    `status_poll_s` (15 s); 128 jobs (64 at the crawler, 64 completed) make about 8.5
    requests a second.
