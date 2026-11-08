@@ -36,6 +36,7 @@ from isel.publish import load_selection, rollback, swap, verify_live
 from isel.pull import CRAWL_COLUMNS, FULL_SCHEMA, estimate_full, pull_dims, pull_full
 from isel.recrawl import (
     CrawlerApi,
+    _refresh_best_rank,
     archive_cycle,
     capacity_report,
     host_id,
@@ -43,6 +44,7 @@ from isel.recrawl import (
     plan_cycle,
     sync,
 )
+from isel.schema import REVISIT_RANK
 from isel.selectdb import (
     ForbiddenTarget,
     NeedsBaselineStamp,
@@ -367,6 +369,8 @@ def test_migrate_builds_an_empty_selectdb_and_downgrades(selectdb):
         command.downgrade(acfg, "0003")
         assert "throttle_streak" not in {
             c["name"] for c in sa.inspect(conn).get_columns("host", schema="recrawl")}
+        indexes = {i["name"] for i in sa.inspect(conn).get_indexes("doc", schema="recrawl")}
+        assert "doc_due" in indexes and not indexes & {"doc_due_first", "doc_due_revisit"}
         command.downgrade(acfg, "base")
         assert sa.inspect(conn).get_table_names() == ["alembic_version"]
         assert "recrawl" not in sa.inspect(conn).get_schema_names()
@@ -639,10 +643,95 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         _poll(cfg, admin, stub, later)
         assert archive_cycle(cfg, admin, later)["texts"] == 2
 
-        # Fetched docs come due again after stale_days and go out first by rank.
+        # Fetched docs come due again after stale_days. C1 was never fetched and its
+        # robots wait ends too, so its host goes first; the revisits follow by rank.
         stale = later + timedelta(days=r.stale_days, seconds=1)
         revisit = plan_cycle(cfg, admin, stale, api)
-        assert revisit["swept"] == 4 and stub.posts[-1] == [A1, A2, B1, C1]
+        assert revisit["swept"] == 4 and stub.posts[-1] == [C1, A1, A2, B1]
+    finally:
+        admin.close()
+
+
+def _revisit(admin, *urls):
+    """Marks docs as fetched before and due again, as a sweep leaves them."""
+    admin.execute("UPDATE recrawl.doc SET fetched_at = %s WHERE doc_id = ANY(%s)",
+                  (T0 - timedelta(days=31), [pg_doc_id(u) for u in urls]))
+
+
+def _best_ranks(admin):
+    return dict(admin.execute("SELECT host, best_rank FROM recrawl.host").fetchall())
+
+
+def test_recrawl_sends_first_fetches_before_revisits(selectdb, tmp_path, stub):
+    """A doc never fetched has no text, so it goes before any revisit: first within its
+    host, then across hosts through best_rank, whatever the ranks."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, job_size=2, host_docs_per_job=2,
+                       plan_max_jobs=1)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [B1, A1, A2, A3])
+        _revisit(admin, B1, A1, A2)
+        sync(cfg, admin, now=lambda: OPEN)           # best_rank as a new list sets it
+        ranks = dict(admin.execute("SELECT url, rank FROM recrawl.doc").fetchall())
+        synced = _best_ranks(admin)
+        assert synced == {"a.example": ranks[A3], "b.example": ranks[B1] + REVISIT_RANK}
+        # The incremental refresh agrees with sync.
+        admin.execute("UPDATE recrawl.host SET best_rank = NULL")
+        with admin.cursor() as cur:
+            _refresh_best_rank(cur, [host_id("a.example"), host_id("b.example")])
+        assert _best_ranks(admin) == synced
+        # A's first fetch A3 goes first though A1 ranks better; a revisit fills the batch.
+        # B ranks best, but holds only a revisit, so it waits for the next job.
+        assert plan_cycle(cfg, admin, T0, _api(stub))["jobs"] == 1
+        assert stub.posts == [[A3, A1]]
+        assert _host(admin, "b.example")[0] is None
+    finally:
+        admin.close()
+
+
+def _plans(admin):
+    """Collects the JSON plan of every statement `admin` runs, through auto_explain."""
+    plans = []
+
+    def keep(diag):
+        text = diag.message_primary or ""
+        if "{" in text:
+            plans.append(json.loads(text[text.index("{"):]))
+
+    admin.add_notice_handler(keep)
+    for setting in ("LOAD 'auto_explain'", "SET auto_explain.log_min_duration = 0",
+                    "SET auto_explain.log_format = json", "SET auto_explain.log_level = notice",
+                    "SET enable_seqscan = off", "SET enable_bitmapscan = off"):
+        admin.execute(setting)
+    return plans
+
+
+def _nodes(node, parent=None):
+    yield node, parent
+    for child in node.get("Plans", []):
+        yield from _nodes(child, node)
+
+
+def test_recrawl_reads_due_docs_tier_by_tier_from_their_index(selectdb, tmp_path, stub):
+    """Each tier comes in rank order straight from its partial index: no Sort over doc."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, B1])
+        _revisit(admin, A1)
+        plans = _plans(admin)
+        assert plan_cycle(cfg, admin, T0, _api(stub))["jobs"] == 1
+        picked = [p for p in plans if "WITH ORDINALITY" in p["Query Text"]]
+        refresh = [p for p in plans if "SET best_rank = coalesce" in p["Query Text"]]
+        assert picked and refresh
+        for plan in picked + refresh:
+            scans = [(n, up) for n, up in _nodes(plan["Plan"]) if n.get("Relation Name") == "doc"]
+            assert {n.get("Index Name") for n, _ in scans} == {"doc_due_first", "doc_due_revisit"}
+        for plan in picked:
+            assert all(up["Node Type"] == "Limit" for n, up in _nodes(plan["Plan"])
+                       if n.get("Relation Name") == "doc")
     finally:
         admin.close()
 

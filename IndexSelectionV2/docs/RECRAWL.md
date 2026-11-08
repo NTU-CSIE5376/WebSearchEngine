@@ -185,11 +185,11 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 - A job expires `ttl_days` after the POST. Past that, the crawler drops it, `GET` answers
   404, and the API's hourly GC deletes its files.
 
-## 5. Frontier schema (`schema.py`, revisions `0003_recrawl` and `0004_host_throttle_streak`)
+## 5. Frontier schema (`schema.py`, revisions `0003_recrawl` and `0004_recrawl_host_pacing`)
 
 | Table | One row per | Main columns |
 |---|---|---|
-| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank`, `next_at` (end of a 429/503 pause, or its next due doc), `batch_id` (the job of its batch not yet done), `throttle_streak` (batches in a row with a 429/503) |
+| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank` (min of its due docs' rank, plus `REVISIT_RANK` = 2^40 for a doc fetched before), `next_at` (end of a 429/503 pause, or its next due doc), `batch_id` (the job of its batch not yet done), `throttle_streak` (batches in a row with a 429/503 and no page) |
 | `recrawl.doc` | `doc_id` (signed BIGINT) | `url` (canonical), `host_id`, `rank`, `model_run_id`, `state`, `due_at`, `attempts`, `batch_id`, fetch fields, `text_file`, `text_len`, `lang` |
 | `recrawl.job` | job sent to the API | `batch_id`, `job_id`, `doc_ids` (in the order sent), `state`, timestamps, `deleted_at`, `records`, `error` |
 | `recrawl.batch_seq` | (sequence) | source of `batch_id` |
@@ -211,7 +211,8 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 - A job's only deadline is `result_ttl_days` (3), sent as `ttl_days`. The server stops
   an expired job; isel has no timeout of its own.
 - Partial indexes: `host_ready (best_rank)` and `host_queued (batch_id)` split hosts by
-  batch at the crawler; `doc_due (host_id, rank)` covers due live docs; `doc_inflight (batch_id)`
+  batch at the crawler; `doc_due_first (host_id, rank)` and `doc_due_revisit (host_id, rank)`
+  cover due live docs never fetched and fetched before; `doc_inflight (batch_id)`
   covers `dispatched`; `doc_stale (due_at)` covers live `fetched` docs; `job_open
   (state)` and `job_undeleted (batch_id)` cover jobs still to watch or delete.
 - Every frontier transaction takes one advisory lock, so sync, plan and archive never
@@ -267,7 +268,12 @@ committed, then sent.
    archive (`archive_lag`), or if less than `min_free_gb` (800 GB) is free under
    `text_root`.
 6. **Claim.** Ready hosts (no batch at the crawler, `next_at` passed) by `best_rank`. Each gives up to
-   `host_docs_per_job` (240) due docs by rank; jobs hold up to `job_size` (10,000) URLs,
+   `host_docs_per_job` (240) due docs: those never fetched by rank, then revisits by rank.
+   `best_rank` adds 2^40 to a revisit's rank, so a host with a first fetch due goes
+   before any host with only revisits. A doc never fetched has no text, so it can never
+   hit; a revisit only refreshes text. At about 0.97M docs a day a round of 57M
+   revisits takes 59 days, longer than `stale_days`, so without this order revisits of
+   good ranks would hold back first fetches of worse ones. Jobs hold up to `job_size` (10,000) URLs,
    at most `plan_max_jobs` (8) per cycle. A job lists one host's docs after another; the
    crawler regroups them by host anyway. Docs become `dispatched`, each host gets
    `batch_id`, its `next_at` stays as it is, and the claim commits. The host is ready

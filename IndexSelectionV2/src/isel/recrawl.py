@@ -65,7 +65,7 @@ import pyarrow as pa
 from isel.config import Config, RecrawlCfg
 from isel.extract import extract
 from isel.io import TMP_SUFFIX, commit_file, open_duckdb, sql_str, write_parquet_atomic
-from isel.schema import DUE_STATES, OPEN_JOB_STATES
+from isel.schema import DUE_STATES, OPEN_JOB_STATES, REVISIT_RANK
 from isel.urlnorm import md5_number_lower, wire_url
 
 LOCK_CYCLE = 0x15E1_DB02      # xact lock held by every frontier transaction
@@ -139,9 +139,12 @@ def _cycle_lock(cur: psycopg.Cursor) -> None:
 def _refresh_best_rank(cur: psycopg.Cursor, hosts: Iterable[int]) -> None:
     ids = sorted(set(hosts))
     if ids:
+        # One index probe per tier (doc_due_first, doc_due_revisit).
+        due = f"FROM recrawl.doc d WHERE d.host_id = h.host_id AND d.rank IS NOT NULL AND d.{_DUE}"
         cur.execute(
-            "UPDATE recrawl.host h SET best_rank = (SELECT min(d.rank) FROM recrawl.doc d "
-            f"WHERE d.host_id = h.host_id AND d.rank IS NOT NULL AND d.{_DUE}) "
+            f"UPDATE recrawl.host h SET best_rank = coalesce((SELECT min(d.rank) {due} "
+            f"AND d.fetched_at IS NULL), (SELECT min(d.rank) {due} "
+            f"AND d.fetched_at IS NOT NULL) + {REVISIT_RANK}) "
             "WHERE h.host_id = ANY(%s::bigint[])", (ids,))
 
 
@@ -198,7 +201,8 @@ def sync(cfg: Config, conn: psycopg.Connection,
                     "AND model_run_id IS DISTINCT FROM %s", (run_id,))
         dropped = cur.rowcount
         cur.execute(
-            "UPDATE recrawl.host h SET best_rank = m.r FROM (SELECT host_id, min(rank) AS r "
+            "UPDATE recrawl.host h SET best_rank = m.r FROM (SELECT host_id, min(rank + CASE "
+            f"WHEN fetched_at IS NULL THEN 0 ELSE {REVISIT_RANK} END) AS r "
             f"FROM recrawl.doc WHERE rank IS NOT NULL AND {_DUE} GROUP BY host_id) m "
             "WHERE h.host_id = m.host_id AND h.best_rank IS DISTINCT FROM m.r")
         cur.execute(
@@ -646,6 +650,9 @@ def _ready_hosts(cfg: Config, cur: psycopg.Cursor, now: datetime,
                  want: int) -> Iterable[tuple[int, list[tuple[int, str]]]]:
     """Ready hosts by best rank with up to `host_docs_per_job` due docs each.
 
+    A host's docs never fetched go before its revisits, and `best_rank` puts hosts
+    with a first fetch due before hosts with only revisits (`REVISIT_RANK`).
+
     Pages through `host_ready` so a cycle reads about the hosts it needs. A
     ready host with no doc due now (all in backoff) waits for its earliest one,
     or leaves the ready set.
@@ -663,12 +670,16 @@ def _ready_hosts(cfg: Config, cur: psycopg.Cursor, now: datetime,
         if not hosts:
             return
         last = hosts[-1][1], hosts[-1][0]
+        # First fetches, then revisits, each read in rank order from its own index.
+        tier = ("(SELECT doc_id, url, rank, {} AS tier FROM recrawl.doc WHERE "
+                f"host_id = h.host_id AND rank IS NOT NULL AND {_DUE} AND fetched_at IS {{}} "
+                "AND due_at <= %(now)s ORDER BY rank LIMIT %(n)s)")
         cur.execute(
-            "SELECT h.host_id, d.doc_id, d.url FROM unnest(%s::bigint[]) "
-            "WITH ORDINALITY AS h(host_id, o) CROSS JOIN LATERAL (SELECT doc_id, url, rank "
-            f"FROM recrawl.doc WHERE host_id = h.host_id AND rank IS NOT NULL AND {_DUE} "
-            "AND due_at <= %s ORDER BY rank LIMIT %s) d ORDER BY h.o, d.rank",
-            ([h for h, _ in hosts], now, r.host_docs_per_job))
+            "SELECT h.host_id, d.doc_id, d.url FROM unnest(%(hosts)s::bigint[]) "
+            "WITH ORDINALITY AS h(host_id, o) CROSS JOIN LATERAL ("
+            f"{tier.format(0, 'NULL')} UNION ALL {tier.format(1, 'NOT NULL')} "
+            "ORDER BY tier, rank LIMIT %(n)s) d ORDER BY h.o, d.tier, d.rank",
+            {"hosts": [h for h, _ in hosts], "now": now, "n": r.host_docs_per_job})
         docs: dict[int, list[tuple[int, str]]] = {}
         for h, doc_id, url in cur.fetchall():
             docs.setdefault(h, []).append((doc_id, url))
@@ -688,7 +699,8 @@ def _ready_hosts(cfg: Config, cur: psycopg.Cursor, now: datetime,
 def _claim(cfg: Config, cur: psycopg.Cursor, now: datetime, n_jobs: int) -> list[Job]:
     """Packs ready hosts into up to `n_jobs` jobs and marks their docs `dispatched`.
 
-    Hosts fill each job in rank order, each host's docs in rank order. The order
+    Hosts fill each job in `best_rank` order, each host's first fetches and then its
+    revisits in rank order (`_ready_hosts`). The order
     across hosts does not matter: the crawler regroups a job's URLs by host.
     """
     r = cfg.recrawl
