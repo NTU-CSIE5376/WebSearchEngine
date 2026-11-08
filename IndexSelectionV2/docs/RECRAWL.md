@@ -340,7 +340,7 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 |---|---|---|---|
 | Pending job files | one manifest per open job, plus one marker per crawler in it | Host2 `/data/manual_bulk_crawls/pending` | a marker until its crawler finishes; the manifest until DELETE or the TTL |
 | Raw HTML + per-URL JSON | 128M pages are 5–6 TB even gzipped; ≤ ~1.28M pages at once (64 jobs at the crawler, 64 waiting for the archive), about 256 GB at the normal crawl's ~200 KB per page | Host2 `/data/manual_bulk_crawls/results` | deleted by isel once applied; the 3-day TTL removes the rest |
-| Text Parquet | ~0.35–0.4 TB | Host2 `/data/isel/text` | permanent |
+| Text Parquet | ~0.35–0.4 TB per copy of the list; each `stale_days` cycle adds one until compaction exists (§13) | Host2 `/data/isel/text` | permanent |
 | Gzipped per-URL results | ~8 GB | Host2 `/data/isel/log` | permanent; selectdb has no backup |
 | `recrawl` schema | ~37 GB (not measured) | Host1 selectdb `:5445` | resident |
 
@@ -477,24 +477,42 @@ Known risks:
 | A per-hostname list cap from an assumed rate (241,920 at 4.8 s) | the rate is the crawler's to decide and is unknown before the crawl; it saves at most the tails of 23 hosts and costs 8 head golden URLs if they finish |
 | `download_latency` or slot delay from the API to size the cap | latency gives only the slot's ceiling (about 2 / latency), not the share and normal traffic; `fetched_at` already shows the pace that results |
 
-## 13. Inverted index (planned)
+## 13. Inverted index
 
-This round only makes sure recrawl keeps enough data to build one.
+`text-index-build` and `text-index-eval` build and measure it locally; the design, the
+engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
 
 - Source: the text Parquet only (`**/*.parquet`; skip `.parquet.tmp`). Per doc, keep the
-  latest `fetched_at`. Index only live docs (`rank IS NOT NULL`), so ranked ≤ indexed.
-- Engine: Quickwit, which keeps the index on disk instead of RAM. Typesense would need an
-  estimated 100–200 GB RAM for 128M documents. Size: ~0.2 TB compact BM25, ~1.2 TB full.
+  latest `fetched_at`.
+- Engine: OpenSearch with ICU analysis. Quickwit ranked lower on Japanese, Hindi and
+  Bengali in the trial, and Typesense keeps the whole index in RAM: about 1.1–1.65 TB for
+  128M pages of body text.
 
 | Field | Use |
 |---|---|
-| `url`, `canonical_url`, `final_url` | aliases; ~23 % of crawled golden pages are redirect sources |
-| `title`, `description`, `body` | full text, BM25 |
-| `lang` | tokenizer choice; golden keywords come from 10 regions, CJK included |
+| `_id` | the doc id; a hit matches a golden URL only by it. A golden URL that redirects is on the list under its own URL, so it still matches |
+| `doc_id` | the same id as doc values only; it breaks score ties, so every build returns the same top 10 |
+| `url` | displayed; its words are searchable as `url.text` |
+| `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url.text` included. The body has no positions (`index_options: freqs`): the query never uses them, and they were 45 % of the index |
+| `lang` | stored; the trial measured what per-language analyzers would add |
 
+Not built yet, for Host2 after WebCrawler#84 is deployed:
+
+- **Live docs only.** Index only docs on the live list (`rank IS NOT NULL`), so a
+  dropped doc leaves the next build. Needed before the first list swap after the
+  recrawl has run: until then a dropped doc stays searchable, and a golden URL that is
+  no longer listed can count as ranked.
+- **Compact the text Parquet.** `recrawl-archive` appends one row per fetch and never
+  drops the older rows, so every `stale_days` cycle adds about one more copy of the
+  text (0.22–0.4 TB at 128M). Needed before the first cycle ends, 30 days after the
+  recrawl starts; the text index build reads only each doc's newest row.
+- **Words of percent-escaped URLs.** Most CJK and Indic URLs are percent escaped, and
+  `url.text` drops the escapes, so those URLs give no words. Indexing the decoded URL
+  could add them. Golden batch 20 already chose the query, so this waits for batch 21
+  (11-01) to tune and test it.
 - **Fallback documents.** A doc without text (`gone`, `failed`, not yet fetched) is
-  indexed by its URL tokens plus crawlerdb's title and anchor text. The full export must
-  then pull `title` and `anchor_text`. The index covers all 128M URLs from day one.
-- **Recall@10.** The official metric hard-codes `ranked_num` to 0; `TypesenseRankMeasure`
-  is a stub. So measure offline: query each batch's golden keywords and match the top
-  10 canonical URLs against golden URLs. The official metric needs a `RankMeasure` PR.
+  indexed by its URL (`url.text`) plus crawlerdb's title and anchor text. The full
+  export must then pull `title` and `anchor_text`.
+- **Recall@10 in the metric.** The official metric hard-codes `ranked_num` to 0;
+  `TypesenseRankMeasure` is a stub. `text-index-eval` measures it offline the same way;
+  the official metric needs a `RankMeasure` PR.
