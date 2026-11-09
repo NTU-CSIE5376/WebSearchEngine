@@ -273,12 +273,23 @@ result_ttl_days = 3                      # the job's ttl_days: the API stops it 
                                          # results this long after the POST; isel deletes sooner
 max_resend = 20                          # 400 "at index N" drops one URL and sends again
 sweep_rows = 100000                      # fetched docs made due again per plan cycle
+revisit = false                          # sweep due fetched docs back in line. Off since
+                                         # 2026-11-08: under manual_first each revisit goes
+                                         # before the normal crawl (at 0.88 of baseline),
+                                         # and its gain on the metric is unmeasured. due_at
+                                         # is still set, so turning it on resumes revisits
 stale_days = 30                          # uniform revisit interval
 retry_base_s = 600                       # failed doc: retry_base_s * 2^attempts
 retry_max_s = 86400
 max_attempts = 5                         # then wait stale_days instead of retry_max_s
+refusal_reasons = ["http_401", "http_402", "http_403"]  # retries almost never succeed:
+                                         # 0.18 % of first-403 docs were fetched later
+refusal_max_attempts = 2                 # max_attempts for a doc that failed on one of these
 robots_retry_days = 30                   # a robots.txt refusal is asked again after this
-host_pause_max_s = 86400                 # cap on a 429/503 pause
+host_pause_max_s = 21600                 # 429/503 pause: retry_base_s, or retry_base_s * 2^n
+                                         # up to this after n batches in a row with no 200
+                                         # page; a 429/503 doc keeps its attempts. 6 h:
+                                         # replayed 11-05..08, as few wasted sends as today
 archive_interval_s = 15.0
 archive_workers = 8                      # text extraction: 6.5 ms per 590 KB page each
 min_free_gb = 800                        # no new jobs below this free space under text_root;

@@ -185,11 +185,11 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 - A job expires `ttl_days` after the POST. Past that, the crawler drops it, `GET` answers
   404, and the API's hourly GC deletes its files.
 
-## 5. Frontier schema (`schema.py`, revision `0003_recrawl`)
+## 5. Frontier schema (`schema.py`, revisions `0003_recrawl` and `0004_recrawl_host_pacing`)
 
 | Table | One row per | Main columns |
 |---|---|---|
-| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank`, `next_at` (end of a 429/503 pause, or its next due doc), `batch_id` (the job of its batch not yet done) |
+| `recrawl.host` | hostname (a back queue) | `host_id` (low 63 bits of `md5_number_lower(host)`), `host`, `best_rank` (min of its due docs' rank, plus `REVISIT_RANK` = 2^40 for a doc fetched before), `next_at` (end of a 429/503 pause, or its next due doc), `batch_id` (the job of its batch not yet done), `throttle_streak` (batches in a row with a 429/503 and no page) |
 | `recrawl.doc` | `doc_id` (signed BIGINT) | `url` (canonical), `host_id`, `rank`, `model_run_id`, `state`, `due_at`, `attempts`, `batch_id`, fetch fields, `text_file`, `text_len`, `lang` |
 | `recrawl.job` | job sent to the API | `batch_id`, `job_id`, `doc_ids` (in the order sent), `state`, timestamps, `deleted_at`, `records`, `error` |
 | `recrawl.batch_seq` | (sequence) | source of `batch_id` |
@@ -211,9 +211,17 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 - A job's only deadline is `result_ttl_days` (3), sent as `ttl_days`. The server stops
   an expired job; isel has no timeout of its own.
 - Partial indexes: `host_ready (best_rank)` and `host_queued (batch_id)` split hosts by
-  batch at the crawler; `doc_due (host_id, rank)` covers due live docs; `doc_inflight (batch_id)`
+  batch at the crawler; `doc_due_first (host_id, rank)` and `doc_due_revisit (host_id, rank)`
+  cover due live docs never fetched and fetched before; `doc_inflight (batch_id)`
   covers `dispatched`; `doc_stale (due_at)` covers live `fetched` docs; `job_open
   (state)` and `job_undeleted (batch_id)` cover jobs still to watch or delete.
+- A query on one host's due docs must name its tier (`fetched_at IS NULL` or `IS NOT
+  NULL`), or it matches neither `doc_due_*` index and scans all of `doc` (25 GB on
+  Host1). `_due_tiers` writes the two subqueries; `best_rank`, the idle-host wake-up and
+  sync use it.
+- `0004` recomputes `best_rank` of the hosts with a revisit due (found through
+  `doc_due_revisit`), and its downgrade sets them back to `min(rank)`. Other hosts keep
+  their value, which both revisions compute the same way.
 - Every frontier transaction takes one advisory lock, so sync, plan and archive never
   interleave or deadlock. An instance lock keeps each command to one copy.
 
@@ -231,8 +239,14 @@ committed, then sent.
 
 1. **Recover.** A `claimed` job older than `claim_timeout_s` (600 s) is `lost` and its
    docs return to `pending`. Docs and hosts held by a job that is no longer open are
-   released. Up to `sweep_rows` (100,000) `fetched` docs past `due_at` return to
-   `pending`.
+   released. With `revisit` on, up to `sweep_rows` (100,000) `fetched` docs past
+   `due_at` return to `pending`. `revisit` is off since 2026-11-08: the crawler serves
+   API requests first (`manual_first`), so each revisit goes before a normal-crawl
+   request, and presence, which the normal crawl drives, loses more pairs than stale
+   text can (§11). `due_at` is still set, so turning it on resumes revisits by due date,
+   behind first fetches (step 6). Turning it off stops only the sweep: a revisit already
+   `pending` or `failed` still goes out behind its host's first fetches. A 0.2 % sample
+   of the live `recrawl.doc` on 11-08 found none.
 2. **Poll.** Each `submitted`, `completed` or `error` job gets a `GET` at most every
    `status_poll_s` (15 s); 128 jobs (64 at the crawler, 64 completed) make about 8.5
    requests a second.
@@ -251,9 +265,13 @@ committed, then sent.
    freed once every one of its docs there has a result file. `request.json`'s
    `crawler_ids` locate the files, as the archive does; one `scandir` per partition
    lists them. The docs stay `dispatched` until the archive applies the job. A host
-   stays held if one of those results is a 429 or 503, so the apply sets its pause
-   before its next batch. A job whose `request.json` is missing or shorter than the docs
-   sent (dropped duplicates) is left to the apply.
+   with a 429 or 503 among those results is freed too, and gets its pause in the same
+   transaction, so the pause lands before its next batch. The apply then leaves it
+   alone, since the job no longer holds it. Until 11-08 such a host stayed held until
+   the whole job was applied: in the 24 h to 11-08 01:49Z it finished its own docs in
+   a median 5.6 min, then waited a median 45.3 min for the job (#31). A job whose
+   `request.json` is missing or shorter than the docs sent (dropped duplicates) is left
+   to the apply.
 4. **Delete.** Every `applied` job without `deleted_at` gets a `DELETE`. 204 or 404 sets
    `deleted_at`; anything else reports `api_error` and is tried next cycle. This runs even
    while the planner is halted.
@@ -263,7 +281,12 @@ committed, then sent.
    archive (`archive_lag`), or if less than `min_free_gb` (800 GB) is free under
    `text_root`.
 6. **Claim.** Ready hosts (no batch at the crawler, `next_at` passed) by `best_rank`. Each gives up to
-   `host_docs_per_job` (240) due docs by rank; jobs hold up to `job_size` (10,000) URLs,
+   `host_docs_per_job` (240) due docs: those never fetched by rank, then revisits by rank.
+   `best_rank` adds 2^40 to a revisit's rank, so a host with a first fetch due goes
+   before any host with only revisits. A doc never fetched has no text, so it can never
+   hit; a revisit only refreshes text. At about 0.97M docs a day a round of 57M
+   revisits takes 59 days, longer than `stale_days`, so without this order revisits of
+   good ranks would hold back first fetches of worse ones. Jobs hold up to `job_size` (10,000) URLs,
    at most `plan_max_jobs` (8) per cycle. A job lists one host's docs after another; the
    crawler regroups them by host anyway. Docs become `dispatched`, each host gets
    `batch_id`, its `next_at` stays as it is, and the claim commits. The host is ready
@@ -323,12 +346,34 @@ A loop, every 15 s. It never changes `result_root`. A spawn pool of `archive_wor
 | 2xx HTML, challenge pages included (§3) | `fetched`; `text_file`, `text_len`, `lang`, `payload_sha1` set | after `stale_days` (30) |
 | 2xx non-HTML, 404, 410 | `gone` | never |
 | `IgnoreRequest` (robots.txt) | `failed` | after `robots_retry_days` (30) |
-| 429, 503 | `failed`, `attempts + 1`; host paused `retry_base_s` | exponential backoff |
+| 429, 503 | `failed`, `attempts` unchanged; host paused `retry_base_s` (10 min), or `retry_base_s · 2^throttle_streak` up to `host_pause_max_s` (6 h) when its batch had no 200 page | when the host's pause ends |
+| 401, 402, 403 (`refusal_reasons`) | `failed`, `attempts + 1` | as below, but `stale_days` after `refusal_max_attempts` (2) |
 | other failure, `unmatched`, extraction failure | `failed`, `attempts + 1` | `retry_base_s · 2^attempts`, cap 24 h; `stale_days` after `max_attempts` (5) |
 
 - A 2xx applies whenever it is newer than the stored fetch. A failure applies only while
   the doc still waits on this job. A doc of the job with no result is retried
   (`no_result`).
+- A 429 or 503 is about the host, not the doc, so it uses none of the doc's attempts.
+  The host's pause depends on its own results in the batch:
+
+  | Its results in the batch | Pause | `throttle_streak` |
+  |---|---|---|
+  | a 429 or 503 and no 200 page | `retry_base_s · 2^throttle_streak`, cap `host_pause_max_s` | + 1 until the pause reaches the cap |
+  | a 429 or 503 and a 200 page | `retry_base_s` | 0 |
+  | no 429 or 503 | none | 0 |
+
+  A host that answers only 429 (or 429 and 202 challenges) waits 10, 20, 40 min, ... up
+  to 6 h between batches; a host that still serves pages keeps the 10-min pause. This
+  is the existing 429/503 pause made to grow, not a host block: a host with no 429 or
+  503 is never paused (#29). Replayed on Host2's batches of 11-05 to 11-08: 3,496 host
+  batches had a 429 and pages. Growing on any 429 would have made the 115 hosts with
+  one take 70,919 h for the same batches, against 2,067 h with a fixed 10-min pause.
+  The 207 spells with
+  no page need the growth: a fixed 10-min pause would send 1.56M requests into them,
+  against 0.21M with a 6-h cap and 0.16M with 24 h, which re-finds a recovered host
+  later (4,270 vs 5,194 docs lost to the delay).
+- On 11-06 to 11-07, 0.18 % of the docs whose first failure was a 403 were fetched
+  later, against 57.9 % after a 429 (#32), so a refusal gets 2 attempts, not 5.
 
 **Text Parquet.** `doc_id` (uint64, as in the manifest), `batch_id`, `url`, `final_url`,
 `fetched_at`, `http_status`, `lang`, `title`, `description`, `body`, `text_len`,

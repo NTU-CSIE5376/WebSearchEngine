@@ -31,6 +31,8 @@ RUN_STATUSES = ("loading", "validated", "live", "retired", "abandoned", "rolled_
 DOC_STATES = ("pending", "dispatched", "fetched", "failed", "gone")
 # Doc states the planner may hand out again once `due_at` has passed.
 DUE_STATES = ("pending", "failed")
+# Added to a revisit's rank in `recrawl.host.best_rank`: above any list rank (at most 128M).
+REVISIT_RANK = 1 << 40
 JOB_STATES = ("claimed", "submitted", "completed", "applied", "lost", "error")
 # Jobs whose docs stay `dispatched`; an `error` job waits for a fix or for its results to expire.
 OPEN_JOB_STATES = ("claimed", "submitted", "completed", "error")
@@ -92,9 +94,13 @@ recrawl_host = sa.Table(
     "host", metadata,
     sa.Column("host_id", sa.BigInteger, nullable=False, autoincrement=False),
     sa.Column("host", sa.Text, nullable=False),
-    sa.Column("best_rank", sa.BigInteger),          # min rank of its due docs; NULL: none
+    # Min over its due docs of rank, plus REVISIT_RANK for a doc fetched before, so hosts
+    # with a first fetch due go first; NULL: none.
+    sa.Column("best_rank", sa.BigInteger),
     _tstz("next_at"),                               # no job before this (pacing, backoff)
     sa.Column("batch_id", sa.BigInteger),           # job of its batch not yet done; NULL: none
+    # Batches in a row with a 429 or 503; the next pause is retry_base_s * 2^this.
+    sa.Column("throttle_streak", sa.SmallInteger, nullable=False, server_default=sa.text("0")),
     sa.PrimaryKeyConstraint("host_id", name="host_pkey"),
     sa.UniqueConstraint("host", name="host_host_key"),
     sa.Index("host_ready", "best_rank",
@@ -129,8 +135,11 @@ recrawl_doc = sa.Table(
     sa.ForeignKeyConstraint(["model_run_id"], ["model_runs.id"], ondelete="RESTRICT",
                             name="doc_model_run_id_fkey"),
     sa.CheckConstraint(_in("state", DOC_STATES), name="doc_state_check"),
-    sa.Index("doc_due", "host_id", "rank",
-             postgresql_where=sa.text(f"rank IS NOT NULL AND {_in('state', DUE_STATES)}")),
+    # Due live docs never fetched, and due revisits: a host's first fetches go out first.
+    sa.Index("doc_due_first", "host_id", "rank", postgresql_where=sa.text(
+        f"rank IS NOT NULL AND {_in('state', DUE_STATES)} AND fetched_at IS NULL")),
+    sa.Index("doc_due_revisit", "host_id", "rank", postgresql_where=sa.text(
+        f"rank IS NOT NULL AND {_in('state', DUE_STATES)} AND fetched_at IS NOT NULL")),
     sa.Index("doc_inflight", "batch_id", postgresql_where=sa.text("state = 'dispatched'")),
     sa.Index("doc_stale", "due_at",
              postgresql_where=sa.text("state = 'fetched' AND rank IS NOT NULL")),

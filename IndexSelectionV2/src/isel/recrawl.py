@@ -14,7 +14,8 @@ isel puts its docs back in line.
 - `plan` (loop): packs the due docs of the best-ranked ready hosts into jobs
   and POSTs them. A host has at most one batch not yet done at the crawler:
   once all its docs in a job have results, its next batch goes out in a new
-  job, even while the old job waits for other hosts. The crawler's
+  job, even while the old job waits for other hosts; a host with a 429 or
+  503 among them is paused first. The crawler's
   AutoThrottle slot sets how fast a host's docs go out; isel adds no rate of
   its own. A job is recorded
   `claimed` before it is sent, so no HTTP call runs inside a transaction. Plan
@@ -64,7 +65,7 @@ import pyarrow as pa
 from isel.config import Config, RecrawlCfg
 from isel.extract import extract
 from isel.io import TMP_SUFFIX, commit_file, open_duckdb, sql_str, write_parquet_atomic
-from isel.schema import DUE_STATES, OPEN_JOB_STATES
+from isel.schema import DUE_STATES, OPEN_JOB_STATES, REVISIT_RANK
 from isel.urlnorm import md5_number_lower, wire_url
 
 LOCK_CYCLE = 0x15E1_DB02      # xact lock held by every frontier transaction
@@ -135,12 +136,25 @@ def _cycle_lock(cur: psycopg.Cursor) -> None:
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_CYCLE,))
 
 
+def _due_tiers(select: str, host: str) -> tuple[str, str]:
+    """`(SELECT {select} ...)` over the due docs of `host`: first fetches, then revisits.
+
+    Each subquery repeats its tier's partial-index predicate, so it probes
+    `doc_due_first` or `doc_due_revisit` by host. A per-host lookup without the
+    `fetched_at` test matches neither index and scans all of `recrawl.doc`.
+    """
+    first, revisit = (f"(SELECT {select} FROM recrawl.doc d WHERE d.host_id = {host} "
+                      f"AND d.rank IS NOT NULL AND d.{_DUE} AND d.fetched_at {test})"
+                      for test in ("IS NULL", "IS NOT NULL"))
+    return first, revisit
+
+
 def _refresh_best_rank(cur: psycopg.Cursor, hosts: Iterable[int]) -> None:
     ids = sorted(set(hosts))
     if ids:
+        first, revisit = _due_tiers("min(d.rank)", "h.host_id")
         cur.execute(
-            "UPDATE recrawl.host h SET best_rank = (SELECT min(d.rank) FROM recrawl.doc d "
-            f"WHERE d.host_id = h.host_id AND d.rank IS NOT NULL AND d.{_DUE}) "
+            f"UPDATE recrawl.host h SET best_rank = coalesce({first}, {revisit} + {REVISIT_RANK}) "
             "WHERE h.host_id = ANY(%s::bigint[])", (ids,))
 
 
@@ -197,13 +211,13 @@ def sync(cfg: Config, conn: psycopg.Connection,
                     "AND model_run_id IS DISTINCT FROM %s", (run_id,))
         dropped = cur.rowcount
         cur.execute(
-            "UPDATE recrawl.host h SET best_rank = m.r FROM (SELECT host_id, min(rank) AS r "
+            "UPDATE recrawl.host h SET best_rank = m.r FROM (SELECT host_id, min(rank + CASE "
+            f"WHEN fetched_at IS NULL THEN 0 ELSE {REVISIT_RANK} END) AS r "
             f"FROM recrawl.doc WHERE rank IS NOT NULL AND {_DUE} GROUP BY host_id) m "
             "WHERE h.host_id = m.host_id AND h.best_rank IS DISTINCT FROM m.r")
-        cur.execute(
-            "UPDATE recrawl.host h SET best_rank = NULL WHERE best_rank IS NOT NULL AND "
-            "NOT EXISTS (SELECT 1 FROM recrawl.doc d WHERE d.host_id = h.host_id "
-            f"AND d.rank IS NOT NULL AND d.{_DUE})")
+        first, revisit = _due_tiers("1", "h.host_id")
+        cur.execute("UPDATE recrawl.host h SET best_rank = NULL WHERE best_rank IS NOT NULL "
+                    f"AND NOT EXISTS {first} AND NOT EXISTS {revisit}")
     conn.execute("ANALYZE recrawl.host")
     conn.execute("ANALYZE recrawl.doc")
     (hosts,) = conn.execute("SELECT count(*) FROM recrawl.host WHERE best_rank IS NOT NULL"
@@ -359,6 +373,7 @@ def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
     """One planning pass; returns counts.
 
     1. Recover: a job whose POST got no answer is lost after `claim_timeout_s`.
+       With `revisit` on, fetched docs past `due_at` return to `pending`.
     2. Poll: every unapplied job is asked for its status every `status_poll_s`.
        A submitted job the API reports done becomes `completed`; a job the API
        no longer knows is lost (its TTL passed).
@@ -386,16 +401,17 @@ def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
         stats["lost"] = len(lost)
         _release(cur, lost)
         stats["orphans"] = _release_orphans(cur)
-        cur.execute(
-            "UPDATE recrawl.doc SET state = 'pending' WHERE doc_id IN (SELECT doc_id "
-            "FROM recrawl.doc WHERE state = 'fetched' AND rank IS NOT NULL AND due_at <= %s "
-            "LIMIT %s) RETURNING host_id", (now, r.sweep_rows))
-        swept = [h for (h,) in cur.fetchall()]
-        stats["swept"] = len(swept)
-        _wake(cur, swept, now, r.host_pause_max_s)
-        _refresh_best_rank(cur, swept)
+        if r.revisit:
+            cur.execute(
+                "UPDATE recrawl.doc SET state = 'pending' WHERE doc_id IN (SELECT doc_id "
+                "FROM recrawl.doc WHERE state = 'fetched' AND rank IS NOT NULL "
+                "AND due_at <= %s LIMIT %s) RETURNING host_id", (now, r.sweep_rows))
+            swept = [h for (h,) in cur.fetchall()]
+            stats["swept"] = len(swept)
+            _wake(cur, swept, now, r.host_pause_max_s)
+            _refresh_best_rank(cur, swept)
     _check_jobs(cfg, conn, api, now, stats)
-    _drain(cfg, conn, stats)
+    _drain(cfg, conn, now, stats)
     _delete_applied(conn, api, now, stats)
 
     counts = dict(conn.execute("SELECT state, count(*) FROM recrawl.job "
@@ -505,17 +521,21 @@ def _check_jobs(cfg: Config, conn: psycopg.Connection, api: CrawlerApi, now: dat
                      (now, batch))
 
 
-def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None:
+def _drain(cfg: Config, conn: psycopg.Connection, now: datetime,
+           stats: dict[str, Any]) -> None:
     """Frees each host whose docs in its open job all have a result on disk.
 
     A job completes only when all its URLs are done, so without this a host
     would wait for the slowest host of its job. Once freed, its next docs go out
     in a new job while the old one is still open; the crawler still holds at
     most one unfinished batch per host. The docs stay `dispatched` until the
-    archive applies the job. A host with a 429 or 503 among them stays held, so
-    its pause is set before its next job. A job whose `request.json` is missing
-    or dropped duplicates (positions differ from the docs sent) is left to the
-    archive.
+    archive applies the job. A host with a 429 or 503 among them gets its pause
+    here, in the same transaction, so the pause still lands before its next
+    job; the apply leaves a host it no longer holds alone. A page is judged from
+    the record alone, before text extraction, so a page the archive later fails
+    to extract still counts as one here. A job whose
+    `request.json` is missing or dropped duplicates (positions differ from the
+    docs sent) is left to the archive.
     """
     jobs = conn.execute(
         "SELECT batch_id, job_id, doc_ids FROM recrawl.job j "
@@ -531,11 +551,16 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
             "WHERE d.state = 'dispatched' AND d.batch_id = ANY(%s::bigint[])",
             ([b for b, _, _ in jobs],)):
         held.setdefault(batch, {}).setdefault(host, []).append(doc_id)
+    r = cfg.recrawl
     free: list[tuple[int, int]] = []
+    throttled: dict[int, bool] = {}      # host -> no page in its batch (the pause grows)
     for batch, job_id, doc_ids in jobs:
         if batch in held:
-            free += [(host, batch) for host in _drained(
-                Path(cfg.recrawl.result_root) / job_id, doc_ids, held[batch])]
+            for host, hit, paged in _drained(Path(r.result_root) / job_id, doc_ids,
+                                             held[batch]):
+                free.append((host, batch))
+                if hit:
+                    throttled[host] = not paged
     if not free:
         return
     with conn.transaction(), conn.cursor() as cur:
@@ -545,12 +570,22 @@ def _drain(cfg: Config, conn: psycopg.Connection, stats: dict[str, Any]) -> None
                     "WHERE h.host_id = u.host_id AND h.batch_id = u.batch_id RETURNING h.host_id",
                     tuple(map(list, zip(*free, strict=True))))
         freed = [h for (h,) in cur.fetchall()]
+        paused = [h for h in freed if h in throttled]
+        cur.execute(_THROTTLE.format("u.grow", "FROM unnest(%(hosts)s::bigint[], "
+                                     "%(grow)s::bool[]) AS u(host_id, grow) "
+                                     "WHERE h.host_id = u.host_id"),
+                    {"now": now, "base": r.retry_base_s, "pause": r.host_pause_max_s,
+                     "hosts": paused, "grow": [throttled[h] for h in paused]})
+        cur.execute("UPDATE recrawl.host SET throttle_streak = 0 "
+                    "WHERE host_id = ANY(%s::bigint[]) AND throttle_streak > 0",
+                    ([h for h in freed if h not in throttled],))
         _refresh_best_rank(cur, freed)
     stats["drained"] = len(freed)
 
 
-def _drained(job_dir: Path, doc_ids: list[int], docs: dict[int, list[int]]) -> list[int]:
-    """The hosts in `docs` (host -> its doc_ids) whose results are all on disk, unthrottled."""
+def _drained(job_dir: Path, doc_ids: list[int],
+             docs: dict[int, list[int]]) -> list[tuple[int, bool, bool]]:
+    """(host, any 429/503, any 200 page) per host in `docs` with all results on disk."""
     try:
         listing = json.loads((job_dir / "request.json").read_text(encoding="utf-8"))
         urls, owners = listing["urls"], listing["crawler_ids"]
@@ -573,12 +608,13 @@ def _drained(job_dir: Path, doc_ids: list[int], docs: dict[int, list[int]]) -> l
         if not all(f"{n:05d}.json" in names[owners[n]] for n in spots):
             continue
         try:
-            outcomes = [classify(read_item(job_dir / f"crawler_{owners[n]:02d}", n, urls[n]))[0]
-                        for n in spots]
+            items = [read_item(job_dir / f"crawler_{owners[n]:02d}", n, urls[n]) for n in spots]
         except (OSError, ValueError):
             continue                     # the archive reports a bad record
-        if "throttled" not in outcomes:
-            out.append(host)
+        outcomes = [classify(item)[0] for item in items]
+        out.append((host, "throttled" in outcomes,
+                     any(o == "fetched" and item["status_code"] == 200
+                         for o, item in zip(outcomes, items, strict=True))))
     return out
 
 
@@ -595,6 +631,17 @@ def _delete_applied(conn: psycopg.Connection, api: CrawlerApi, now: datetime,
                      (now, batch))
         stats["deleted"] += 1
 
+
+# A batch with a 429 or 503 pauses its host. If it fetched no 200 page ({0} is true), the
+# host blocks us: the pause is retry_base_s * 2^throttle_streak, at most host_pause_max_s,
+# and the streak grows until the pause reaches that cap. A batch that also fetched a page
+# only meets a rate limit: the pause is retry_base_s and the streak resets. Both SET
+# expressions read the old streak. {1} picks the hosts.
+_THROTTLE = ("UPDATE recrawl.host h SET next_at = greatest(coalesce(h.next_at, %(now)s), "
+             "%(now)s + make_interval(secs => least(%(base)s * power(2, CASE WHEN {0} "
+             "THEN h.throttle_streak ELSE 0 END), %(pause)s))), throttle_streak = CASE "
+             "WHEN {0} THEN h.throttle_streak + CASE WHEN %(base)s * "
+             "power(2, h.throttle_streak) < %(pause)s THEN 1 ELSE 0 END ELSE 0 END {1}")
 
 # A throttle pause ends within host_pause_max_s, so a later next_at was set by _claim for
 # docs in backoff; it must not hold back docs that are due now.
@@ -614,6 +661,9 @@ def _ready_hosts(cfg: Config, cur: psycopg.Cursor, now: datetime,
                  want: int) -> Iterable[tuple[int, list[tuple[int, str]]]]:
     """Ready hosts by best rank with up to `host_docs_per_job` due docs each.
 
+    A host's docs never fetched go before its revisits, and `best_rank` puts hosts
+    with a first fetch due before hosts with only revisits (`REVISIT_RANK`).
+
     Pages through `host_ready` so a cycle reads about the hosts it needs. A
     ready host with no doc due now (all in backoff) waits for its earliest one,
     or leaves the ready set.
@@ -631,23 +681,29 @@ def _ready_hosts(cfg: Config, cur: psycopg.Cursor, now: datetime,
         if not hosts:
             return
         last = hosts[-1][1], hosts[-1][0]
+        # First fetches, then revisits, each read in rank order from its own index.
+        tier = ("(SELECT doc_id, url, rank, {} AS tier FROM recrawl.doc WHERE "
+                f"host_id = h.host_id AND rank IS NOT NULL AND {_DUE} AND fetched_at IS {{}} "
+                "AND due_at <= %(now)s ORDER BY rank LIMIT %(n)s)")
         cur.execute(
-            "SELECT h.host_id, d.doc_id, d.url FROM unnest(%s::bigint[]) "
-            "WITH ORDINALITY AS h(host_id, o) CROSS JOIN LATERAL (SELECT doc_id, url, rank "
-            f"FROM recrawl.doc WHERE host_id = h.host_id AND rank IS NOT NULL AND {_DUE} "
-            "AND due_at <= %s ORDER BY rank LIMIT %s) d ORDER BY h.o, d.rank",
-            ([h for h, _ in hosts], now, r.host_docs_per_job))
+            "SELECT h.host_id, d.doc_id, d.url FROM unnest(%(hosts)s::bigint[]) "
+            "WITH ORDINALITY AS h(host_id, o) CROSS JOIN LATERAL ("
+            f"{tier.format(0, 'NULL')} UNION ALL {tier.format(1, 'NOT NULL')} "
+            "ORDER BY tier, rank LIMIT %(n)s) d ORDER BY h.o, d.tier, d.rank",
+            {"hosts": [h for h, _ in hosts], "now": now, "n": r.host_docs_per_job})
         docs: dict[int, list[tuple[int, str]]] = {}
         for h, doc_id, url in cur.fetchall():
             docs.setdefault(h, []).append((doc_id, url))
         idle = [h for h, _ in hosts if h not in docs]
         if idle:
+            # MATERIALIZED: m.n is read twice below, and an inlined m would run both
+            # subqueries twice per host.
+            first, revisit = _due_tiers("min(d.due_at)", "u.host_id")
             cur.execute(
+                f"WITH m AS MATERIALIZED (SELECT u.host_id, least({first}, {revisit}) AS n "
+                "FROM unnest(%s::bigint[]) AS u(host_id)) "
                 "UPDATE recrawl.host h SET next_at = m.n, best_rank = CASE WHEN m.n IS NULL "
-                "THEN NULL ELSE h.best_rank END FROM (SELECT u.host_id, (SELECT min(d.due_at) "
-                "FROM recrawl.doc d WHERE d.host_id = u.host_id AND d.rank IS NOT NULL "
-                f"AND d.{_DUE}) AS n FROM unnest(%s::bigint[]) AS u(host_id)) m "
-                "WHERE h.host_id = m.host_id", (idle,))
+                "THEN NULL ELSE h.best_rank END FROM m WHERE h.host_id = m.host_id", (idle,))
         for h, _ in hosts:
             if h in docs:
                 yield h, docs[h]
@@ -656,7 +712,8 @@ def _ready_hosts(cfg: Config, cur: psycopg.Cursor, now: datetime,
 def _claim(cfg: Config, cur: psycopg.Cursor, now: datetime, n_jobs: int) -> list[Job]:
     """Packs ready hosts into up to `n_jobs` jobs and marks their docs `dispatched`.
 
-    Hosts fill each job in rank order, each host's docs in rank order. The order
+    Hosts fill each job in `best_rank` order, each host's first fetches and then its
+    revisits in rank order (`_ready_hosts`). The order
     across hosts does not matter: the crawler regroups a job's URLs by host.
     """
     r = cfg.recrawl
@@ -1051,6 +1108,16 @@ def _record(r: RecrawlCfg, part: Path, job: JobInput, i: int, item: dict[str, An
     return rec
 
 
+# A failed doc retries after retry_base_s * 2^attempts, or waits stale_days once its
+# attempts reach {} (an SQL expression).
+_BACKOFF = ("state = 'failed', attempts = d.attempts + 1, due_at = %(now)s + CASE "
+            "WHEN d.attempts + 1 >= {} THEN make_interval(days => %(stale)s) "
+            "ELSE make_interval(secs => least(%(base)s * power(2, d.attempts), %(max)s)) END")
+# A refusal (403 ...) almost never turns into a page on retry, so it gets fewer attempts.
+_RETRY_LIMIT = ("CASE WHEN r.fail_reason = ANY(%(refusals)s::text[]) "
+                "THEN %(refusal_attempts)s ELSE %(attempts)s END")
+
+
 def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJob,
            now: datetime) -> int:
     """Applies one job's results idempotently; returns the number of docs changed.
@@ -1063,6 +1130,7 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
     r = cfg.recrawl
     args = {"now": now, "stale": r.stale_days, "robots": r.robots_retry_days,
             "base": r.retry_base_s, "max": r.retry_max_s, "attempts": r.max_attempts,
+            "refusals": r.refusal_reasons, "refusal_attempts": r.refusal_max_attempts,
             "pause": r.host_pause_max_s, "text_file": done.text_file, "batch": job.batch_id,
             "n": len(done.records)}
     changed = 0
@@ -1103,24 +1171,32 @@ def _apply(cfg: Config, conn: psycopg.Connection, job: JobInput, done: PreparedJ
             "due_at = %(now)s + make_interval(days => %(robots)s) "
             + current.format("'robots'"), args)
         changed += cur.rowcount
+        # Hosts this job still holds; a drained host had its batch judged by the drain.
+        throttled = ("SELECT 1 FROM r JOIN recrawl.doc d USING (doc_id) "
+                     "WHERE r.outcome = 'throttled' AND d.host_id = h.host_id "
+                     "AND d.state = 'dispatched' AND d.batch_id = %(batch)s")
+        # The docs fetched here are no longer `dispatched`, so r alone names them.
+        no_page = ("NOT EXISTS (SELECT 1 FROM r JOIN recrawl.doc d USING (doc_id) "
+                   "WHERE d.host_id = h.host_id AND r.outcome = 'fetched' "
+                   "AND r.http_status = 200)")
+        cur.execute(_THROTTLE.format(
+            no_page, f"WHERE h.batch_id = %(batch)s AND EXISTS ({throttled})"), args)
+        cur.execute("UPDATE recrawl.host h SET throttle_streak = 0 WHERE h.batch_id = %(batch)s "
+                    f"AND h.throttle_streak > 0 AND NOT EXISTS ({throttled})", args)
+        # The host's pause alone paces a throttled doc, so it keeps its attempts.
         cur.execute(
-            "UPDATE recrawl.host h SET next_at = greatest(coalesce(h.next_at, %(now)s), "
-            "%(now)s + make_interval(secs => least(%(base)s, %(pause)s))) "
-            "FROM (SELECT DISTINCT d.host_id FROM r JOIN recrawl.doc d USING (doc_id) "
-            "WHERE r.outcome = 'throttled' AND d.state = 'dispatched' "
-            "AND d.batch_id = %(batch)s) p WHERE h.host_id = p.host_id", args)
-        backoff = ("state = 'failed', attempts = d.attempts + 1, due_at = %(now)s + CASE "
-                   "WHEN d.attempts + 1 >= %(attempts)s THEN make_interval(days => %(stale)s) "
-                   "ELSE make_interval(secs => least(%(base)s * power(2, d.attempts), %(max)s)) "
-                   "END")
+            "UPDATE recrawl.doc d SET state = 'failed', due_at = %(now)s, "
+            "http_status = r.http_status, final_url = r.final_url, fail_reason = r.fail_reason "
+            + current.format("'throttled'"), args)
+        changed += cur.rowcount
         cur.execute(
-            f"UPDATE recrawl.doc d SET {backoff}, http_status = r.http_status, "
-            "final_url = r.final_url, fail_reason = r.fail_reason "
-            "FROM r WHERE r.outcome IN ('throttled', 'retry') AND d.doc_id = r.doc_id "
-            "AND d.state = 'dispatched' AND d.batch_id = %(batch)s", args)
+            f"UPDATE recrawl.doc d SET {_BACKOFF.format(_RETRY_LIMIT)}, "
+            "http_status = r.http_status, final_url = r.final_url, fail_reason = r.fail_reason "
+            + current.format("'retry'"), args)
         changed += cur.rowcount
         # A doc of this job with no record at all: never expected, never left waiting.
-        cur.execute(f"UPDATE recrawl.doc d SET {backoff}, fail_reason = 'no_result' "
+        cur.execute(f"UPDATE recrawl.doc d SET {_BACKOFF.format('%(attempts)s')}, "
+                    "fail_reason = 'no_result' "
                     "WHERE d.state = 'dispatched' AND d.batch_id = %(batch)s", args)
         changed += cur.rowcount
         cur.execute("UPDATE recrawl.host SET batch_id = NULL WHERE batch_id = %(batch)s "

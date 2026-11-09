@@ -37,6 +37,7 @@ from isel.pg import ReadGuard, ReadOnlyViolation, open_metricdb
 from isel.publish import load_selection, rollback, swap, verify_live
 from isel.recrawl import (
     CrawlerApi,
+    _refresh_best_rank,
     archive_cycle,
     capacity_report,
     host_id,
@@ -44,6 +45,7 @@ from isel.recrawl import (
     plan_cycle,
     sync,
 )
+from isel.schema import REVISIT_RANK
 from isel.selectdb import (
     ForbiddenTarget,
     NeedsBaselineStamp,
@@ -281,8 +283,8 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
     with pytest.raises(NeedsBaselineStamp):
         migrate(_admin(cfg))
     first = migrate(_admin(cfg), stamp_baseline=True)
-    assert first == {"revision_before": None, "revision": "0003", "stamped_baseline": True}
-    assert migrate(_admin(cfg))["revision_before"] == "0003"     # a rerun changes nothing
+    assert first == {"revision_before": None, "revision": "0004", "stamped_baseline": True}
+    assert migrate(_admin(cfg))["revision_before"] == "0004"     # a rerun changes nothing
     with pytest.raises(RuntimeError, match="only fits a pre-Alembic"):
         migrate(_admin(cfg), stamp_baseline=True)
     admin = _admin(cfg)
@@ -306,17 +308,55 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
 
 def test_migrate_builds_an_empty_selectdb_and_downgrades(selectdb):
     cfg = selectdb
-    assert _setup(cfg)["revision"] == "0003"
+    assert _setup(cfg)["revision"] == "0004"
     dsn = os.environ[cfg.selectdb.admin_dsn_env]
     engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://"))
     acfg = _alembic_config()
     with engine.begin() as conn:
         acfg.attributes["connection"] = conn
+        command.downgrade(acfg, "0003")
+        assert "throttle_streak" not in {
+            c["name"] for c in sa.inspect(conn).get_columns("host", schema="recrawl")}
+        indexes = {i["name"] for i in sa.inspect(conn).get_indexes("doc", schema="recrawl")}
+        assert "doc_due" in indexes and not indexes & {"doc_due_first", "doc_due_revisit"}
         command.downgrade(acfg, "base")
         assert sa.inspect(conn).get_table_names() == ["alembic_version"]
         assert "recrawl" not in sa.inspect(conn).get_schema_names()
         command.upgrade(acfg, "head")
         command.check(acfg)
+    engine.dispose()
+
+
+def test_migrate_0004_sets_best_rank_of_hosts_with_revisits_due(selectdb):
+    """0003's best_rank is min(rank) over every due doc; 0004's puts first fetches before
+    revisits. Each direction recomputes the hosts with a revisit due to its own rule."""
+    cfg = selectdb
+    _setup(cfg)
+    dsn = os.environ[cfg.selectdb.admin_dsn_env]
+    engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://"))
+    acfg = _alembic_config()
+
+    def best(conn):
+        return dict(conn.exec_driver_sql("SELECT host, best_rank FROM recrawl.host").all())
+
+    with engine.begin() as conn:
+        acfg.attributes["connection"] = conn
+        command.downgrade(acfg, "0003")
+        conn.exec_driver_sql(
+            "INSERT INTO recrawl.host (host_id, host, best_rank) VALUES "
+            "(1, 'first.example', 10), (2, 'revisit.example', 20), (3, 'mixed.example', 5)")
+        conn.exec_driver_sql(
+            "INSERT INTO recrawl.doc (doc_id, url, host_id, rank, state, fetched_at) VALUES "
+            "(1, 'https://first.example/', 1, 10, 'pending', NULL), "
+            "(2, 'https://revisit.example/', 2, 20, 'pending', now()), "
+            "(3, 'https://mixed.example/a', 3, 5, 'failed', now()), "
+            "(4, 'https://mixed.example/b', 3, 7, 'pending', NULL), "
+            "(5, 'https://mixed.example/c', 3, 1, 'fetched', now())")
+        command.upgrade(acfg, "0004")
+        assert best(conn) == {"first.example": 10, "revisit.example": 20 + REVISIT_RANK,
+                              "mixed.example": 7}
+        command.downgrade(acfg, "0003")
+        assert best(conn) == {"first.example": 10, "revisit.example": 20, "mixed.example": 5}
     engine.dispose()
 
 
@@ -459,7 +499,7 @@ def _recrawl_cfg(cfg, tmp_path, stub, **kw):
     values = {"api_url": stub.url, "result_root": str(stub.results),
               "text_root": str(root / "text"), "log_root": str(root / "log"), "job_size": 4,
               "host_docs_per_job": 2, "max_jobs_inflight": 3, "plan_max_jobs": 2,
-              "min_free_gb": 0, "archive_workers": 1, "status_poll_s": 0}
+              "min_free_gb": 0, "archive_workers": 1, "status_poll_s": 0, "revisit": True}
     return replace(cfg, "recrawl", **{**values, **kw})
 
 
@@ -551,7 +591,9 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
             "颱風假", "停班停課", "zh")
         assert "防颱準備" in rows[A1]["body"] and "首頁" not in rows[A1]["body"]
         assert rows[B1]["fetched_at"] == done + timedelta(seconds=2)   # its position in the job
-        assert _doc(admin, A2, "state", "attempts", "fail_reason") == ("failed", 1, "http_503")
+        # A 503 is about the host: the doc keeps its attempts and waits for the pause.
+        assert _doc(admin, A2, "state", "attempts", "fail_reason", "due_at") == (
+            "failed", 0, "http_503", done)
         assert _doc(admin, C1, "state", "fail_reason", "due_at") == (
             "failed", "ignore_request", done + timedelta(days=r.robots_retry_days))
         assert _host(admin, "a.example") == (None, done + timedelta(seconds=r.retry_base_s))
@@ -582,10 +624,192 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         _poll(cfg, admin, stub, later)
         assert archive_cycle(cfg, admin, later)["texts"] == 2
 
-        # Fetched docs come due again after stale_days and go out first by rank.
+        # Fetched docs come due again after stale_days. C1 was never fetched and its
+        # robots wait ends too, so its host goes first; the revisits follow by rank.
         stale = later + timedelta(days=r.stale_days, seconds=1)
         revisit = plan_cycle(cfg, admin, stale, api)
-        assert revisit["swept"] == 4 and stub.posts[-1] == [A1, A2, B1, C1]
+        assert revisit["swept"] == 4 and stub.posts[-1] == [C1, A1, A2, B1]
+    finally:
+        admin.close()
+
+
+def test_recrawl_sends_no_revisit_while_revisit_is_off(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1])
+        api = _api(stub)
+        _round(cfg, admin, stub, api, FakeCrawler(stub, {A1: ENGLISH}), T0)
+        (due,) = _doc(admin, A1, "due_at")
+        assert due == T0 + timedelta(days=r.stale_days)      # still set while off
+        stale = due + timedelta(seconds=1)
+        assert plan_cycle(cfg, admin, stale, api)["swept"] == 0
+        assert _doc(admin, A1, "state") == ("fetched",) and len(stub.posts) == 1
+        # Turned on, the next cycle sweeps it back in line and sends it.
+        got = plan_cycle(replace(cfg, "recrawl", revisit=True), admin, stale, api)
+        assert (got["swept"], got["jobs"]) == (1, 1) and stub.posts[-1] == [A1]
+    finally:
+        admin.close()
+
+
+def test_recrawl_sends_a_queued_revisit_while_revisit_is_off(selectdb, tmp_path, stub):
+    """`revisit = false` stops only the sweep: a revisit already due still goes out,
+    behind its host's first fetches."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False, job_size=3,
+                       host_docs_per_job=3, plan_max_jobs=1)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3])
+        _revisit(admin, A1)
+        assert plan_cycle(cfg, admin, T0, _api(stub))["jobs"] == 1
+        assert stub.posts == [[A2, A3, A1]]
+    finally:
+        admin.close()
+
+
+def _revisit(admin, *urls):
+    """Marks docs as fetched before and due again, as a sweep leaves them."""
+    admin.execute("UPDATE recrawl.doc SET fetched_at = %s WHERE doc_id = ANY(%s)",
+                  (T0 - timedelta(days=31), [pg_doc_id(u) for u in urls]))
+
+
+def _best_ranks(admin):
+    return dict(admin.execute("SELECT host, best_rank FROM recrawl.host").fetchall())
+
+
+def test_recrawl_sends_first_fetches_before_revisits(selectdb, tmp_path, stub):
+    """A doc never fetched has no text, so it goes before any revisit: first within its
+    host, then across hosts through best_rank, whatever the ranks."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, job_size=2, host_docs_per_job=2,
+                       plan_max_jobs=1)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [B1, A1, A2, A3])
+        _revisit(admin, B1, A1, A2)
+        sync(cfg, admin, now=lambda: OPEN)           # best_rank as a new list sets it
+        ranks = dict(admin.execute("SELECT url, rank FROM recrawl.doc").fetchall())
+        synced = _best_ranks(admin)
+        assert synced == {"a.example": ranks[A3], "b.example": ranks[B1] + REVISIT_RANK}
+        # The incremental refresh agrees with sync.
+        admin.execute("UPDATE recrawl.host SET best_rank = NULL")
+        with admin.cursor() as cur:
+            _refresh_best_rank(cur, [host_id("a.example"), host_id("b.example")])
+        assert _best_ranks(admin) == synced
+        # A's first fetch A3 goes first though A1 ranks better; a revisit fills the batch.
+        # B ranks best, but holds only a revisit, so it waits for the next job.
+        assert plan_cycle(cfg, admin, T0, _api(stub))["jobs"] == 1
+        assert stub.posts == [[A3, A1]]
+        assert _host(admin, "b.example")[0] is None
+    finally:
+        admin.close()
+
+
+def _plans(admin):
+    """Collects the JSON plan of every statement `admin` runs, through auto_explain."""
+    plans = []
+
+    def keep(diag):
+        text = diag.message_primary or ""
+        if "{" in text:
+            plans.append(json.loads(text[text.index("{"):]))
+
+    admin.add_notice_handler(keep)
+    for setting in ("LOAD 'auto_explain'", "SET auto_explain.log_min_duration = 0",
+                    "SET auto_explain.log_format = json", "SET auto_explain.log_level = notice",
+                    "SET enable_seqscan = off", "SET enable_bitmapscan = off"):
+        admin.execute(setting)
+    return plans
+
+
+def _nodes(node, parent=None):
+    yield node, parent
+    for child in node.get("Plans", []):
+        yield from _nodes(child, node)
+
+
+def test_recrawl_reads_due_docs_tier_by_tier_from_their_index(selectdb, tmp_path, stub):
+    """Each tier comes in rank order straight from its partial index: no Sort over doc."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, B1])
+        _revisit(admin, A1)
+        plans = _plans(admin)
+        assert plan_cycle(cfg, admin, T0, _api(stub))["jobs"] == 1
+        picked = [p for p in plans if "WITH ORDINALITY" in p["Query Text"]]
+        refresh = [p for p in plans if "SET best_rank = coalesce" in p["Query Text"]]
+        assert picked and refresh
+        for plan in picked + refresh:
+            scans = [(n, up) for n, up in _nodes(plan["Plan"]) if n.get("Relation Name") == "doc"]
+            assert {n.get("Index Name") for n, _ in scans} == {"doc_due_first", "doc_due_revisit"}
+        for plan in picked:
+            assert all(up["Node Type"] == "Limit" for n, up in _nodes(plan["Plan"])
+                       if n.get("Relation Name") == "doc")
+    finally:
+        admin.close()
+
+
+def _doc_scans(plan):
+    return [n for n, _ in _nodes(plan["Plan"]) if n.get("Relation Name") == "doc"]
+
+
+def _fail_until(admin, url, due):
+    admin.execute("UPDATE recrawl.doc SET state = 'failed', due_at = %s WHERE doc_id = %s",
+                  (due, pg_doc_id(url)))
+
+
+def test_recrawl_idle_host_waits_for_its_earliest_due_doc(selectdb, tmp_path, stub):
+    """A ready host with every due doc in backoff waits for the earliest of them, read
+    through the tier indexes: one probe per tier, never a scan of doc."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, B1, C1])
+        _revisit(admin, A2)
+        hour, two = T0 + timedelta(hours=1), T0 + timedelta(hours=2)
+        _fail_until(admin, A1, hour)             # a first fetch in backoff
+        _fail_until(admin, A2, two)              # a revisit in backoff
+        admin.execute("UPDATE recrawl.doc SET state = 'gone' WHERE doc_id = %s",
+                      (pg_doc_id(C1),))          # C keeps a best_rank but has no due doc
+        a_rank = _best_ranks(admin)["a.example"]
+        plans = _plans(admin)
+        assert plan_cycle(cfg, admin, T0, _api(stub))["jobs"] == 1
+        assert stub.posts == [[B1]]
+        assert _host(admin, "a.example") == (None, hour)
+        assert _host(admin, "c.example") == (None, None)
+        assert _best_ranks(admin)["a.example"] == a_rank
+        assert _best_ranks(admin)["c.example"] is None
+        idle = [p for p in plans if "min(d.due_at)" in p["Query Text"]]
+        assert len(idle) == 1
+        scans = sorted((n["Node Type"], n.get("Index Name", "")) for n in _doc_scans(idle[0]))
+        assert scans == [("Index Scan", "doc_due_first"), ("Index Scan", "doc_due_revisit")]
+    finally:
+        admin.close()
+
+
+def test_recrawl_sync_clears_best_rank_through_the_tier_indexes(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, C1])
+        admin.execute("UPDATE recrawl.doc SET state = 'gone' WHERE doc_id = %s",
+                      (pg_doc_id(C1),))
+        plans = _plans(admin)
+        sync(cfg, admin, now=lambda: OPEN)
+        assert _best_ranks(admin)["c.example"] is None
+        assert _best_ranks(admin)["a.example"] is not None
+        clear = [p for p in plans if "SET best_rank = NULL" in p["Query Text"]]
+        assert len(clear) == 1
+        scans = _doc_scans(clear[0])
+        assert scans and {n.get("Index Name") for n in scans} <= {"doc_due_first",
+                                                                 "doc_due_revisit"}
     finally:
         admin.close()
 
@@ -693,25 +917,155 @@ def test_recrawl_plan_frees_a_host_whose_docs_are_done_while_its_job_runs(select
         admin.close()
 
 
-def test_recrawl_drain_holds_a_throttled_host_until_its_pause_is_set(selectdb, tmp_path, stub):
+# A1's answer beside A2's 429, the pause (in retry_base_s) and the streak after it, from a
+# streak of 2: a 200 page means a rate limit, a 202 challenge alone counts as no page.
+@pytest.mark.parametrize("first, pause, streak", [(ENGLISH, 1, 0),
+                                                  (Page(status=202, body=ENGLISH.body), 4, 3)])
+def test_recrawl_drain_frees_a_throttled_host_and_pauses_it_once(selectdb, tmp_path, stub,
+                                                                 first, pause, streak):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub)
     r = cfg.recrawl
     _setup(cfg)
     admin = _admin(cfg)
     try:
         _live(cfg, admin, tmp_path, [A1, A2, A3, B1])
+        admin.execute("UPDATE recrawl.host SET throttle_streak = 2")
         api = _api(stub)
         plan_cycle(cfg, admin, T0, api)
         ((batch, job_id, _, _),) = _jobs(admin)
-        crawler = FakeCrawler(stub, {A1: ENGLISH, A2: Page(status=429), B1: ENGLISH})
+        crawler = FakeCrawler(stub, {A1: first, A2: Page(status=429), A3: ENGLISH,
+                                     B1: ENGLISH})
         crawler.fetch(job_id, [A1, A2], T0)
-        assert plan_cycle(cfg, admin, T0, api)["drained"] == 0
-        assert _host(admin, "a.example")[0] == batch
+        # A's docs are done, one with a 429: A is freed and paused now, while B still
+        # holds the job open.
+        drained = T0 + timedelta(seconds=1)
+        got = plan_cycle(cfg, admin, drained, api)
+        assert (got["drained"], got["jobs"]) == (1, 0)
+        pause_end = drained + timedelta(seconds=pause * r.retry_base_s)
+        assert _host(admin, "a.example") == (None, pause_end)
+        assert _streak(admin, "a.example") == streak
+        assert _host(admin, "b.example")[0] == batch
 
-        crawler.take(T0)
-        _poll(cfg, admin, stub, T0)
-        archive_cycle(cfg, admin, T0)
-        assert _host(admin, "a.example") == (None, T0 + timedelta(seconds=r.retry_base_s))
+        # After the pause A's next batch goes out, though its first job is still open.
+        assert plan_cycle(cfg, admin, pause_end, api)["jobs"] == 1
+        assert stub.posts[-1] == [A3]
+        second = _jobs(admin)[1][1]
+        # Applying the first job does not pause A again: that job no longer holds A.
+        applied = pause_end + timedelta(minutes=1)
+        crawler.take(applied, hold={second})
+        _poll(cfg, admin, stub, applied)
+        assert archive_cycle(cfg, admin, applied)["jobs"] == 1
+        assert _host(admin, "a.example")[1] == pause_end
+        assert _streak(admin, "a.example") == streak
+        assert _doc(admin, A2, "state", "attempts", "due_at") == ("failed", 0, applied)
+    finally:
+        admin.close()
+
+
+def _streak(admin, host):
+    return admin.execute("SELECT throttle_streak FROM recrawl.host WHERE host_id = %s",
+                         (host_id(host),)).fetchone()[0]
+
+
+def _round(cfg, admin, stub, api, crawler, at):
+    """One job sent, fetched, polled and applied, all at `at`."""
+    assert plan_cycle(cfg, admin, at, api)["jobs"] == 1
+    crawler.take(at)
+    _poll(cfg, admin, stub, at)
+    assert archive_cycle(cfg, admin, at)["jobs"] == 1
+
+
+def test_recrawl_attempts_depend_on_the_failure_reason(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    r = cfg.recrawl
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, B1, C1])
+        admin.execute("UPDATE recrawl.doc SET attempts = 1")
+        crawler = FakeCrawler(stub, {A1: Page(status=403), B1: Page(status=500),
+                                     C1: Page(status=429)})
+        _round(cfg, admin, stub, _api(stub), crawler, T0)
+        # A refusal waits stale_days after refusal_max_attempts (2), not max_attempts (5).
+        assert _doc(admin, A1, "state", "attempts", "due_at") == (
+            "failed", r.refusal_max_attempts, T0 + timedelta(days=r.stale_days))
+        assert _doc(admin, B1, "state", "attempts", "due_at") == (
+            "failed", 2, T0 + timedelta(seconds=2 * r.retry_base_s))
+        # A 429 keeps the doc's attempts; the host's pause paces it.
+        assert _doc(admin, C1, "state", "attempts", "due_at") == ("failed", 1, T0)
+        assert _host(admin, "c.example") == (None, T0 + timedelta(seconds=r.retry_base_s))
+        assert _streak(admin, "c.example") == 1
+    finally:
+        admin.close()
+
+
+def test_recrawl_pause_grows_with_throttled_batches_in_a_row(selectdb, tmp_path, stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, job_size=1, host_docs_per_job=1,
+                       host_pause_max_s=1500)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2])
+        api = _api(stub)
+        crawler = FakeCrawler(stub, {A1: Page(status=429), A2: Page(status=429)})
+        at = T0
+        # 600 s, 1200 s, then the 1500 s cap; the streak stops growing at the cap.
+        for pause, streak in ((600, 1), (1200, 2), (1500, 2), (1500, 2)):
+            _round(cfg, admin, stub, api, crawler, at)
+            assert stub.posts[-1] == [A1]
+            assert _host(admin, "a.example") == (None, at + timedelta(seconds=pause))
+            assert _streak(admin, "a.example") == streak
+            at += timedelta(seconds=pause)
+        # A batch without a 429 resets the streak, so the next 429 pauses 600 s again.
+        crawler.web[A1] = ENGLISH
+        _round(cfg, admin, stub, api, crawler, at)
+        assert _streak(admin, "a.example") == 0 and _doc(admin, A1, "state") == ("fetched",)
+        _round(cfg, admin, stub, api, crawler, at)
+        assert stub.posts[-1] == [A2]
+        assert _host(admin, "a.example") == (None, at + timedelta(seconds=600))
+        assert _doc(admin, A2, "attempts") == (0,)
+    finally:
+        admin.close()
+
+
+def test_recrawl_pause_grows_only_when_a_batch_fetched_no_page(selectdb, tmp_path, stub):
+    """A host that still serves 200 pages next to its 429s is rate limited, not blocking:
+    it keeps the base pause however long its streak was. A 202 challenge is no page."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, job_size=2, host_docs_per_job=2)
+    base = timedelta(seconds=cfg.recrawl.retry_base_s)
+    a4 = "https://a.example/4"
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, A3, a4])
+        api = _api(stub)
+        crawler = FakeCrawler(stub, {A1: ENGLISH, A2: Page(status=429)})
+        _round(cfg, admin, stub, api, crawler, T0)
+        assert stub.posts[-1] == [A1, A2]
+        assert _host(admin, "a.example") == (None, T0 + base)
+        assert _streak(admin, "a.example") == 0
+        # A long streak does not survive a batch that fetched a page.
+        admin.execute("UPDATE recrawl.host SET throttle_streak = 3")
+        crawler.web[A3] = ENGLISH
+        at = T0 + base
+        _round(cfg, admin, stub, api, crawler, at)
+        assert sorted(stub.posts[-1]) == [A2, A3]
+        assert _host(admin, "a.example") == (None, at + base)
+        assert _streak(admin, "a.example") == 0
+        # 429 beside a 202 challenge: no page, so the pause starts to grow.
+        crawler.web[a4] = Page(status=202, body=ENGLISH.body)
+        at += base
+        _round(cfg, admin, stub, api, crawler, at)
+        assert sorted(stub.posts[-1]) == [A2, a4]
+        assert _doc(admin, a4, "state", "http_status") == ("fetched", 202)
+        assert _host(admin, "a.example") == (None, at + base)
+        assert _streak(admin, "a.example") == 1
+        at += base
+        _round(cfg, admin, stub, api, crawler, at)
+        assert stub.posts[-1] == [A2]
+        assert _host(admin, "a.example") == (None, at + 2 * base)
+        assert _streak(admin, "a.example") == 2
+        assert _doc(admin, A2, "attempts") == (0,)
     finally:
         admin.close()
 

@@ -173,6 +173,10 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
         (("real_text_min_chars = 200 ", "real_text_min_chars = -1 "), "real_text_min_chars"),
         (('"f1dbc6923af7384830c2b832bc9859adacbc3b70"', '"F1DBC6923AF7384830C2B832BC"'),
          "challenge_sha1"),
+        (("refusal_max_attempts = 2 ", "refusal_max_attempts = 6 "), "refusal_max_attempts"),
+        (("refusal_max_attempts = 2 ", "refusal_max_attempts = 0 "), "refusal_max_attempts"),
+        (('"http_401", "http_402"', '"401", "http_402"'), "refusal_reasons"),
+        (("revisit = false ", "revisit = 0 "), "revisit"),
     ]
     for (old, new), message in cases:
         assert old in BASE.read_text(), old
