@@ -51,5 +51,5 @@ class QueryStrategy:
                     print("Max retries reached. Returning empty list.")
                     return []
 
-        # google.com/goto 轉址連結換成實際網址，解析不了的丟掉
-        return resolve_golden_urls(urls)
+        # google.com/goto 轉址連結換成實際網址，解析不了的記在 log 後丟掉
+        return resolve_golden_urls(urls, query=query)

@@ -39,36 +39,39 @@ def _fetch(url: str, timeout: float):
         return e
 
 
-def resolve_google_goto(url: str, fetch=_fetch, timeout: float = 10) -> str | None:
-    """Return the page a goto link redirects to, or None if it can't be resolved
-    (no redirect, a redirect back to Google such as a captcha page, or an error)."""
+def resolve_google_goto(url: str, fetch=_fetch, timeout: float = 10) -> tuple[str | None, str]:
+    """Return (target, reason): the page a goto link redirects to, or None and why
+    it can't be resolved (no redirect, a redirect back to Google such as a captcha
+    page, or an error)."""
     try:
         response = fetch(url, timeout)
     except Exception as e:
-        print(f"[goto] resolve failed for {url}: {e}")
-        return None
+        return None, f"request failed: {type(e).__name__}: {e}"
 
-    location = response.headers.get("Location") if 300 <= response.status < 400 else None
+    if not 300 <= response.status < 400:
+        return None, f"HTTP {response.status}, no redirect"
+    location = response.headers.get("Location")
     if not location:
-        return None
+        return None, f"HTTP {response.status} without Location"
     host = (urlsplit(location).hostname or "").lower()
     if not host or "google" in host.split("."):
-        return None
-    return location
+        return None, f"HTTP {response.status} to {location}"
+    return location, "resolved"
 
 
-def resolve_golden_urls(urls: list, fetch=_fetch, delay: float = 0.5) -> list:
-    """Replace goto links with their targets; drop the ones that can't be resolved."""
+def resolve_golden_urls(urls: list, query: str = "", fetch=_fetch, delay: float = 0.5) -> list:
+    """Replace goto links with their targets. Links that can't be resolved are
+    logged with the query, their SerpApi rank and the reason, then dropped."""
     resolved = []
-    for url in urls:
+    for rank, url in enumerate(urls, start=1):
         if not is_google_goto(url):
             resolved.append(url)
             continue
-        target = resolve_google_goto(url, fetch=fetch)
+        target, reason = resolve_google_goto(url, fetch=fetch)
         if target:
             resolved.append(target)
         else:
-            print(f"[goto] dropped unresolved link {url}")
+            print(f"[goto] dropped unresolved link: query={query!r} rank={rank} reason={reason} url={url}")
         if delay:
             time.sleep(delay)
     return resolved

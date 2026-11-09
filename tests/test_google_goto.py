@@ -48,27 +48,33 @@ def test_is_google_goto(url, expected):
 
 def test_resolve_follows_one_redirect():
     fetch = fetcher({GOTO: FakeResponse(302, TARGET)})
-    assert resolve_google_goto(GOTO, fetch=fetch) == TARGET
+    assert resolve_google_goto(GOTO, fetch=fetch) == (TARGET, "resolved")
 
 
 @pytest.mark.parametrize(
-    "response",
+    "response, reason",
     [
-        FakeResponse(200),
-        FakeResponse(302),
-        FakeResponse(302, "https://www.google.com/sorry/index?continue=x"),
-        FakeResponse(302, "/relative/path"),
-        TimeoutError("timed out"),
+        (FakeResponse(200), "HTTP 200, no redirect"),
+        (FakeResponse(302), "HTTP 302 without Location"),
+        (FakeResponse(302, "https://www.google.com/sorry/index?continue=x"),
+         "HTTP 302 to https://www.google.com/sorry/index?continue=x"),
+        (FakeResponse(302, "/relative/path"), "HTTP 302 to /relative/path"),
+        (TimeoutError("timed out"), "request failed: TimeoutError: timed out"),
     ],
 )
-def test_resolve_returns_none_when_target_unknown(response):
-    assert resolve_google_goto(GOTO, fetch=fetcher({GOTO: response})) is None
+def test_resolve_explains_why_target_unknown(response, reason):
+    assert resolve_google_goto(GOTO, fetch=fetcher({GOTO: response})) == (None, reason)
 
 
-def test_resolve_golden_urls_keeps_order_and_drops_unresolved():
+def test_resolve_golden_urls_keeps_order_and_drops_unresolved(capsys):
     bad = "https://www.google.com/goto?url=expired"
     fetch = fetcher({GOTO: FakeResponse(302, TARGET), bad: FakeResponse(200)})
     urls = ["https://a.com/1", GOTO, bad, "https://b.com/2"]
-    assert resolve_golden_urls(urls, fetch=fetch, delay=0) == ["https://a.com/1", TARGET, "https://b.com/2"]
+    resolved = resolve_golden_urls(urls, query="j league", fetch=fetch, delay=0)
+    assert resolved == ["https://a.com/1", TARGET, "https://b.com/2"]
     # Ordinary links are passed through without a request.
     assert fetch.calls == [GOTO, bad]
+    # The dropped link is logged with its query, SerpApi rank and reason.
+    assert capsys.readouterr().out.splitlines() == [
+        f"[goto] dropped unresolved link: query='j league' rank=3 reason=HTTP 200, no redirect url={bad}"
+    ]
