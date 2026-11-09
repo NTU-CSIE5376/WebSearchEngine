@@ -25,10 +25,20 @@ psql -v ON_ERROR_STOP=1 -h 172.16.191.1 -p 5433 -U metric -d metricdb \
 
 Both SQL files run in one transaction and abort, changing nothing, unless every row
 still holds the expected URL. A second run of the same file therefore fails
-instead of doing anything. Only `url` changes. The flags (`is_discovered`,
-`is_crawled`, `is_indexed`, `shard_id`) are recomputed by the next
-`measure.py --test --measure crawler_all` run, which always measures the latest
-batch (still 21 until the next batch is created).
+instead of doing anything. Only `url` changes.
+
+The flags (`is_discovered`, `is_crawled`, `is_indexed`, `shard_id`) and the
+coverage tables are not recomputed on their own: cron runs `crawler_all` only on
+the 1st and 16th together with `--create`, so it measures the new batch, not 21.
+Measure batch 21 once by hand after the write-back, before the next batch is
+created (2026-11-16 12:00). Without `--create`, `measure.py` measures the latest
+batch, and the coverage rows are upserted for today's date:
+
+```sh
+cd /root/WebSearchEngine && /root/system-venv/bin/python3 measure.py --test \
+    --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.3:5433 \
+    --select_db_url 172.16.191.1:5445 --strategy random head --measure crawler_all
+```
 
 Tested on a copy of batch 21 in Postgres 16: write-back leaves 0 goto rows, a rerun
 aborts, and rollback restores the original URLs byte for byte.

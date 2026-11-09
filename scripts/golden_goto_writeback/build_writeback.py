@@ -59,8 +59,9 @@ def render_sql(rows: list[dict], batch: int, rollback: bool) -> str:
 --   psql -v ON_ERROR_STOP=1 -h 172.16.191.1 -p 5433 -U metric -d metricdb -f <this file>
 --
 -- Runs in one transaction. It aborts, changing nothing, unless all {n} rows still
--- hold the expected URL. Only metric_url.url changes; the next
--- `measure.py --test --measure crawler_all` run recomputes is_discovered/is_crawled/is_indexed.
+-- hold the expected URL. Only metric_url.url changes; run
+-- `measure.py --test --measure crawler_all --strategy random head` (no --create)
+-- afterwards to recompute the flags and coverage, see README.md.
 
 BEGIN;
 
