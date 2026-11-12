@@ -1,0 +1,56 @@
+name: websearchengine_selectdb
+
+services:
+  selectdb:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${SELECTDB_USER:-select}
+      POSTGRES_PASSWORD: ${SELECTDB_PASSWORD:-select}
+      POSTGRES_DB: ${SELECTDB_NAME:-selectdb}
+    ports:
+      - "${SELECTDB_PORT:-5444}:5432"
+    volumes:
+      - ${SELECTDB_DATA_DIR:-./runtime/selectdb-data}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SELECTDB_USER:-select} -d ${SELECTDB_NAME:-selectdb}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  indexselection_scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.selectdb
+    restart: unless-stopped
+    depends_on:
+      selectdb:
+        condition: service_healthy
+    environment:
+      METRIC_DB_URL: ${METRIC_DB_URL:-postgresql+psycopg2://metric:metric@172.16.191.1:5433/metricdb}
+      CRAWLER_DB_URL: ${CRAWLER_DB_URL:-postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb}
+      SELECT_DB_URL: ${SELECT_DB_URL:-postgresql+psycopg2://select:select@selectdb:5432/selectdb}
+      RUN_ROOT: /runtime
+      IPC_QUEUE_DIR: ${IPC_QUEUE_DIR:-/data/indexselection_v1/ipc}
+      TRAIN_SCHEDULE: ${TRAIN_SCHEDULE:-0 0 8,23 * *}
+      TRAIN_BATCHES: ${TRAIN_BATCHES:-10}
+      TEST_BATCHES: ${TEST_BATCHES:-0}
+      NEGATIVE_SAMPLE_TARGET: ${NEGATIVE_SAMPLE_TARGET:-1000000}
+      SELECTION_TOP_K: ${SELECTION_TOP_K:-32000000}
+      TOP_FRAC: ${TOP_FRAC:-0.06}
+      RANDOM_TEST_FRAC: ${RANDOM_TEST_FRAC:-0.1}
+      SEED: ${SEED:-42}
+      WORKER_COUNT: ${WORKER_COUNT:-16}
+      DB_RETRY_ATTEMPTS: ${DB_RETRY_ATTEMPTS:-3}
+      SCORE_BATCH_SIZE: ${SCORE_BATCH_SIZE:-250000}
+      FETCH_SIZE: ${FETCH_SIZE:-100000}
+      RUN_ON_STARTUP: ${RUN_ON_STARTUP:-0}
+      SELECTION_FIRST_SEEN_BEFORE: ${SELECTION_FIRST_SEEN_BEFORE:-}
+      GOLDEN_SET_ANCHOR_DATE: ${GOLDEN_SET_ANCHOR_DATE:-}
+      GOLDEN_SET_CADENCE_DAYS: ${GOLDEN_SET_CADENCE_DAYS:-14}
+      PRE_GOLDEN_RESET_DAYS: ${PRE_GOLDEN_RESET_DAYS:-7}
+      RESET_SCHEDULE: ${RESET_SCHEDULE:-}
+      RESET_REASON: ${RESET_REASON:-pre_golden_reset}
+    volumes:
+      - ${INDEXSELECTION_RUNTIME_DIR:-./runtime/indexselection}:/runtime
+      - ${IPC_HOST_PATH:-./runtime/ipc}:/data
