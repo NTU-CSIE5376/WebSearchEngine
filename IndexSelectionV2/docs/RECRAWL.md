@@ -242,12 +242,14 @@ recomputed, and hosts of new or re-ranked docs lose their backoff `next_at`.
   live one) would change, and writes nothing. Run it after `publish`, before `swap`.
   It streams `recrawl.doc` out with one `COPY` (no sort) and joins it with the run's
   manifest in DuckDB. Totals: docs `new` to the frontier, `kept` (`kept_fetched`,
-  `kept_real` as in §3, `kept_left` not yet fetched), live docs `dropped`, and `left`,
-  the docs still to send. Per host, most `left` first (`report_top_hosts`): its pace,
+  `kept_real` as in §3, `kept_waiting`, `kept_left`), live docs `dropped`, and `left`,
+  the docs still to send this period: new plus `kept_left`. A kept `failed` doc whose
+  `due_at` falls after `report_period_days` (a refusal or robots wait of `stale_days`)
+  is `kept_waiting`, not left. Per host, most `left` first (`report_top_hosts`): its pace,
   the results per day in the last `report_rate_days` of `log_root`, the share of status
   200 among them, and `days_left` = `left` over that pace. A host above
   `report_period_days` (one list period) is flagged; one with no recent result has no
-  pace. A kept `failed` doc counts as left even while it waits for its `due_at`.
+  pace.
 - Measured on Host2 on 2026-11-13, before any list swap: 70 % of the 2.80M docs left on
   hosts with 1,000 or more were on hosts that served no page (403, 405), only AWS WAF 202
   challenges (`www.espn.com`), or 200s without text (`www.youtube.com`). A host's pace

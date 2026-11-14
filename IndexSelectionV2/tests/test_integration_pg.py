@@ -948,24 +948,29 @@ def test_recrawl_swap_report_counts_what_a_new_list_keeps_adds_and_drops(selectd
         totals = {k: v for k, v in got.items() if k not in ("hosts", "secs")}
         assert totals == {
             "run_label": "r2", "docs": 3, "kept": 2, "new": 1, "kept_fetched": 1,
-            "kept_real": 1, "kept_left": 1, "dropped": 1, "dropped_fetched": 1,
+            "kept_real": 1, "kept_waiting": 0, "kept_left": 1, "dropped": 1, "dropped_fetched": 1,
             "dropped_real": 1, "left": 2, "hosts_left": 2, "hosts_over_period": 0,
             "left_over_period": 0, "left_without_pace": 1, "rate_days": 1,
             "period_days": cfg.recrawl.report_period_days}
         # b.example answered its one doc with a 403 in the last day; c.example has no pace.
         assert got["hosts"] == [
             {"host": "b.example", "docs": 1, "new": 0, "kept_fetched": 0, "kept_real": 0,
-             "kept_left": 1, "left": 1, "per_day": 1.0, "ok_share": 0.0, "days_left": 1.0,
-             "over_period": False},
+             "kept_waiting": 0, "kept_left": 1, "left": 1, "per_day": 1.0, "ok_share": 0.0,
+             "days_left": 1.0, "over_period": False},
             {"host": "c.example", "docs": 1, "new": 1, "kept_fetched": 0, "kept_real": 0,
-             "kept_left": 0, "left": 1, "per_day": None, "ok_share": None, "days_left": None,
-             "over_period": False}]
+             "kept_waiting": 0, "kept_left": 0, "left": 1, "per_day": None, "ok_share": None,
+             "days_left": None, "over_period": False}]
         # Over 3 days, b.example's one result is a third of a doc a day: 3 days left.
         slow = swap_report(replace(cfg, "recrawl", report_rate_days=3, report_period_days=1,
                                    report_top_hosts=1), admin, "r2", now=at)
         assert (slow["hosts_over_period"], slow["left_over_period"]) == (1, 1)
         assert [(h["host"], h["days_left"], h["over_period"]) for h in slow["hosts"]] == [
             ("b.example", 3.0, True)]
+        # A retry due after the period (a refusal's stale_days wait) is not left.
+        _fail_until(admin, B1, at + timedelta(days=cfg.recrawl.report_period_days, seconds=1))
+        later = swap_report(cfg, admin, "r2", now=at)
+        assert (later["kept_waiting"], later["kept_left"], later["left"]) == (1, 0, 1)
+        assert [h["host"] for h in later["hosts"]] == ["c.example"]
         # Nothing was written: A2 is still listed and C1 is not in the frontier.
         assert _doc(admin, A2, "rank") != (None,) and _doc(admin, C1, "state") is None
     finally:
