@@ -195,3 +195,36 @@ def test_the_prior_reorders_only_the_best_text_matches(node, tmp_path, mode, boo
     narrow = replace(cfg, "text_index", k=2, fetch_k=2, prior_depth=2).text_index
     ids, _ = search(client, narrow, "zebra")
     assert set(ids) == {str(doc_id[n]) for n in ("strong", "middle")}
+
+
+def test_a_listed_doc_without_text_is_found_by_its_url(node, tmp_path):
+    vinegary = "https://www.merriam-webster.com/dictionary/vinegary"     # Cloudflare refuses us
+    off_list = ("https://recipes.example.com/vinegary-dressing", "en", "Vinegary dressing", None,
+                "A vinegary dressing for a green salad.")
+    root = tmp_path / "text"
+    write_parquet_atomic(_text([DOCS[0], off_list], datetime(2026, 10, 20, tzinfo=UTC)),
+                         root / "job-1.parquet")
+    listed = [DOCS[0][0], vinegary]
+    prior = tmp_path / "list" / "run.parquet"
+    write_parquet_atomic(pa.table({
+        "doc_id": pa.array([md5_number_lower(canonicalize(u)) for u in listed], pa.uint64()),
+        "rank": pa.array([0, 1], pa.int64()), "url": listed}), prior)
+    cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
+                  alias="isel-text-fallback", prior_file=str(prior), warmup_queries=0,
+                  settings_file=str(ROOT / "config/text_index/icu.json"))
+    client = OpenSearch(node, 60.0, 2, 1.0)
+    out = build(cfg, client, root, datetime(2026, 10, 25, tzinfo=UTC))
+    assert (out["docs"], out["fallback_docs"], out["docs_off_list"]) == (2, 1, 1)
+
+    # The off-list page says "vinegary" in its title and body; only the listed URL counts.
+    vinegary_id = str(md5_number_lower(canonicalize(vinegary)))
+    ids, _ = search(client, cfg.text_index, "vinegary")
+    assert ids == [vinegary_id]
+    golden = [{"batch_id": 20, "batch_created_at": datetime(2026, 10, 16, tzinfo=UTC),
+               "query_id": 1, "keyword": "vinegary", "frequency": 1, "tags": ["head"],
+               "rank": 1, "raw_url": vinegary, "canonical_url": canonicalize(vinegary),
+               "host": "www.merriam-webster.com"}]
+    write_parquet_atomic(pa.Table.from_pylist(golden, schema=GOLDEN_SCHEMA),
+                         golden_path(cfg.work_dir))
+    measured = evaluate_golden(cfg, client, 20)["all"]
+    assert (measured["presence"], measured["recall_pairs"]) == (1.0, 1.0)
