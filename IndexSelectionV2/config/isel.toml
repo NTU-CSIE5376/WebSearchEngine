@@ -341,9 +341,10 @@ fields = ["title^2", "description", "body", "url.text^2"]   # tuned on golden ba
 k = 10                                   # hits per query: the metric's top 10
 fetch_k = 200                            # hits read per query, so a host cap can refill the top k
 host_cap = 2                             # hits per host in the top k; 0 turns the cap off
-prior_file = ""                          # Parquet glob of the list's doc_id and rank, or "live"
-                                         # for the live run's manifest; only listed docs are
-                                         # indexed. "" indexes every doc with no prior.
+prior_file = ""                          # Parquet glob of the list's doc_id, rank and url, or
+                                         # "live" for the live run's manifest; only listed docs
+                                         # are indexed, a doc without text by its url alone.
+                                         # "" indexes every text doc with no prior.
                                          # Host-specific (host2.toml)
 prior_scale = 1e9                        # sel_prior = prior_scale / (rank + 1); above the largest
                                          # rank, so log(1 + S) stays close to log(S)

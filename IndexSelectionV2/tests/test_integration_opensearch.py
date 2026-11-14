@@ -177,7 +177,8 @@ def test_the_prior_reorders_only_the_best_text_matches(node, tmp_path, mode, boo
     write_parquet_atomic(_text(docs, datetime(2026, 10, 20, tzinfo=UTC)), root / "job-1.parquet")
     prior = tmp_path / "list" / "run.parquet"
     write_parquet_atomic(pa.table({"doc_id": pa.array([doc_id[n] for n in ranks], pa.uint64()),
-                                   "rank": pa.array(list(ranks.values()), pa.int64())}), prior)
+                                   "rank": pa.array(list(ranks.values()), pa.int64()),
+                                   "url": [f"https://{n}.example.org/" for n in ranks]}), prior)
     cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
                   alias=f"isel-text-prior-{mode}", host_cap=0, prior_file=str(prior),
                   prior_score_mode=mode, prior_boost=boost,

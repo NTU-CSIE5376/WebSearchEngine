@@ -101,9 +101,9 @@ def test_latest_docs_keeps_the_newest_row_of_each_doc(cfg, tmp_path):
     from isel.io import open_duckdb
 
     con = open_duckdb(cfg, tmp_path / "tmp")
-    rows, ranked, reader = latest_docs(con, root, 10)
+    texts, url_only, off_list, reader = latest_docs(con, root, 10)
     table = reader.read_all()
-    assert rows == 2 and ranked == 0
+    assert (texts, url_only, off_list) == (2, 0, 0)
     assert table.column_names == ["doc_id", *DOC_FIELDS, "prior_rank"]
     # doc 2 ties on fetched_at: the larger file name (job-2) wins.
     assert sorted(zip(table["doc_id"].to_pylist(), table["title"].to_pylist(),
@@ -119,7 +119,7 @@ def test_latest_docs_lets_a_row_without_text_lose_to_any_row_with_text(cfg, tmp_
         _row(1, OLD, "real", "text"), _row(2, OLD, None, "only a body"), _row(3, OLD, **challenge)])
     _write(root / "fetch_date=20261020" / "job-2.parquet", [
         _row(1, NEW, **challenge), _row(2, NEW, **challenge), _row(3, NEW, **challenge)])
-    _, _, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10)
+    *_, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10)
     table = reader.read_all().sort_by("doc_id")
     assert table["body"].to_pylist() == ["text", "only a body", ""]
     assert table["title"].to_pylist()[0] == "real"
@@ -231,32 +231,70 @@ def test_latest_docs_keeps_only_listed_docs_at_their_best_rank(cfg, tmp_path):
                       "url": ["u", "v", "w", "x"]})
     write_parquet_atomic(prior, tmp_path / "list" / "run=r" / "index_shard=00.parquet")
     glob = str(tmp_path / "list" / "run=r" / "index_shard=*.parquet")
-    rows, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10, glob)
+    texts, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root,
+                                                    10, glob)
     table = reader.read_all()
-    assert rows == 2 and off_list == 1 and table.num_rows == 2
+    assert (texts, url_only, off_list) == (2, 1, 1) and table.num_rows == 3
     got = dict(zip(table["doc_id"].to_pylist(), table["prior_rank"].to_pylist(), strict=True))
-    assert got == {1: 5, 2: 0}
+    assert got == {1: 5, 2: 0, 9: 3}
     # Without a prior every doc stays, with no rank.
-    rows, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10)
-    assert (rows, off_list, reader.read_all()["prior_rank"].null_count) == (3, 0, 3)
+    texts, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10)
+    assert (texts, url_only, off_list, reader.read_all()["prior_rank"].null_count) == (3, 0, 0, 3)
+
+
+def test_latest_docs_adds_url_only_docs_for_listed_docs_without_text(cfg, tmp_path):
+    from isel.io import open_duckdb
+
+    root = tmp_path / "text"
+    waf = {"title": None, "body": ""}           # a challenge page: a text row with no text
+    _write(root / "a" / "job-1.parquet", [_row(1), _row(2, **waf), _row(3)])
+    # Doc 5 is on the list twice, under two spellings of one page; doc 7 once. Neither has
+    # a text row.
+    prior = pa.table({"doc_id": pa.array([1, 2, 5, 5, 7], pa.uint64()),
+                      "rank": pa.array([4, 6, 8, 3, 1], pa.int64()),
+                      "url": ["https://h1.example/", "https://h2.example/",
+                              "https://www.merriam-webster.com/dictionary/vinegary",
+                              "https://merriam-webster.com/dictionary/vinegary",
+                              "https://natalie.mu/music/news/1"]})
+    write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
+    texts, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10,
+                                                    str(tmp_path / "list" / "s.parquet"))
+    rows = {r.pop("doc_id"): r for r in reader.read_all().to_pylist()}
+    assert (texts, url_only, off_list) == (2, 2, 1)
+    assert sorted(rows) == [1, 2, 5, 7]
+    no_text = dict.fromkeys(("lang", "title", "description", "body"))
+    assert rows[5] == {"url": "https://merriam-webster.com/dictionary/vinegary",
+                       **no_text, "prior_rank": 3}
+    assert rows[7] == {"url": "https://natalie.mu/music/news/1", **no_text, "prior_rank": 1}
+    # The challenge page's row stays the doc's document; the doc gets no second one.
+    assert (rows[2]["body"], rows[2]["lang"], rows[2]["prior_rank"]) == ("", "en", 6)
+    assert rows[1]["title"] == "t"
 
 
 def test_build_indexes_only_the_docs_on_the_list(cfg, stub, tmp_path):
     root = tmp_path / "text"
     _write(root / "a" / "job-1.parquet", [_row(1), _row(2)])
-    prior = pa.table({"doc_id": pa.array([1], pa.uint64()), "rank": pa.array([0], pa.int64())})
+    vinegary = "https://www.merriam-webster.com/dictionary/vinegary"
+    prior = pa.table({"doc_id": pa.array([1, 9], pa.uint64()), "rank": pa.array([0, 3], pa.int64()),
+                      "url": ["https://h1.example/", vinegary]})
     write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
     with_prior = replace(cfg, "text_index", prior_file=str(tmp_path / "list" / "s.parquet"))
     out = build(with_prior, _client(stub), root)
-    assert (out["prior_docs"], out["docs_off_list"], out["prior_run"]) == (1, 1, None)
+    assert (out["prior_docs"], out["fallback_docs"], out["docs_off_list"]) == (2, 1, 1)
+    assert (out["rows"], out["docs"], out["prior_run"]) == (2, 2, None)
     docs = stub.indices[out["index"]]["docs"]
-    assert set(docs) == {"1"} and PRIOR_FIELD in docs["1"]
+    assert set(docs) == {"1", "9"} and PRIOR_FIELD in docs["1"]
+    # The listed doc without text: its list URL and rank, nothing else.
+    assert docs["9"] == {"doc_id": 9, "url": vinegary, PRIOR_FIELD: 1e9 / 4}
 
 
 def test_build_stops_when_no_doc_is_on_the_list(cfg, stub, tmp_path):
     root = tmp_path / "text"
     _write(root / "a" / "job-1.parquet", [_row(1)])
-    prior = pa.table({"doc_id": pa.array([9], pa.uint64()), "rank": pa.array([0], pa.int64())})
+    # A list that shares no doc with the text is the wrong list, though every listed doc
+    # could get a document from its URL.
+    prior = pa.table({"doc_id": pa.array([9], pa.uint64()), "rank": pa.array([0], pa.int64()),
+                      "url": ["https://h9.example/"]})
     write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
     with pytest.raises(TextIndexError, match=r"no doc of .* is on the list"):
         build(replace(cfg, "text_index", prior_file=str(tmp_path / "list" / "s.parquet")),
