@@ -874,6 +874,119 @@ def capacity_report(r: RecrawlCfg, conn: psycopg.Connection, now: datetime) -> d
     return report
 
 
+def swap_report(cfg: Config, conn: psycopg.Connection, label: str | None = None,
+                now: datetime | None = None) -> dict[str, Any]:
+    """What a sync of run `label` (default: the live run) would change; writes nothing.
+
+    Sync keeps every doc already in the frontier with its fetch state, so the new list
+    sends only its new docs and the kept docs not yet fetched (`left`). A kept `failed`
+    doc whose `due_at` falls after the next `report_period_days` (a refusal or robots
+    wait, `stale_days` after its last attempt) goes out only in a later period: it is
+    `kept_waiting`, not left. Live docs that the run leaves out are `dropped`. A host's
+    pace is its results per day over the last `report_rate_days` of `log_root`, and
+    `days_left` is its `left` over that pace, None without a recent result. The frontier
+    is streamed out with one `COPY`, no sort, and joined in DuckDB.
+    """
+    from isel.manifest import validate_run
+
+    r = cfg.recrawl
+    at = now or datetime.now(UTC)
+    if label is None:
+        _, label = _live_run(conn)
+    run_dir = cfg.work_dir / "full" / "selection" / f"run={label}"
+    if validate_run(run_dir).get("scope") != "full":
+        raise RecrawlError(f"{run_dir} is not a select-full run")
+    tmp = cfg.work_dir / "duckdb_tmp"
+    con = open_duckdb(cfg, tmp)
+    docs_csv = tmp / "recrawl_report_docs.csv"
+    started = time.monotonic()
+    try:
+        docs = _stage_docs(con, run_dir)
+        with conn.cursor() as cur, docs_csv.open("wb") as fh, cur.copy(
+                "COPY (SELECT doc_id, host_id, (rank IS NOT NULL)::int, state, "
+                "(state = 'fetched' AND http_status = 200 AND text_len >= %s "
+                "AND payload_sha1 IS NOT NULL AND payload_sha1 <> ALL(%s::text[]))::int, "
+                "(state = 'failed' AND due_at > %s)::int "
+                "FROM recrawl.doc) TO STDOUT (FORMAT csv)",
+                (r.real_text_min_chars, r.challenge_sha1,
+                 at + timedelta(days=r.report_period_days))) as copy:
+            while block := copy.read():
+                fh.write(block)
+        con.execute(f"""CREATE OR REPLACE TEMP TABLE fr AS SELECT * FROM read_csv(
+            {sql_str(str(docs_csv))}, header = false, columns = {{'doc_id': 'BIGINT',
+            'host_id': 'BIGINT', 'listed': 'INTEGER', 'state': 'VARCHAR',
+            'is_real': 'INTEGER', 'waiting': 'INTEGER'}})""")
+        since = at - timedelta(days=r.report_rate_days)
+        logs = [str(p) for i in range((at.date() - since.date()).days + 1)
+                for p in sorted((Path(r.log_root) / (since.date() + timedelta(days=i))
+                                 .strftime("%Y%m%d")).glob("*.jsonl.gz"))]
+        files = "[" + ", ".join(map(sql_str, logs)) + "]"
+        results = (f"""SELECT doc_id, status_code FROM read_json({files},
+            format = 'newline_delimited', columns = {{'doc_id': 'BIGINT',
+            'fetched_at': 'VARCHAR', 'status_code': 'INTEGER'}})
+            WHERE CAST(fetched_at AS TIMESTAMPTZ) >= {sql_str(since.isoformat())}::TIMESTAMPTZ"""
+                   if logs else "SELECT NULL::BIGINT AS doc_id, NULL::INTEGER AS status_code "
+                                "WHERE false")
+        con.execute(f"""CREATE OR REPLACE TEMP TABLE pace AS
+            SELECT f.host_id, count(*) / {r.report_rate_days} AS per_day,
+                   avg(coalesce(l.status_code = 200, false)::INT) AS ok_share
+            FROM ({results}) l JOIN fr f USING (doc_id) GROUP BY f.host_id""")
+        con.execute("""CREATE OR REPLACE TEMP TABLE cmp AS
+            SELECT s.host_id, s.host, f.doc_id IS NULL AS is_new,
+                   CASE WHEN f.waiting = 1 THEN 'waiting' ELSE f.state END AS state,
+                   coalesce(f.is_real, 0) AS is_real
+            FROM sync_rows s LEFT JOIN fr f USING (doc_id)""")
+        con.execute("""CREATE OR REPLACE TEMP TABLE dropped AS
+            SELECT f.* FROM fr f ANTI JOIN sync_rows s USING (doc_id) WHERE f.listed = 1""")
+        con.execute("""CREATE OR REPLACE TEMP TABLE per_host AS
+            WITH k AS (
+              SELECT host_id, any_value(host) AS host, count(*) AS docs,
+                     count(*) FILTER (WHERE is_new) AS new,
+                     count(*) FILTER (WHERE state = 'fetched') AS kept_fetched,
+                     sum(is_real) AS kept_real,
+                     count(*) FILTER (WHERE state = 'waiting') AS kept_waiting,
+                     count(*) FILTER (WHERE state NOT IN ('fetched', 'gone', 'waiting'))
+                       AS kept_left
+              FROM cmp GROUP BY host_id)
+            SELECT k.*, k.new + k.kept_left AS "left", p.per_day, p.ok_share,
+                   round((k.new + k.kept_left) / p.per_day, 1) AS days_left
+            FROM k LEFT JOIN pace p USING (host_id)""")
+        (totals,) = con.execute(f"""SELECT
+              (SELECT count(*) FILTER (WHERE NOT is_new) FROM cmp),
+              (SELECT count(*) FILTER (WHERE is_new) FROM cmp),
+              (SELECT count(*) FILTER (WHERE state = 'fetched') FROM cmp),
+              (SELECT coalesce(sum(is_real), 0) FROM cmp),
+              (SELECT count(*) FILTER (WHERE state = 'waiting') FROM cmp),
+              (SELECT count(*) FILTER (WHERE state NOT IN ('fetched', 'gone', 'waiting'))
+               FROM cmp),
+              (SELECT count(*) FROM dropped),
+              (SELECT count(*) FILTER (WHERE state = 'fetched') FROM dropped),
+              (SELECT coalesce(sum(is_real), 0) FROM dropped),
+              coalesce(sum("left"), 0), count(*) FILTER (WHERE "left" > 0),
+              count(*) FILTER (WHERE days_left > {r.report_period_days}),
+              coalesce(sum("left") FILTER (WHERE days_left > {r.report_period_days}), 0),
+              coalesce(sum("left") FILTER (WHERE per_day IS NULL), 0)
+            FROM per_host""").fetchall()
+        hosts = con.execute(f"""SELECT host, docs, new, kept_fetched, kept_real, kept_waiting,
+              kept_left, "left", round(per_day, 1), round(ok_share, 3), days_left
+            FROM per_host WHERE "left" > 0
+            ORDER BY "left" DESC, host LIMIT {r.report_top_hosts}""").fetchall()
+    finally:
+        con.close()
+        docs_csv.unlink(missing_ok=True)
+    keys = ("kept", "new", "kept_fetched", "kept_real", "kept_waiting", "kept_left", "dropped",
+            "dropped_fetched", "dropped_real", "left", "hosts_left", "hosts_over_period",
+            "left_over_period", "left_without_pace")
+    host_keys = ("host", "docs", "new", "kept_fetched", "kept_real", "kept_waiting",
+                 "kept_left", "left", "per_day", "ok_share", "days_left")
+    return {"run_label": label, "docs": docs, **dict(zip(keys, map(int, totals), strict=True)),
+            "rate_days": r.report_rate_days, "period_days": r.report_period_days,
+            "hosts": [{**dict(zip(host_keys, h, strict=True)),
+                       "over_period": h[-1] is not None and h[-1] > r.report_period_days}
+                      for h in hosts],
+            "secs": round(time.monotonic() - started, 1)}
+
+
 # ---------------------------------------------------------------- archive
 
 def run_archiver(cfg: Config, conn: psycopg.Connection, once: bool) -> dict[str, Any]:

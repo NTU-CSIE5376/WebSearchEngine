@@ -177,6 +177,9 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
         (("refusal_max_attempts = 2 ", "refusal_max_attempts = 0 "), "refusal_max_attempts"),
         (('"http_401", "http_402"', '"401", "http_402"'), "refusal_reasons"),
         (("revisit = false ", "revisit = 0 "), "revisit"),
+        (("report_rate_days = 3 ", "report_rate_days = 0 "), "report_rate_days"),
+        (("report_period_days = 14 ", "report_period_days = 0 "), "report_period_days"),
+        (("report_top_hosts = 30 ", "report_top_hosts = -1 "), "report_top_hosts"),
     ]
     for (old, new), message in cases:
         assert old in BASE.read_text(), old
