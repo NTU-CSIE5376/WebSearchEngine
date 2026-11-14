@@ -227,7 +227,9 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 
 ## 6. `recrawl-sync`
 
-Run once after each swap; it refuses to run in the swap freeze window. It reads the live
+The `refresh` service runs it after each automatic swap, outside the swap freeze window
+(`docs/DESIGN.md` §11). Run it by hand after a manual swap or a rollback; it refuses to run
+in the swap freeze window. It reads the live
 run's manifest (one row per `doc_id`, its best rank) and upserts `host` and `doc`, one
 transaction per 1M rows. Docs that left the list get `rank = NULL`, `best_rank` is
 recomputed, and hosts of new or re-ranked docs lose their backoff `next_at`.
