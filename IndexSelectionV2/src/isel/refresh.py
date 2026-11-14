@@ -66,6 +66,7 @@ from isel.schedule import Window, cycle_at
 log = logging.getLogger(__name__)
 
 REFRESH_DIR = "refresh"            # under work_dir: `lock` and `outcomes/<G>.json`
+OUTCOME_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].json"
 SCRATCH_DIR = "duckdb_tmp"         # DuckDB spill and staging CSVs of every step
 MANIFEST_FILE = "_MANIFEST.json"   # written last by manifest.write_run: no file, no run
 # model_runs statuses of a run someone took off: the cycle stops and never swaps it in.
@@ -535,16 +536,29 @@ def _pull_dims(job: Job) -> Any:
 
 
 def _export(job: Job) -> Any:
-    """One `pull_full` pass; raises NotYet while shards are missing."""
+    """One `pull_full` pass; raises NotYet while shards are missing.
+
+    A lost or refused crawlerdb connection is NotYet too, not a failure: the export
+    resumes file by file, it may run for days, and `swap_by` still ends it. Errors of
+    another class (a privilege, a changed layout) count toward `max_attempts`.
+    """
+    import psycopg
+
     from isel.pg import open_crawlerdb
     from isel.pull import pull_full
 
     cfg = job.cfg
-    with ExitStack() as stack:
-        sessions = [stack.enter_context(closing(open_crawlerdb(cfg)))
-                    for _ in range(cfg.full.connections)]
-        # `now` becomes started_at only on the first pass: the cycle's export identity.
-        report = pull_full(cfg, sessions, cfg.work_dir / "full" / "export", now=job.clock())
+    try:
+        with ExitStack() as stack:
+            sessions = [stack.enter_context(closing(open_crawlerdb(cfg)))
+                        for _ in range(cfg.full.connections)]
+            # `now` becomes started_at only on the first pass: the cycle's export identity.
+            report = pull_full(cfg, sessions, cfg.work_dir / "full" / "export",
+                               now=job.clock())
+    except psycopg.OperationalError as exc:
+        log.warning("crawlerdb connection lost (%s); the export resumes on the next tick",
+                    type(exc).__name__, exc_info=True)
+        raise NotYet(f"crawlerdb connection lost ({type(exc).__name__})") from exc
     if report["shards_missing"]:
         raise NotYet(f"{report['shards_missing']} shards missing")
     return report
@@ -1072,8 +1086,12 @@ def work_lock_holder(cfg: Config) -> str:
 
 
 def _expire_earlier(cfg: Config, golden_day: date) -> None:
-    """Fails every running outcome of an earlier cycle: its window has ended."""
-    for path in sorted((cfg.work_dir / REFRESH_DIR / "outcomes").glob("*.json")):
+    """Fails every running outcome of an earlier cycle: its window has ended.
+
+    Only `<YYYY-MM-DD>.json` files are cycles, so a renamed copy left in the directory
+    (`2026-12-01.failed.json`) cannot stop every tick.
+    """
+    for path in sorted((cfg.work_dir / REFRESH_DIR / "outcomes").glob(OUTCOME_GLOB)):
         day = date.fromisoformat(path.stem)
         if day < golden_day:
             out = read_outcome(cfg, day)
