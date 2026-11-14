@@ -853,6 +853,40 @@ def test_recrawl_sync_takes_docs_off_the_list_and_plan_skips_them(selectdb, tmp_
         admin.close()
 
 
+def test_recrawl_sync_keeps_fetched_docs_across_runs(selectdb, tmp_path, stub):
+    """A new list resends nothing already fetched: only new docs and unfinished ones go out."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False)
+    _setup(cfg)
+    admin = _admin(cfg)
+    fields = ("state", "fetched_at", "text_file", "payload_sha1", "due_at", "attempts")
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, B1])
+        api = _api(stub)
+        _round(cfg, admin, stub, api,
+               FakeCrawler(stub, {A1: ARTICLE, A2: ENGLISH, B1: Page(status=403)}), T0)
+        a1, a2, b1 = (_doc(admin, u, *fields) for u in (A1, A2, B1))
+        assert (a1[0], a2[0], b1[0]) == ("fetched", "fetched", "failed")
+        (a1_rank,) = _doc(admin, A1, "rank")
+
+        # The next list re-ranks A1 and B1, drops A2 and adds C1.
+        _go_live(cfg, admin, tmp_path, "r2", [B1, C1, A1])
+        assert sync(cfg, admin, now=lambda: OPEN)["dropped"] == 1
+        assert _doc(admin, A1, *fields) == a1 and _doc(admin, A1, "rank") != (a1_rank,)
+        assert _doc(admin, B1, *fields) == b1          # its retry keeps its due time
+        assert _doc(admin, A2, "rank", *fields) == (None, *a2)
+        assert plan_cycle(cfg, admin, T0, api)["jobs"] == 1
+        assert stub.posts[-1] == [C1]
+
+        # A2 comes back on a later list: still fetched, not sent again.
+        _go_live(cfg, admin, tmp_path, "r3", [A1, A2])
+        sync(cfg, admin, now=lambda: OPEN)
+        assert _doc(admin, A2, *fields) == a2 and _doc(admin, A2, "rank") != (None,)
+        assert plan_cycle(cfg, admin, T0, api)["jobs"] == 0
+        assert len(stub.posts) == 2
+    finally:
+        admin.close()
+
+
 def test_recrawl_plan_caps_open_jobs_and_sends_a_hosts_next_job_once_done(selectdb, tmp_path, stub):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub, job_size=2, host_docs_per_job=1)
     D1, E1 = "https://d.example/1", "https://e.example/1"
