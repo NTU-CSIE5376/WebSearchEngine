@@ -81,6 +81,21 @@ services:
     memswap_limit: 8g
     cpus: 8                             # archive_workers; 6.5 ms per 590 KB page each
 
+  # A new list for every golden day (docs/DESIGN.md §11): export, train, score, select,
+  # gate, publish, swap, verify, recrawl-sync. The same bridge network, secrets, /work
+  # and limits as the `run --rm isel ...` jobs it replaces; one step process at a time.
+  #   docker compose ... --profile refresh up -d refresh
+  #   docker compose ... run --rm isel refresh --status
+  # `stop refresh` ends the running step's process group; the next start resumes.
+  refresh:
+    extends: {service: isel}
+    profiles: [refresh]
+    command: ["refresh", "--loop"]
+    restart: unless-stopped             # the calendar and the outcomes live on disk
+    environment:
+      OPENBLAS_NUM_THREADS: "1"         # the parent loads numpy through pyarrow and idles
+                                        # for days; OpenBLAS would start 64 threads
+
   # Full-text index (docs/TEXT_INDEX.md). Like the crawler API, OpenSearch listens on
   # 127.0.0.1 only and has no security plugin: any Host2 user can reach it, and a lost
   # index is rebuilt from the text Parquet. Its data shares /data with the crawler; run
