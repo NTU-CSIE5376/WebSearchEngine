@@ -572,6 +572,15 @@ engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
   longer listed cannot count as ranked. A kept doc keeps its text, under the new rank;
   one that comes back on a later list returns with the text fetched before. The build
   reports `docs_off_list`.
+- **Docs without text.** With a prior, a listed doc with no text row (not yet fetched,
+  `failed`, `gone`) is indexed by its URL alone: the URL listed at its best rank,
+  searchable as `url.text`, and that rank as its prior. A doc with any text row, even an
+  empty WAF page, keeps that row. On Host2 on 2026-11-14, about 9M listed docs had no
+  document. 44 % of the 2.36M docs still pending sat on hosts that refuse every
+  non-browser client (Cloudflare challenges, AWS WAF CAPTCHA), so they will never get
+  text. Such docs still hit: the WAF 202 docs, with no title and no body, hit at 0.533
+  and 0.426 on the dev halves of golden batches 20 and 21, through URL terms and list
+  rank. The build reports these docs as `fallback_docs`; `prior_docs` counts them too.
 
 Not built yet, for Host2 after WebCrawler#84 is deployed:
 
@@ -583,9 +592,9 @@ Not built yet, for Host2 after WebCrawler#84 is deployed:
   `url.text` drops the escapes, so those URLs give no words. Indexing the decoded URL
   could add them. Golden batch 20 already chose the query, so this waits for batch 21
   (11-01) to tune and test it.
-- **Fallback documents.** A doc without text (`gone`, `failed`, not yet fetched) is
-  indexed by its URL (`url.text`) plus crawlerdb's title and anchor text. The full
-  export must then pull `title` and `anchor_text`.
+- **Crawlerdb text for docs without text.** A doc without text could add crawlerdb's
+  title and anchor text to its URL. The full export must then pull `title` and
+  `anchor_text`, a crawlerdb export change that needs the TA's approval.
 - **Recall@10 in the metric.** The official metric hard-codes `ranked_num` to 0;
   `TypesenseRankMeasure` is a stub. `text-index-eval` measures it offline the same way;
   the official metric needs a `RankMeasure` PR.
