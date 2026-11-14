@@ -1,4 +1,4 @@
-"""Crash-safe file writes and DuckDB connections.
+"""Crash-safe file writes, file locks, DuckDB connections and the log format.
 
 A data file is committed only by renaming `<name>.tmp` to `<name>` after fsync,
 so a reader never sees a half-written file and a re-run redoes exactly the
@@ -7,9 +7,14 @@ unfinished work.
 
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
 import os
 import re
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -28,6 +33,39 @@ _SECRET_RE = re.compile(r"\b(password|passwd|secret|token)\b|://[^/\s]*:[^@/\s]*
 
 class SecretLeak(ValueError):
     """Raised when metadata would store something that looks like a credential."""
+
+
+class LockBusy(RuntimeError):
+    """Raised when another process holds a conflicting lock on the file."""
+
+
+def configure_logging() -> None:
+    """Sets the log format of every isel process: the CLI and each refresh step process.
+
+    A spawned process starts without handlers, so it calls this first.
+    """
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+@contextmanager
+def file_lock(path: Path, *, shared: bool = False) -> Iterator[None]:
+    """Holds an advisory `flock` on `path` for the block, without waiting.
+
+    Exclusive by default; shared holders exclude only an exclusive one. The lock
+    belongs to the open file, so it ends with the block or the process and a crash
+    never leaves it behind. Containers that bind-mount the same directory share it.
+
+    Raises:
+        LockBusy: If another holder conflicts.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as fh:
+        try:
+            fcntl.flock(fh, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise LockBusy(f"another process holds {path}") from exc
+        yield
 
 
 def code_version() -> str:

@@ -65,6 +65,7 @@ import pyarrow as pa
 from isel.config import Config, RecrawlCfg
 from isel.extract import extract
 from isel.io import TMP_SUFFIX, commit_file, open_duckdb, sql_str, write_parquet_atomic
+from isel.schedule import swap_allowed
 from isel.schema import DUE_STATES, OPEN_JOB_STATES, REVISIT_RANK
 from isel.urlnorm import md5_number_lower, wire_url
 
@@ -174,10 +175,9 @@ def run_loop(cycle: Callable[[], dict[str, Any]], interval_s: float, once: bool,
 def sync(cfg: Config, conn: psycopg.Connection,
          now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> dict[str, Any]:
     """Makes the frontier match the live run: new docs, new ranks, docs off the list."""
-    # Imported here: both import DuckDB, which starts one thread per host core on
+    # Imported here: it imports DuckDB, which starts one thread per host core on
     # import, and the archive workers import this module.
     from isel.manifest import validate_run
-    from isel.publish import swap_allowed
 
     at = now()
     if not swap_allowed(at, cfg.schedule):

@@ -247,6 +247,23 @@ verify_chunk = 10000                     # URLs per lookup, as in the official m
 swap_freeze_days = [1, 16]
 swap_freeze_window = ["11:30", "20:00"]  # random set at 12:00, head set at 18:00 UTC
 
+[refresh]                                # `isel refresh --loop`: a new list for each golden day G
+                                         # (a schedule.swap_freeze_days day); docs/DESIGN.md §11
+start_days_before = 2                    # a cycle starts on G-2 ...
+start_time = "02:15"                     # ... at 02:15 UTC (01:58-02:10 is a guard gap)
+swap_margin_min = 30                     # swap_by = freeze start - this = G 11:00; above the
+                                         # swap retries (selectdb: 5 x 30 s)
+sync_budget_min = 120                    # recrawl-sync starts only this long before the
+                                         # freeze; otherwise after the freeze ends
+min_overlap_share = 0.3                  # gate (a): share of the new run's doc_ids on the live
+                                         # run's manifest; the 2026-10 model change kept 42 %
+min_coverage_ratio = 0.9                 # gate (b): newest golden batch, per tag, metric rate
+                                         # under the new run / under the live run
+max_attempts = 3                         # failures of one step before the cycle is `failed`
+poll_s = 300.0                           # seconds between ticks with nothing to do; also the
+                                         # wait before a retry
+kill_grace_s = 30.0                      # SIGTERM to SIGKILL for a step past its deadline
+
 [recrawl]                                # recrawl frontier in selectdb `recrawl`; docs/RECRAWL.md
 api_url = "http://127.0.0.1:4000"        # crawler API (WebCrawler PR #84), host network only
 api_timeout_s = 10.0

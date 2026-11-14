@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -70,10 +71,47 @@ def test_base_config_loads(base_cfg):
     ("[text_index]\nprior_depth = 100\n", "prior_depth must be >= fetch_k"),
     ("[text_index]\nprior_scale = 0.0\n", "prior_scale and prior_scaling_factor must be > 0"),
     ("[text_index]\nprior_scaling_factor = 0.0\n", "prior_scale and prior_scaling_factor"),
+    ("[schedule]\nswap_freeze_days = []\n", "swap_freeze_days must not be empty"),
+    # Feb 16 to Mar 1 is 13 days: a cycle that starts 13 days early overlaps the last one.
+    ("[refresh]\nstart_days_before = 13\n", "start_days_before is too large"),
+    ("[schedule]\nswap_freeze_days = [1, 2]\n", "start_days_before is too large"),
+    ("[refresh]\nstart_days_before = 0\n", "start_days_before must be >= 1"),
+    ("[refresh]\nstart_time = '24:00'\n", "start_time must be before 24:00"),
+    ("[refresh]\nstart_time = '2:15pm'\n", "HH:MM"),
+    # 2 minutes is shorter than 5 swap retries x 30 s.
+    ("[refresh]\nswap_margin_min = 2\n", "swap_margin_min must exceed"),
+    ("[refresh]\nswap_margin_min = 3500\n", "no time between the cycle start and swap_by"),
+    ("[refresh]\nsync_budget_min = 0\n", "sync_budget_min must be 1 to 1439"),
+    ("[refresh]\nsync_budget_min = 1440\n", "sync_budget_min must be 1 to 1439"),
+    ("[refresh]\nmin_overlap_share = 1.5\n", "min_overlap_share and min_coverage_ratio"),
+    ("[refresh]\nmin_coverage_ratio = -0.1\n", "min_overlap_share and min_coverage_ratio"),
+    ("[refresh]\nmax_attempts = 0\n", "max_attempts must be >= 1"),
+    ("[refresh]\npoll_s = 0.0\n", "poll_s must be > 0"),
+    ("[refresh]\nkill_grace_s = -1.0\n", "kill_grace_s must be >= 0"),
+    ("[refresh]\nfirst_golden_day = '2026-12-01'\n", "unknown keys"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
         load_config(_overlay(tmp_path, text))
+
+
+@pytest.mark.parametrize("overlays", [
+    ["config/container.toml"],
+    ["config/container.toml", "config/text_index/host2.toml"],
+])
+def test_the_deployed_config_layers_load_with_the_refresh_cycle(base_cfg, overlays):
+    cfg = load_config([BASE, *(ROOT / o for o in overlays)])
+    assert cfg.refresh == base_cfg.refresh
+    assert cfg.schedule == base_cfg.schedule
+
+
+def test_config_without_the_refresh_table_is_refused(tmp_path):
+    text = re.sub(r"\n\[refresh\].*?\n(?=\[recrawl\])", "\n", BASE.read_text(), flags=re.S)
+    assert "start_days_before" not in text and "[recrawl]" in text
+    path = tmp_path / "old.toml"
+    path.write_text(text)
+    with pytest.raises(ConfigError, match=r"missing keys \['refresh'\]"):
+        load_config([path])
 
 
 def test_host2_overlay_sets_the_text_index():
