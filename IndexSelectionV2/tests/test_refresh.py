@@ -532,6 +532,16 @@ def test_tick_ends_an_unfinished_earlier_cycle(cfg, db):
     assert read_outcome(cfg, date(2026, 11, 1)).status is Status.DONE
 
 
+def test_tick_leaves_a_renamed_outcome_file_alone(cfg, db):
+    write_outcome(cfg, Outcome(date(2026, 11, 16)))
+    outcomes = refresh.outcome_path(cfg, date(2026, 11, 16)).parent
+    renamed = outcomes / "2026-11-16.failed.json"
+    os.replace(outcomes / "2026-11-16.json", renamed)
+    tick(cfg, lambda: _at(11, 29, 3), lambda job, step, deadline: Deferred())
+    assert json.loads(renamed.read_text())["status"] == "running"
+    assert refresh.outcome_path(cfg, G).exists()
+
+
 def test_tick_writes_the_terminal_outcome_once(cfg, db):
     # 2026-12-01 11:00 is swap_by and nothing was built.
     result = tick(cfg, lambda: _at(12, 1, 11), _never)
@@ -782,6 +792,42 @@ def test_the_export_step_waits_for_missing_shards(cfg, w, monkeypatch):
     assert execute(act, job) == Completed({"shards_missing": 0})
     # The cycle's clock names the export; every session is closed again.
     assert calls == [(cfg.full.connections, _at(11, 29, 3))] * 2 and opened == []
+
+
+@pytest.mark.parametrize("connect_error, export_error, result", [
+    ("connection refused", None, Deferred()),
+    (None, "terminating connection due to administrator command", Deferred()),
+    (None, "permission denied for table", Failed("InsufficientPrivilege")),
+])
+def test_the_export_step_resumes_after_a_lost_connection(cfg, w, monkeypatch, connect_error,
+                                                         export_error, result):
+    import psycopg
+
+    import isel.pg
+    import isel.pull
+
+    opened = []
+
+    class Session:
+        def close(self):
+            opened.remove(self)
+
+    def open_crawlerdb(cfg):
+        if connect_error:
+            raise psycopg.OperationalError(connect_error)
+        opened.append(Session())
+        return opened[-1]
+
+    def pull_full(cfg, sessions, out_dir, now=None):
+        error = (psycopg.errors.InsufficientPrivilege if "permission" in export_error
+                 else psycopg.errors.AdminShutdown)
+        raise error(export_error)
+
+    monkeypatch.setattr(isel.pg, "open_crawlerdb", open_crawlerdb)
+    monkeypatch.setattr(isel.pull, "pull_full", pull_full)
+    job = Job(cfg, w, evidence_through(S.DIMS), lambda: _at(11, 29, 3))
+    assert execute(refresh.STEP[S.EXPORT].act, job) == result
+    assert opened == []
 
 
 @pytest.mark.parametrize("answer, result", [

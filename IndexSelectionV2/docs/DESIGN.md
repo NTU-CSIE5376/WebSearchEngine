@@ -458,6 +458,18 @@ it: `free`, `commands` or `refresh`. The outcome of each cycle is
 An error stores the step and the exception class only. The message is in the log
 (`$D logs refresh`).
 
+A step that raises counts one failure toward `max_attempts`. Three cases do not count,
+and the step runs again on the next tick: the export lost or could not open a crawlerdb
+connection (it resumes file by file, until `swap_by`), the export still misses shards,
+and the swap timed out on its lock.
+
+**Retry a cycle.** A finished cycle never acts again. To retry a `failed` cycle, or a
+`skipped_gate` one after changing the thresholds, delete or rename its outcome file
+`work_dir/refresh/outcomes/<G>.json` before `swap_by`. The next tick plans from the
+evidence: the export, sample, model, scores and selection run on disk are kept, and the
+gates run again. Refresh reads only `<YYYY-MM-DD>.json` names there, so a renamed copy
+such as `<G>.failed.json` stays as a record.
+
 **The work lock.** A refresh tick holds `work_dir/refresh/lock` exclusively while it
 observes and runs a step. Every command that reads or writes what refresh rebuilds, or
 uses `duckdb_tmp`, holds it shared: `pull-*`, `derive-*`, `validate-routing`,
