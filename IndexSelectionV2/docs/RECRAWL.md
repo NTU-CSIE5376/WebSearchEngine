@@ -563,12 +563,14 @@ engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
 | `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url.text` included. The body has no positions (`index_options: freqs`): the query never uses them, and they were 45 % of the index |
 | `lang` | stored; the trial measured what per-language analyzers would add |
 
+- **Live docs only.** With `prior_file = "live"` (Host2), a build indexes only docs in
+  the live run's manifest. A dropped doc leaves the next build, so a golden URL no
+  longer listed cannot count as ranked. A kept doc keeps its text, under the new rank;
+  one that comes back on a later list returns with the text fetched before. The build
+  reports `docs_off_list`.
+
 Not built yet, for Host2 after WebCrawler#84 is deployed:
 
-- **Live docs only.** Index only docs on the live list (`rank IS NOT NULL`), so a
-  dropped doc leaves the next build. Needed before the first list swap after the
-  recrawl has run: until then a dropped doc stays searchable, and a golden URL that is
-  no longer listed can count as ranked.
 - **Compact the text Parquet.** `recrawl-archive` appends one row per fetch and never
   drops the older rows, so every `stale_days` cycle adds about one more copy of the
   text (0.22–0.4 TB at 128M). Needed before the first cycle ends, 30 days after the

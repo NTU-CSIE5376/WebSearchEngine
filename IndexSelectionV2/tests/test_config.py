@@ -70,7 +70,6 @@ def test_base_config_loads(base_cfg):
     ("[text_index]\nprior_depth = 100\n", "prior_depth must be >= fetch_k"),
     ("[text_index]\nprior_scale = 0.0\n", "prior_scale and prior_scaling_factor must be > 0"),
     ("[text_index]\nprior_scaling_factor = 0.0\n", "prior_scale and prior_scaling_factor"),
-    ("[text_index]\nprior_min_coverage = 1.5\n", "prior_min_coverage must be in"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
@@ -82,7 +81,7 @@ def test_host2_overlay_sets_the_text_index():
                        ROOT / "config/text_index/host2.toml"])
     t = cfg.text_index
     assert (ROOT / Path(t.settings_file).relative_to("/app")).is_file()   # the image's copy
-    assert t.keep_prev is False and t.shards == 8
+    assert t.keep_prev is False and t.shards == 8 and t.prior_file == "live"
     assert cfg.duckdb.threads == 4 and cfg.duckdb.memory_limit == "16GB"
 
 

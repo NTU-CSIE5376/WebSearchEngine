@@ -8,11 +8,13 @@ old index or the new one, never a half-built one, and a failed build leaves noth
 
 `_id` is the doc id in decimal (`md5_number_lower` of the canonical URL, a u64), and ids
 are only ever read from it, so they never pass through a float. A hit is matched to a
-golden URL by `_id` alone: the list URL defines the doc, as in the indexed rate. Every
-doc of the text Parquet is indexed, also one that has left the list since
-(`docs/RECRAWL.md` §13). The same number is also an `unsigned_long` doc-values field
-that breaks score ties: Lucene otherwise orders equal scores by load order, so two
-builds of the same text could return different top-k sets.
+golden URL by `_id` alone: the list URL defines the doc, as in the indexed rate. With a
+prior, only the docs on that list are indexed (`docs/RECRAWL.md` §13): a doc that left
+the list leaves the index at the next build, and one that comes back on a later list
+returns with the text fetched before. `prior_file = "live"` takes the manifest of the
+live selection run, so a build after a swap uses the new list. The same number is also
+an `unsigned_long` doc-values field that breaks score ties: Lucene otherwise orders equal
+scores by load order, so two builds of the same text could return different top-k sets.
 
 The node shares its disk with the crawler. The flood stage blocks writes but not a merge
 that is already running, so a build checks the free space itself before it loads and
@@ -64,6 +66,7 @@ DOC_FIELDS = ("url", "lang", "title", "description", "body")
 TEXT_FIELDS = ("title", "description", "body")
 # The selection model's list rank as a static score, the `rank_feature` of the mapping.
 PRIOR_FIELD = "sel_prior"
+LIVE_PRIOR = "live"                    # prior_file value: the live run's manifest
 # Bulk-load mode: nothing searches the new index before the swap, and the Parquet is
 # the source of truth, so a lost translog only costs a rebuild.
 BUILD_SETTINGS = {"number_of_replicas": 0, "refresh_interval": "-1",
@@ -186,7 +189,7 @@ def bulk_payloads(batches: Iterable[pa.RecordBatch], max_bytes: int,
 
 def latest_docs(con: duckdb.DuckDBPyConnection, text_root: Path, batch_rows: int,
                 prior_file: str = "") -> tuple[int, int, pa.RecordBatchReader]:
-    """The newest row of each doc_id under `text_root`, as (rows, rows with a rank, batches).
+    """The newest row of each doc_id under `text_root`, as (rows, docs off the list, batches).
 
     The first pass picks each doc's winner without the page bodies, so they are never
     sorted; the second pass reads the winners. A row with text beats any row without it,
@@ -194,9 +197,9 @@ def latest_docs(con: duckdb.DuckDBPyConnection, text_root: Path, batch_rows: int
     gets a document, as its URL's words can find it. A tie on `fetched_at` goes to the
     larger file name. `*.parquet` skips `.parquet.tmp` files.
 
-    `prior_file` is a Parquet glob of the list's `doc_id` and `rank`. A doc can be on the
-    list twice, under two URLs with one canonical form, so it takes its best rank and the
-    join adds no rows.
+    `prior_file` is a Parquet glob of the list's `doc_id` and `rank`. With it, only docs on
+    the list are kept; the docs off it are counted. A doc can be on the list twice, under
+    two URLs with one canonical form, so it takes its best rank and the join adds no rows.
     """
     if next(text_root.glob("**/*.parquet"), None) is None:
         raise TextIndexError(f"no text Parquet under {text_root}")
@@ -215,11 +218,13 @@ def latest_docs(con: duckdb.DuckDBPyConnection, text_root: Path, batch_rows: int
         source = f"SELECT doc_id, win, NULL::BIGINT AS prior_rank FROM ({winners})"
     con.execute(f"CREATE OR REPLACE TEMP TABLE winner AS {source}")
     rows, ranked = con.execute("SELECT count(*), count(prior_rank) FROM winner").fetchone()
+    if prior_file:
+        con.execute("DELETE FROM winner WHERE prior_rank IS NULL")
     reader = con.execute(f"""SELECT s.doc_id, {', '.join(f's.{f}' for f in DOC_FIELDS)},
                w.prior_rank
         FROM {files} s JOIN winner w ON s.doc_id = w.doc_id
          AND s.fetched_at = w.win.t AND s.filename = w.win.f""").to_arrow_reader(batch_rows)
-    return int(rows), int(ranked), reader
+    return (int(ranked), int(rows - ranked), reader) if prior_file else (int(rows), 0, reader)
 
 
 def _text_bytes(batch: pa.RecordBatch) -> int:
@@ -397,6 +402,33 @@ def _swap(client: OpenSearch, alias: str, index: str, previous: list[str]) -> No
         raise
 
 
+def resolve_prior(cfg: Config) -> tuple[str, str | None]:
+    """The prior's Parquet glob and its run label; `"live"` reads the live run's manifest.
+
+    Raises:
+        TextIndexError: If selectdb has no single live run.
+        ManifestError: If that run's files fail their checksums.
+    """
+    prior = cfg.text_index.prior_file
+    if prior != LIVE_PRIOR:
+        return prior, None
+    from isel.manifest import validate_run
+    from isel.selectdb import connect
+
+    conn = connect(cfg, cfg.selectdb.reader_dsn_env, read_only=True)
+    try:
+        rows = conn.execute("SELECT run_label FROM public.model_runs WHERE status = 'live'"
+                            ).fetchall()
+    finally:
+        conn.close()
+    if len(rows) != 1:
+        raise TextIndexError(f"expected one live run, found {len(rows)}")
+    ((label,),) = rows
+    run_dir = cfg.work_dir / "full" / "selection" / f"run={label}"
+    validate_run(run_dir)
+    return str(run_dir / "manifest" / "*.parquet"), label
+
+
 def build(cfg: Config, client: OpenSearch, text_root: Path,
           now: datetime | None = None) -> dict[str, Any]:
     """Builds a new index from `text_root` and makes it the alias's only index.
@@ -414,13 +446,14 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
     settings = {**spec.get("settings", {}), **BUILD_SETTINGS, "number_of_shards": t.shards}
     built = cfg.work_dir / "text_index" / "build"
     started = time.monotonic()
+    prior_file, prior_run = resolve_prior(cfg)
     with _build_lock(cfg.work_dir / "text_index" / "build.lock"):
         con = open_duckdb(cfg, cfg.work_dir / "text_index" / "tmp")
         try:
-            rows, ranked, batches = latest_docs(con, text_root, t.read_batch_rows, t.prior_file)
-            if t.prior_file and ranked < t.prior_min_coverage * rows:
-                raise TextIndexError(f"only {ranked} of {rows} docs have a rank in "
-                                     f"{t.prior_file}")
+            rows, off_list, batches = latest_docs(con, text_root, t.read_batch_rows,
+                                                  prior_file)
+            if prior_file and not rows:
+                raise TextIndexError(f"no doc of {text_root} is on the list of {prior_file}")
             # A build killed before it could delete its index left it unaliased and
             # without a manifest; it would add to this build's disk peak.
             aliased = set(_aliased(client, t.alias))
@@ -483,7 +516,8 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
             "load_s": round(load_s, 3), "total_s": round(total_s, 3),
             "docs_per_s_load": round(rows / load_s, 1) if load_s else None,
             "previous": previous, "deleted": deleted, "strays": strays,
-            "prior_file": t.prior_file, "prior_docs": ranked,
+            "prior_file": prior_file, "prior_run": prior_run,
+            "prior_docs": rows if prior_file else 0, "docs_off_list": off_list,
             "settings_sha256": sha256(spec_bytes).hexdigest(), "config_sha256": cfg.sha256(),
             "code_version": code_version(),
         }

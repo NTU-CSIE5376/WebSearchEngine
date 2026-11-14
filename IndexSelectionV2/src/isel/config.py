@@ -259,7 +259,6 @@ class TextIndexCfg:
     prior_score_mode: str
     prior_boost: float
     prior_depth: int
-    prior_min_coverage: float
 
 
 @dataclass(frozen=True)
@@ -580,7 +579,6 @@ def _validate_text_index(cfg: Config, need: Any) -> None:
     need(t.prior_depth >= t.fetch_k, "text_index.prior_depth must be >= fetch_k")
     need(min(t.prior_scale, t.prior_scaling_factor) > 0,
          "text_index.prior_scale and prior_scaling_factor must be > 0")
-    need(0 <= t.prior_min_coverage <= 1, "text_index.prior_min_coverage must be in [0, 1]")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:

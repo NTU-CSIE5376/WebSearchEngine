@@ -26,7 +26,8 @@ import pyarrow.parquet as pq
 import pytest
 import sqlalchemy as sa
 from alembic import command
-from conftest import replace
+from conftest import ROOT, replace
+from opensearch_fakes import OpenSearchStub
 from recrawl_fakes import ApiStub, FakeCrawler, Page, crawler_of
 
 from isel.cli import main as cli_main
@@ -55,6 +56,7 @@ from isel.selectdb import (
     init_role,
     migrate,
 )
+from isel.textindex import PRIOR_FIELD, OpenSearch, build
 from isel.urlnorm import DomainKeyer, ShardRouter
 
 pytestmark = pytest.mark.integration
@@ -885,6 +887,44 @@ def test_recrawl_sync_keeps_fetched_docs_across_runs(selectdb, tmp_path, stub):
         assert plan_cycle(cfg, admin, T0, api)["jobs"] == 0
         assert len(stub.posts) == 2
     finally:
+        admin.close()
+
+
+def test_text_index_follows_the_live_list_across_a_swap(selectdb, tmp_path, stub):
+    """Fetched text kept by sync is indexed under the new list's rank; a doc off it leaves."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False)
+    _setup(cfg)
+    admin = _admin(cfg)
+    node = OpenSearchStub()
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, B1])
+        _round(cfg, admin, stub, _api(stub),
+               FakeCrawler(stub, {A1: ARTICLE, A2: ENGLISH, B1: ENGLISH}), T0)
+        cfg = replace(cfg, "text_index", url=node.url, prior_file="live", lease_wait_s=1.0,
+                      backoff_s=0.0, settings_file=str(ROOT / "config/text_index/icu.json"))
+        client = OpenSearch(node.url, 5.0, 2, 0.0, sleep=lambda s: None)
+        text_root = Path(cfg.recrawl.text_root)
+        ids = {u: str(pg_doc_id(u) % (1 << 64)) for u in (A1, A2, B1)}
+
+        first = build(cfg, client, text_root, T0 + timedelta(hours=1))
+        assert (first["prior_run"], first["prior_docs"], first["docs_off_list"]) == ("r1", 3, 0)
+        before = node.indices[first["index"]]["docs"]
+        assert set(before) == set(ids.values())
+
+        # The next list drops A2, puts B1 first and A1 last; nothing is fetched again.
+        _go_live(cfg, admin, tmp_path, "r2", [B1, C1, A1])
+        sync(cfg, admin, now=lambda: OPEN)
+        second = build(cfg, client, text_root, T0 + timedelta(hours=2))
+        assert (second["prior_run"], second["prior_docs"], second["docs_off_list"]) == ("r2", 2, 1)
+        assert second["prior_file"].endswith("run=r2/manifest/*.parquet")
+        after = node.indices[second["index"]]["docs"]
+        assert set(after) == {ids[A1], ids[B1]}
+        assert after[ids[A1]]["title"] == before[ids[A1]]["title"] == "颱風假"
+        assert after[ids[A1]][PRIOR_FIELD] < before[ids[A1]][PRIOR_FIELD]
+        assert after[ids[B1]][PRIOR_FIELD] > before[ids[B1]][PRIOR_FIELD]
+        assert len(stub.posts) == 1
+    finally:
+        node.close()
         admin.close()
 
 
