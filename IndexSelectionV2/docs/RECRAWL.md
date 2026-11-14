@@ -227,10 +227,36 @@ selection run ──recrawl-sync──► selectdb recrawl.{host,doc}
 
 ## 6. `recrawl-sync`
 
-Run once after each swap; it refuses to run in the swap freeze window. It reads the live
+The `refresh` service runs it after each automatic swap, outside the swap freeze window
+(`docs/DESIGN.md` §11). Run it by hand after a manual swap or a rollback; it refuses to run
+in the swap freeze window. It reads the live
 run's manifest (one row per `doc_id`, its best rank) and upserts `host` and `doc`, one
 transaction per 1M rows. Docs that left the list get `rank = NULL`, `best_rank` is
 recomputed, and hosts of new or re-ranked docs lose their backoff `next_at`.
+
+- **A new list keeps what was fetched.** `doc_id` is the canonical URL's hash, so a page
+  keeps its row across runs. The upsert writes only `rank` and `model_run_id`: a fetched
+  doc keeps its state, fetch time and text file, and a failed one its `attempts` and
+  `due_at`. A doc off the list keeps its row too, and comes back as it left. With
+  `revisit` off, a new list sends only its new docs and the kept docs not yet fetched.
+  The text Parquet is permanent, so the text index has the kept text (§13).
+- **`recrawl-sync --dry-run [--run LABEL]`** reports what a sync of a run (by default the
+  live one) would change, and writes nothing. Run it after `publish`, before `swap`.
+  It streams `recrawl.doc` out with one `COPY` (no sort) and joins it with the run's
+  manifest in DuckDB. Totals: docs `new` to the frontier, `kept` (`kept_fetched`,
+  `kept_real` as in §3, `kept_waiting`, `kept_left`), live docs `dropped`, and `left`,
+  the docs still to send this period: new plus `kept_left`. A kept `failed` doc whose
+  `due_at` falls after `report_period_days` (a refusal or robots wait of `stale_days`)
+  is `kept_waiting`, not left. Per host, most `left` first (`report_top_hosts`): its pace,
+  the results per day in the last `report_rate_days` of `log_root`, the share of status
+  200 among them, and `days_left` = `left` over that pace. A host above
+  `report_period_days` (one list period) is flagged; one with no recent result has no
+  pace.
+- Measured on Host2 on 2026-11-13, before any list swap: 70 % of the 2.80M docs left on
+  hosts with 1,000 or more were on hosts that served no page (403, 405), only AWS WAF 202
+  challenges (`www.espn.com`), or 200s without text (`www.youtube.com`). A host's pace
+  is its crawler slot: one batch of 240 at a time, 380–890 s each at p50, then about 30 s
+  to the next. Keeping fetched docs cannot help a host that serves no page.
 
 ## 7. `recrawl-plan`
 
@@ -541,12 +567,14 @@ engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
 | `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url.text` included. The body has no positions (`index_options: freqs`): the query never uses them, and they were 45 % of the index |
 | `lang` | stored; the trial measured what per-language analyzers would add |
 
+- **Live docs only.** With `prior_file = "live"` (Host2), a build indexes only docs in
+  the live run's manifest. A dropped doc leaves the next build, so a golden URL no
+  longer listed cannot count as ranked. A kept doc keeps its text, under the new rank;
+  one that comes back on a later list returns with the text fetched before. The build
+  reports `docs_off_list`.
+
 Not built yet, for Host2 after WebCrawler#84 is deployed:
 
-- **Live docs only.** Index only docs on the live list (`rank IS NOT NULL`), so a
-  dropped doc leaves the next build. Needed before the first list swap after the
-  recrawl has run: until then a dropped doc stays searchable, and a golden URL that is
-  no longer listed can count as ranked.
 - **Compact the text Parquet.** `recrawl-archive` appends one row per fetch and never
   drops the older rows, so every `stale_days` cycle adds about one more copy of the
   text (0.22–0.4 TB at 128M). Needed before the first cycle ends, 30 days after the

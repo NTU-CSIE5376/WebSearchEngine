@@ -13,6 +13,8 @@ one transaction, under an advisory lock, and then compares the database with
 from __future__ import annotations
 
 import io
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import psycopg
@@ -156,6 +158,25 @@ def assert_ready(cfg: Config, conn: psycopg.Connection) -> None:
         if cur.fetchone() is None:
             raise RuntimeError(f"role {cfg.selectdb.reader_role!r} is missing; "
                                "run `isel migrate-selectdb`")
+
+
+@contextmanager
+def admin(cfg: Config, *, read_only: bool = False,
+          ready: bool = False) -> Iterator[psycopg.Connection]:
+    """An admin connection to our selectdb, closed after the block.
+
+    With `ready`, it first refuses a database behind the newest revision
+    (`assert_ready`): the recrawl commands and refresh's sync need that, and
+    `migrate-selectdb` must not have it. The reader role cannot see `recrawl`, so
+    read-only recrawl work uses this role in a read-only session.
+    """
+    conn = connect(cfg, cfg.selectdb.admin_dsn_env, read_only=read_only)
+    try:
+        if ready:
+            assert_ready(cfg, conn)
+        yield conn
+    finally:
+        conn.close()
 
 
 def init_role(cfg: Config, admin: psycopg.Connection) -> None:

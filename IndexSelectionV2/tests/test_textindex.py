@@ -12,7 +12,7 @@ from conftest import ROOT, replace, small_cfg
 from opensearch_fakes import OpenSearchStub
 
 from isel.golden import GOLDEN_SCHEMA, golden_path
-from isel.io import write_parquet_atomic
+from isel.io import LockBusy, write_parquet_atomic
 from isel.recrawl import TEXT_SCHEMA
 from isel.textindex import (
     DOC_FIELDS,
@@ -220,7 +220,7 @@ def test_build_drops_the_new_index_when_the_merge_fails(cfg, stub, tmp_path):
     assert stub.indices == {} and "/_aliases" not in stub.paths("POST")
 
 
-def test_latest_docs_joins_the_rank_without_adding_rows(cfg, tmp_path):
+def test_latest_docs_keeps_only_listed_docs_at_their_best_rank(cfg, tmp_path):
     from isel.io import open_duckdb
 
     root = tmp_path / "text"
@@ -231,26 +231,37 @@ def test_latest_docs_joins_the_rank_without_adding_rows(cfg, tmp_path):
                       "url": ["u", "v", "w", "x"]})
     write_parquet_atomic(prior, tmp_path / "list" / "run=r" / "index_shard=00.parquet")
     glob = str(tmp_path / "list" / "run=r" / "index_shard=*.parquet")
-    rows, ranked, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10, glob)
+    rows, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10, glob)
     table = reader.read_all()
-    assert rows == 3 and ranked == 2 and table.num_rows == 3
+    assert rows == 2 and off_list == 1 and table.num_rows == 2
     got = dict(zip(table["doc_id"].to_pylist(), table["prior_rank"].to_pylist(), strict=True))
-    assert got == {1: 5, 2: 0, 3: None}
+    assert got == {1: 5, 2: 0}
+    # Without a prior every doc stays, with no rank.
+    rows, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10)
+    assert (rows, off_list, reader.read_all()["prior_rank"].null_count) == (3, 0, 3)
 
 
-def test_build_stops_when_too_few_docs_have_a_rank(cfg, stub, tmp_path):
+def test_build_indexes_only_the_docs_on_the_list(cfg, stub, tmp_path):
     root = tmp_path / "text"
     _write(root / "a" / "job-1.parquet", [_row(1), _row(2)])
     prior = pa.table({"doc_id": pa.array([1], pa.uint64()), "rank": pa.array([0], pa.int64())})
     write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
     with_prior = replace(cfg, "text_index", prior_file=str(tmp_path / "list" / "s.parquet"))
-    with pytest.raises(TextIndexError, match="1 of 2 docs have a rank"):
-        build(with_prior, _client(stub), root)
-    assert stub.indices == {}
-    out = build(replace(with_prior, "text_index", prior_min_coverage=0.5), _client(stub), root)
-    assert out["prior_docs"] == 1
+    out = build(with_prior, _client(stub), root)
+    assert (out["prior_docs"], out["docs_off_list"], out["prior_run"]) == (1, 1, None)
     docs = stub.indices[out["index"]]["docs"]
-    assert PRIOR_FIELD in docs["1"] and PRIOR_FIELD not in docs["2"]
+    assert set(docs) == {"1"} and PRIOR_FIELD in docs["1"]
+
+
+def test_build_stops_when_no_doc_is_on_the_list(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    prior = pa.table({"doc_id": pa.array([9], pa.uint64()), "rank": pa.array([0], pa.int64())})
+    write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
+    with pytest.raises(TextIndexError, match=r"no doc of .* is on the list"):
+        build(replace(cfg, "text_index", prior_file=str(tmp_path / "list" / "s.parquet")),
+              _client(stub), root)
+    assert stub.indices == {}
 
 
 def test_query_body_rescores_the_best_text_matches_with_the_prior(base_cfg):
@@ -476,7 +487,7 @@ def test_a_second_build_waits_for_no_lock(cfg, stub, tmp_path):
     lock.parent.mkdir(parents=True)
     with lock.open("a") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
-        with pytest.raises(TextIndexError, match="another text-index-build"):
+        with pytest.raises(LockBusy):
             build(cfg, _client(stub), root)
     assert stub.paths("PUT") == []
 

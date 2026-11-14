@@ -1,23 +1,29 @@
 """Command line: `isel --config base.toml [--config overlay.toml] <command> [options]`.
 
-Exit codes: 0 success, 2 config error.
+Exit codes: 0 success, 2 config error, 3 a refresh step holds the work dir.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import logging
 import sys
 from collections import Counter
+from collections.abc import Callable
+from contextlib import ExitStack
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
 
+from isel import refresh
 from isel.config import Config, ConfigError, load_config
-from isel.io import atomic_write_json, open_duckdb, sql_str
+from isel.io import LockBusy, atomic_write_json, configure_logging, open_duckdb, sql_str
+
+WORK_BUSY = ("refresh is running a step on this work dir (see `isel refresh --status`); "
+             "retry when it is done, or stop the refresh service first")
 
 
 def _ids(text: str | None) -> list[int] | None:
@@ -236,45 +242,41 @@ def cmd_select_full(cfg: Config, args: argparse.Namespace) -> Any:
     return {k: v for k, v in meta.items() if k != "files"}
 
 
-def _with_admin(cfg: Config, action: Any) -> Any:
-    """Runs `action(conn)` on an admin connection to our selectdb."""
-    from isel.selectdb import connect
-
-    conn = connect(cfg, cfg.selectdb.admin_dsn_env, read_only=False)
-    try:
-        return action(conn)
-    finally:
-        conn.close()
-
-
 def cmd_migrate_selectdb(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.selectdb import init_role, migrate, render_sql
+    from isel.selectdb import admin, init_role, migrate, render_sql
 
     if args.sql:
         render_sql(args.stamp_baseline, sys.stdout)
         return None
-    result = _with_admin(cfg, lambda conn: migrate(conn, args.stamp_baseline))
-    _with_admin(cfg, lambda conn: init_role(cfg, conn))
+    with admin(cfg) as conn:
+        result = migrate(conn, args.stamp_baseline)
+    with admin(cfg) as conn:
+        init_role(cfg, conn)
     return {**result, "reader_role": cfg.selectdb.reader_role}
 
 
 def cmd_publish(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.publish import load_selection
+    from isel.selectdb import admin
 
-    return _with_admin(cfg, lambda conn: load_selection(cfg, conn, Path(args.run_dir),
-                                                         cfg.work_dir))
+    with admin(cfg) as conn:
+        return load_selection(cfg, conn, Path(args.run_dir), cfg.work_dir)
 
 
 def cmd_swap(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.publish import swap
+    from isel.selectdb import admin
 
-    return _with_admin(cfg, lambda conn: swap(cfg, conn, args.db_run_id))
+    with admin(cfg) as conn:
+        return swap(cfg, conn, args.db_run_id)
 
 
 def cmd_rollback(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.publish import rollback
+    from isel.selectdb import admin
 
-    return _with_admin(cfg, lambda conn: rollback(cfg, conn))
+    with admin(cfg) as conn:
+        return rollback(cfg, conn)
 
 
 def cmd_verify_live(cfg: Config, args: argparse.Namespace) -> Any:
@@ -283,41 +285,36 @@ def cmd_verify_live(cfg: Config, args: argparse.Namespace) -> Any:
     return verify_live(cfg, cfg.work_dir, args.batch)
 
 
-def _recrawl(cfg: Config, action: Any, read_only: bool = False) -> Any:
-    """Runs `action(conn)` as admin on a selectdb at the newest schema revision.
-
-    The reader role cannot see `recrawl`, so read-only work uses the admin role
-    in a read-only session.
-    """
-    from isel.selectdb import assert_ready, connect
-
-    conn = connect(cfg, cfg.selectdb.admin_dsn_env, read_only=read_only)
-    try:
-        assert_ready(cfg, conn)
-        return action(conn)
-    finally:
-        conn.close()
-
-
 def cmd_recrawl_sync(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.recrawl import sync
+    from isel.recrawl import swap_report, sync
+    from isel.selectdb import admin
 
-    return _recrawl(cfg, lambda conn: sync(cfg, conn))
+    if args.dry_run:
+        with admin(cfg, read_only=True, ready=True) as conn:
+            return swap_report(cfg, conn, args.run)
+    if args.run:
+        raise SystemExit("--run needs --dry-run: a sync always loads the live run")
+    with admin(cfg, ready=True) as conn:
+        return sync(cfg, conn)
 
 
 def cmd_recrawl_plan(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.recrawl import capacity_report, run_planner
+    from isel.selectdb import admin
 
     if args.dry_run:
-        return _recrawl(cfg, lambda conn: capacity_report(cfg.recrawl, conn, datetime.now(UTC)),
-                        read_only=True)
-    return _recrawl(cfg, lambda conn: run_planner(cfg, conn, args.once))
+        with admin(cfg, read_only=True, ready=True) as conn:
+            return capacity_report(cfg.recrawl, conn, datetime.now(UTC))
+    with admin(cfg, ready=True) as conn:
+        return run_planner(cfg, conn, args.once)
 
 
 def cmd_recrawl_archive(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.recrawl import run_archiver
+    from isel.selectdb import admin
 
-    return _recrawl(cfg, lambda conn: run_archiver(cfg, conn, args.once))
+    with admin(cfg, ready=True) as conn:
+        return run_archiver(cfg, conn, args.once)
 
 
 def _text_index_client(cfg: Config):
@@ -344,6 +341,14 @@ def cmd_validate_manifest(cfg: Config, args: argparse.Namespace) -> Any:
 
     meta = validate_run(Path(args.run_dir))
     return {"run_id": meta["run_id"], "rows": meta["rows"], "ok": True}
+
+
+def cmd_refresh(cfg: Config, args: argparse.Namespace) -> Any:
+    if args.status:
+        return refresh.status(cfg)
+    if args.once:
+        return refresh.tick(cfg).as_json()
+    refresh.run_loop(cfg)
 
 
 def cmd_check_config(cfg: Config, args: argparse.Namespace) -> Any:
@@ -402,7 +407,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("rollback", help="make the previous list live again")
     p = sub.add_parser("verify-live", help="indexed rate of a batch under the live list")
     p.add_argument("--batch", type=int, required=True)
-    sub.add_parser("recrawl-sync", help="load the live run into the recrawl frontier")
+    p = sub.add_parser("recrawl-sync", help="load the live run into the recrawl frontier")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what a sync would keep, add and drop, per host; write nothing")
+    p.add_argument("--run", help="with --dry-run: the run label to compare (default: live)")
     p = sub.add_parser("recrawl-plan", help="send due docs as jobs to the crawler API (loop)")
     p.add_argument("--once", action="store_true", help="run one cycle and exit")
     p.add_argument("--dry-run", action="store_true",
@@ -416,49 +424,78 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch", type=int, required=True)
     p = sub.add_parser("validate-manifest")
     p.add_argument("--run-dir", required=True)
+    p = sub.add_parser("refresh", help="a new list for every golden day, unattended")
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--loop", action="store_true", help="tick until stopped (the service)")
+    mode.add_argument("--once", action="store_true", help="run one tick and print it")
+    mode.add_argument("--status", action="store_true",
+                      help="print the cycle, its outcome, the evidence and the next step; "
+                           "change nothing")
     return parser
 
 
-COMMANDS = {
-    "check-config": cmd_check_config,
-    "pull-golden": cmd_pull_golden,
-    "pull-dims": cmd_pull_dims,
-    "pull-full": cmd_pull_full,
-    "derive-sample": cmd_derive_sample,
-    "derive-positives": cmd_derive_positives,
-    "validate-routing": cmd_validate_routing,
-    "build-dataset": cmd_build_dataset,
-    "backtest": cmd_backtest,
-    "report": cmd_report,
-    "train": cmd_train,
-    "forward-eval": cmd_forward_eval,
-    "select-sample": cmd_select_sample,
-    "score-full": cmd_score_full,
-    "select-full": cmd_select_full,
-    "migrate-selectdb": cmd_migrate_selectdb,
-    "publish": cmd_publish,
-    "swap": cmd_swap,
-    "rollback": cmd_rollback,
-    "verify-live": cmd_verify_live,
-    "recrawl-sync": cmd_recrawl_sync,
-    "recrawl-plan": cmd_recrawl_plan,
-    "recrawl-archive": cmd_recrawl_archive,
-    "text-index-build": cmd_text_index_build,
-    "text-index-eval": cmd_text_index_eval,
-    "validate-manifest": cmd_validate_manifest,
+@dataclass(frozen=True)
+class Command:
+    run: Callable[[Config, argparse.Namespace], Any]
+    # True when the command reads or writes what `refresh` rebuilds (export, sample,
+    # positives, models, scores, selection runs, selectdb) or uses work_dir/duckdb_tmp.
+    # It then holds the work lock shared: it runs beside other commands, never beside a
+    # refresh step. No default, so every new command must decide.
+    work: bool
+
+
+COMMANDS: dict[str, Command] = {
+    "check-config": Command(cmd_check_config, work=False),
+    "pull-golden": Command(cmd_pull_golden, work=True),
+    "pull-dims": Command(cmd_pull_dims, work=True),
+    "pull-full": Command(cmd_pull_full, work=True),
+    "derive-sample": Command(cmd_derive_sample, work=True),
+    "derive-positives": Command(cmd_derive_positives, work=True),
+    "validate-routing": Command(cmd_validate_routing, work=True),
+    "build-dataset": Command(cmd_build_dataset, work=True),
+    "backtest": Command(cmd_backtest, work=True),
+    "report": Command(cmd_report, work=False),
+    "train": Command(cmd_train, work=True),
+    "forward-eval": Command(cmd_forward_eval, work=True),
+    "select-sample": Command(cmd_select_sample, work=True),
+    "score-full": Command(cmd_score_full, work=True),
+    "select-full": Command(cmd_select_full, work=True),
+    "migrate-selectdb": Command(cmd_migrate_selectdb, work=True),
+    "publish": Command(cmd_publish, work=True),
+    "swap": Command(cmd_swap, work=True),
+    "rollback": Command(cmd_rollback, work=True),
+    "verify-live": Command(cmd_verify_live, work=False),
+    "recrawl-sync": Command(cmd_recrawl_sync, work=True),
+    # The loops run as services; holding the lock would stop refresh for good.
+    "recrawl-plan": Command(cmd_recrawl_plan, work=False),
+    "recrawl-archive": Command(cmd_recrawl_archive, work=False),
+    "text-index-build": Command(cmd_text_index_build, work=False),
+    "text-index-eval": Command(cmd_text_index_eval, work=False),
+    "validate-manifest": Command(cmd_validate_manifest, work=False),
+    # Takes the lock itself, exclusively, for each tick that runs a step.
+    "refresh": Command(cmd_refresh, work=False),
 }
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    configure_logging()
     try:
         cfg = load_config(args.config)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
-    result = COMMANDS[args.command](cfg, args)
+    command = COMMANDS[args.command]
+    with ExitStack() as stack:
+        if command.work:
+            # Only this acquisition means exit 3: a LockBusy raised inside a command
+            # (text-index-build's own lock) surfaces as itself.
+            try:
+                stack.enter_context(refresh.work_lock(cfg, exclusive=False))
+            except LockBusy:
+                print(WORK_BUSY, file=sys.stderr)
+                return 3
+        result = command.run(cfg, args)
     if result is not None:
         _print(result)
     return 0

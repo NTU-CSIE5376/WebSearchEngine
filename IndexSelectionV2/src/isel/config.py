@@ -190,6 +190,21 @@ class ScheduleCfg:
 
 
 @dataclass(frozen=True)
+class RefreshCfg:
+    """`isel refresh`: one cycle per golden day, a `schedule.swap_freeze_days` day."""
+
+    start_days_before: int
+    start_time: str
+    swap_margin_min: int
+    sync_budget_min: int
+    min_overlap_share: float
+    min_coverage_ratio: float
+    max_attempts: int
+    poll_s: float
+    kill_grace_s: float
+
+
+@dataclass(frozen=True)
 class RecrawlCfg:
     api_url: str
     api_timeout_s: float
@@ -223,6 +238,9 @@ class RecrawlCfg:
     sync_chunk_rows: int
     real_text_min_chars: int
     challenge_sha1: list[str]
+    report_rate_days: int
+    report_period_days: int
+    report_top_hosts: int
 
 
 @dataclass(frozen=True)
@@ -256,7 +274,6 @@ class TextIndexCfg:
     prior_score_mode: str
     prior_boost: float
     prior_depth: int
-    prior_min_coverage: float
 
 
 @dataclass(frozen=True)
@@ -277,6 +294,7 @@ class Config:
     full: FullCfg
     selectdb: SelectDbCfg
     schedule: ScheduleCfg
+    refresh: RefreshCfg
     recrawl: RecrawlCfg
     text_index: TextIndexCfg
 
@@ -490,6 +508,7 @@ def _validate(cfg: Config) -> None:
     need(cfg.duckdb.threads > 0, "duckdb.threads must be > 0")
     _validate_full(cfg, need)
     _validate_selectdb(cfg, need)
+    _validate_refresh(cfg, need)
     _validate_recrawl(cfg, need)
     _validate_text_index(cfg, need)
 
@@ -528,6 +547,9 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "recrawl.refusal_reasons must be fail reasons like http_403")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
     need(r.real_text_min_chars >= 0, "recrawl.real_text_min_chars must be >= 0")
+    need(r.report_rate_days >= 1 and r.report_period_days >= 1,
+         "recrawl.report_rate_days and report_period_days must be >= 1")
+    need(r.report_top_hosts >= 0, "recrawl.report_top_hosts must be >= 0")
     need(all(re.fullmatch(r"[0-9a-f]{40}", h) for h in r.challenge_sha1),
          "recrawl.challenge_sha1 must be 40-char lowercase hex SHA-1s")
 
@@ -574,7 +596,6 @@ def _validate_text_index(cfg: Config, need: Any) -> None:
     need(t.prior_depth >= t.fetch_k, "text_index.prior_depth must be >= fetch_k")
     need(min(t.prior_scale, t.prior_scaling_factor) > 0,
          "text_index.prior_scale and prior_scaling_factor must be > 0")
-    need(0 <= t.prior_min_coverage <= 1, "text_index.prior_min_coverage must be in [0, 1]")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:
@@ -617,6 +638,39 @@ def _validate_selectdb(cfg: Config, need: Any) -> None:
          "schedule.swap_freeze_window must be [start, end] within one day")
     need(all(1 <= d <= 31 for d in cfg.schedule.swap_freeze_days),
          "schedule.swap_freeze_days must be 1-31")
+
+
+def _validate_refresh(cfg: Config, need: Any) -> None:
+    # Imported here: isel.schedule imports this module for hhmm_minutes.
+    from isel.schedule import min_gap_days
+
+    r, s, db = cfg.refresh, cfg.schedule, cfg.selectdb
+    need(bool(s.swap_freeze_days),
+         "schedule.swap_freeze_days must not be empty: they are refresh's golden days")
+    need(r.start_days_before >= 1,
+         "refresh.start_days_before must be >= 1: crawlerdb is closed on a golden day "
+         "until guard.month_window ends")
+    start = hhmm_minutes(r.start_time)
+    need(start < 24 * 60, "refresh.start_time must be before 24:00")
+    need(r.swap_margin_min * 60 > db.swap_retry_attempts * db.swap_retry_backoff_s,
+         "refresh.swap_margin_min must exceed selectdb.swap_retry_attempts x "
+         "swap_retry_backoff_s, or a retried swap runs into the freeze")
+    freeze_start, freeze_end = (hhmm_minutes(v) for v in s.swap_freeze_window)
+    need(r.start_days_before * 24 * 60 + freeze_start - r.swap_margin_min > start,
+         "refresh.swap_margin_min leaves no time between the cycle start and swap_by")
+    need(0 < r.sync_budget_min < 24 * 60, "refresh.sync_budget_min must be 1 to 1439")
+    # A cycle runs until the next one starts. On the shortest gap between golden days it
+    # must still hold its whole freeze and sync_budget_min after it, or a sync that waited
+    # for the freeze could never run.
+    gap = min_gap_days(s.swap_freeze_days)
+    need((gap - r.start_days_before) * 24 * 60 + start - freeze_end >= r.sync_budget_min,
+         f"refresh.start_days_before is too large for the {gap}-day gap between "
+         "schedule.swap_freeze_days: the next cycle would start before this one can sync")
+    need(0 <= r.min_overlap_share <= 1 and 0 <= r.min_coverage_ratio <= 1,
+         "refresh.min_overlap_share and min_coverage_ratio must be in [0, 1]")
+    need(r.max_attempts >= 1, "refresh.max_attempts must be >= 1")
+    need(r.poll_s > 0, "refresh.poll_s must be > 0")
+    need(r.kill_grace_s >= 0, "refresh.kill_grace_s must be >= 0")
 
 
 def load_config(paths: Sequence[str | Path]) -> Config:

@@ -37,7 +37,11 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   and positions were 45 % of the index. The URL's words are searchable as `url.text`.
   `doc_id` holds the same id as doc values only, for sorting. `sel_prior` is a
   `rank_feature`, `prior_scale / (rank + 1)`, from the doc's rank in the selection manifest
-  (`prior_file`). A build fails if under `prior_min_coverage` of the docs have a rank.
+  (`prior_file`). With a prior, only the docs on that list are indexed, and a build with
+  none of them fails. `prior_file = "live"` reads the live run's label from selectdb and
+  checks its manifest (`validate_run`), so a swap needs only a rebuild. The `refresh`
+  service does not rebuild the index: once its `recrawl-sync` is done (`refresh --status`),
+  run `text-index-build` by hand.
   `config/text_index/icu.json` holds the settings and mappings.
 - **Analysis.** One analyzer for every text field and language: `icu_tokenizer` (Unicode
   word breaks with dictionaries for CJK and Thai) and `icu_folding` (case, accents,
@@ -577,8 +581,9 @@ It holds. The other scripts of batch 20 pass only because the upper bound is exa
     earlier batch. See the table above for who gains and who loses by list rank.
   - The weight fits this size. BM25 scores are small on a small index, so on 2,653 golden
     pages the same weight gives 0.650 against 0.833 without it. Tune again for another size.
-  - The scores come from one selection run. A new run needs a new `prior_file` and a rebuild.
-    A retrained model on batches 20 or 21 voids them as out-of-sample data.
+  - The scores come from one selection run. A new run needs a rebuild, which takes its
+    ranks through `prior_file = "live"`. A retrained model on batches 20 or 21 voids
+    them as out-of-sample data.
   - A window of 375 per shard scored 0.431 and 0.406 on dev, against 0.430 and 0.386. It
     was read after the check failed and is not the frozen depth, so it was not adopted.
   - The recrawl's `fetched` count grew by about 95,000 per 2 hours during the rebuild,
@@ -748,8 +753,8 @@ The Host2 pieces are in the repo. Steps 1 to 4 ran on 2026-11-06, and step 5 on
 - `deploy/compose.compute.yaml`: the `opensearch` service (profile `search`) and the
   `text-index` job service;
 - `config/text_index/host2.toml`: `settings_file` under `/app` (the image runs in
-  `/work`), 8 shards, no `keep_prev`, a small DuckDB, and the `prior_file` of the live
-  selection run. The `text-index` service passes it after `container.toml`.
+  `/work`), 8 shards, no `keep_prev`, a small DuckDB, and `prior_file = "live"`. The
+  `text-index` service passes it after `container.toml`.
 - Hard limits, since Host2's CPU is rarely full and `cpu_shares` then does nothing: the node
   has `OS_CPUS` (16) CPUs and `OS_MEM` (64g) of memory, with an `OS_HEAP` (31g) heap, and the
   `text-index` job has 4 CPUs and 24 GB. A stage runs with smaller values. No I/O limit is
@@ -784,7 +789,6 @@ Choices and limits:
   suggests](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/bp-sharding.html)
   when search latency matters.
 - **Still open** (`docs/RECRAWL.md` §13):
-  - index only live docs, before the first list swap after the recrawl has run;
   - compact the text Parquet, before its first 30-day cycle ends;
   - fallback documents for docs without text;
   - a `RankMeasure` for the metric;

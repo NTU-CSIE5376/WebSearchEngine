@@ -1,6 +1,6 @@
 # IndexSelectionV2
 
-IndexSelectionV2 picks the 128,000,000 crawled URLs that go into the search index.
+IndexSelectionV2 picks the 64,000,000 crawled URLs that go into the search index.
 It learns which pages tend to become golden URLs, scores every crawled page, and
 publishes the exact top K to its own selectdb. The official metric reads that list
 with its existing query.
@@ -42,8 +42,14 @@ flowchart LR
 | Export | `pull-golden`, `pull-dims`, `pull-full` | metricdb, crawlerdb on YugabyteDB (read-only) | Parquet in the work dir |
 | Sample | `derive-sample`, `derive-positives` | the export | 2 % hash sample, golden rows |
 | Model | `backtest`, `train` | the sample | backtest report, frozen model |
-| Select | `score-full`, `select-full` | the export, the model | the 128M-URL manifest |
+| Select | `score-full`, `select-full` | the export, the model | the 64M-URL manifest |
 | Publish | `migrate-selectdb`, `publish`, `swap`, `verify-live` | the manifest | selectdb :5445 only |
+| Refresh | `refresh --loop` (service), `refresh --status` | all of the above | a new live list before every golden day, then `recrawl-sync` |
+
+The opt-in `refresh` service runs these steps for every golden day (the 1st and 16th).
+It gates the new list against the live one before `publish` and swaps it before the
+metric reads it ([`docs/DESIGN.md`](docs/DESIGN.md) §11). Every other command is one
+container run, except the two opt-in recrawl services below.
 
 ## What it never does
 
@@ -53,8 +59,8 @@ flowchart LR
   or in each hour's :58–:10 window, when the metric scans the crawl tables.
 - It never swaps the list on the 1st and 16th between 11:30 and 20:00 UTC, so the head
   and random sets of one batch see the same list.
-- It has no scheduler. Each command is one container run, except the two opt-in recrawl
-  services below.
+- The `refresh` service never publishes a list that failed its gates, and never rebuilds
+  the text index.
 - It never writes `/data/ipc` or `/data/manual_bulk_crawls`. Recrawl jobs go through the
   crawler's API, the crawler's result files are read-only for us, and we delete them
   through the same API.
@@ -97,6 +103,7 @@ and both commands (service `text-index`); the steps are in TEXT_INDEX.md, "Befor
 | Step | Who | Undo |
 |---|---|---|
 | Publish and swap a list on :5445 | us | `rollback` restores the previous list at once |
+| Refresh the list every golden day (`refresh` service) | us | stop `refresh`, then `rollback` and `recrawl-sync` |
 | Point the metric's `--select_db_url` at :5445 | TA (Dockerfile cron) | set it back to `:5444` |
 
 ## Code arrives in these pull requests
