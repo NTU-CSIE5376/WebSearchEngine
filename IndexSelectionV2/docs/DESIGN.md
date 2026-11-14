@@ -376,10 +376,12 @@ $J select-full
 $J migrate-selectdb --sql --stamp-baseline   # review the DDL
 $J migrate-selectdb --stamp-baseline         # first run on the pre-Alembic :5445 only
 $J publish --run-dir /work/full/selection/run=<id>
+$J recrawl-sync --dry-run --run <id>   # what the swap keeps, adds and drops; writes nothing
 $J swap --db-run-id <n>
 $J verify-live --batch <b>
 # recrawl (docs/RECRAWL.md §11), against the crawler API as Host2 runs it
 $J recrawl-sync                        # after each swap; refused in the freeze window
+$D run --rm text-index text-index-build   # after each sync: index the new list's docs
 $J recrawl-plan --dry-run              # per-host capacity report; sends nothing
 $D --profile recrawl up -d recrawl-archive recrawl-plan
 $D --profile recrawl stop recrawl-plan # stops sending new jobs at once

@@ -303,6 +303,11 @@ challenge_sha1 = [                       # report only: payload sha1 of shared b
     "f1dbc6923af7384830c2b832bc9859adacbc3b70",  # "Client Challenge", Hearst sites
     "6a92d6cd49d457a65207172eaa43ea3046dc8154",  # walmart "Robot or human?"
 ]
+report_rate_days = 3                     # swap report: a host's pace is its results per day
+                                         # in this many days of log_root
+report_period_days = 14                  # swap report: hosts whose docs left take longer
+                                         # than this (one list period) are flagged
+report_top_hosts = 30                    # swap report: hosts listed, most docs left first
 
 [text_index]                             # full-text index of the recrawl text; docs/TEXT_INDEX.md
 url = "http://127.0.0.1:9200"            # OpenSearch (deploy/compose.opensearch.yaml locally)
@@ -318,8 +323,10 @@ fields = ["title^2", "description", "body", "url.text^2"]   # tuned on golden ba
 k = 10                                   # hits per query: the metric's top 10
 fetch_k = 200                            # hits read per query, so a host cap can refill the top k
 host_cap = 2                             # hits per host in the top k; 0 turns the cap off
-prior_file = ""                          # Parquet glob of the list's doc_id and rank; "" gives
-                                         # docs no prior. Host-specific (host2.toml)
+prior_file = ""                          # Parquet glob of the list's doc_id and rank, or "live"
+                                         # for the live run's manifest; only listed docs are
+                                         # indexed. "" indexes every doc with no prior.
+                                         # Host-specific (host2.toml)
 prior_scale = 1e9                        # sel_prior = prior_scale / (rank + 1); above the largest
                                          # rank, so log(1 + S) stays close to log(S)
 prior_scaling_factor = 1.0               # rank_feature's log(scaling_factor + S)
@@ -335,7 +342,6 @@ prior_depth = 4500                       # best text matches the prior reorders,
                                          # holds to 10,000, while the sum falls after 4,500.
                                          # Over every match, popular pages with a weak match
                                          # took 40 % of the top 10
-prior_min_coverage = 0.99                # share of docs with a rank a build needs
 read_batch_rows = 10000                  # text rows per Arrow batch read for the bulk load
 bulk_bytes = 8388608                     # per _bulk request; OpenSearch suggests 5-15 MiB
 bulk_workers = 2                         # concurrent _bulk requests

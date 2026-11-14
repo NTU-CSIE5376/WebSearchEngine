@@ -26,7 +26,8 @@ import pyarrow.parquet as pq
 import pytest
 import sqlalchemy as sa
 from alembic import command
-from conftest import replace
+from conftest import ROOT, replace
+from opensearch_fakes import OpenSearchStub
 from recrawl_fakes import ApiStub, FakeCrawler, Page, crawler_of
 
 from isel.cli import main as cli_main
@@ -43,6 +44,7 @@ from isel.recrawl import (
     host_id,
     pg_doc_id,
     plan_cycle,
+    swap_report,
     sync,
 )
 from isel.schema import REVISIT_RANK
@@ -54,6 +56,7 @@ from isel.selectdb import (
     init_role,
     migrate,
 )
+from isel.textindex import PRIOR_FIELD, OpenSearch, build
 from isel.urlnorm import DomainKeyer, ShardRouter
 
 pytestmark = pytest.mark.integration
@@ -849,6 +852,127 @@ def test_recrawl_sync_takes_docs_off_the_list_and_plan_skips_them(selectdb, tmp_
         assert stub.posts == [[A1]]
         with pytest.raises(RuntimeError, match="freeze window"):
             sync(cfg, admin, now=lambda: FROZEN)
+    finally:
+        admin.close()
+
+
+def test_recrawl_sync_keeps_fetched_docs_across_runs(selectdb, tmp_path, stub):
+    """A new list resends nothing already fetched: only new docs and unfinished ones go out."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False)
+    _setup(cfg)
+    admin = _admin(cfg)
+    fields = ("state", "fetched_at", "text_file", "payload_sha1", "due_at", "attempts")
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, B1])
+        api = _api(stub)
+        _round(cfg, admin, stub, api,
+               FakeCrawler(stub, {A1: ARTICLE, A2: ENGLISH, B1: Page(status=403)}), T0)
+        a1, a2, b1 = (_doc(admin, u, *fields) for u in (A1, A2, B1))
+        assert (a1[0], a2[0], b1[0]) == ("fetched", "fetched", "failed")
+        (a1_rank,) = _doc(admin, A1, "rank")
+
+        # The next list re-ranks A1 and B1, drops A2 and adds C1.
+        _go_live(cfg, admin, tmp_path, "r2", [B1, C1, A1])
+        assert sync(cfg, admin, now=lambda: OPEN)["dropped"] == 1
+        assert _doc(admin, A1, *fields) == a1 and _doc(admin, A1, "rank") != (a1_rank,)
+        assert _doc(admin, B1, *fields) == b1          # its retry keeps its due time
+        assert _doc(admin, A2, "rank", *fields) == (None, *a2)
+        assert plan_cycle(cfg, admin, T0, api)["jobs"] == 1
+        assert stub.posts[-1] == [C1]
+
+        # A2 comes back on a later list: still fetched, not sent again.
+        _go_live(cfg, admin, tmp_path, "r3", [A1, A2])
+        sync(cfg, admin, now=lambda: OPEN)
+        assert _doc(admin, A2, *fields) == a2 and _doc(admin, A2, "rank") != (None,)
+        assert plan_cycle(cfg, admin, T0, api)["jobs"] == 0
+        assert len(stub.posts) == 2
+    finally:
+        admin.close()
+
+
+def test_text_index_follows_the_live_list_across_a_swap(selectdb, tmp_path, stub):
+    """Fetched text kept by sync is indexed under the new list's rank; a doc off it leaves."""
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False)
+    _setup(cfg)
+    admin = _admin(cfg)
+    node = OpenSearchStub()
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, B1])
+        _round(cfg, admin, stub, _api(stub),
+               FakeCrawler(stub, {A1: ARTICLE, A2: ENGLISH, B1: ENGLISH}), T0)
+        cfg = replace(cfg, "text_index", url=node.url, prior_file="live", lease_wait_s=1.0,
+                      backoff_s=0.0, settings_file=str(ROOT / "config/text_index/icu.json"))
+        client = OpenSearch(node.url, 5.0, 2, 0.0, sleep=lambda s: None)
+        text_root = Path(cfg.recrawl.text_root)
+        ids = {u: str(pg_doc_id(u) % (1 << 64)) for u in (A1, A2, B1)}
+
+        first = build(cfg, client, text_root, T0 + timedelta(hours=1))
+        assert (first["prior_run"], first["prior_docs"], first["docs_off_list"]) == ("r1", 3, 0)
+        before = node.indices[first["index"]]["docs"]
+        assert set(before) == set(ids.values())
+
+        # The next list drops A2, puts B1 first and A1 last; nothing is fetched again.
+        _go_live(cfg, admin, tmp_path, "r2", [B1, C1, A1])
+        sync(cfg, admin, now=lambda: OPEN)
+        second = build(cfg, client, text_root, T0 + timedelta(hours=2))
+        assert (second["prior_run"], second["prior_docs"], second["docs_off_list"]) == ("r2", 2, 1)
+        assert second["prior_file"].endswith("run=r2/manifest/*.parquet")
+        after = node.indices[second["index"]]["docs"]
+        assert set(after) == {ids[A1], ids[B1]}
+        assert after[ids[A1]]["title"] == before[ids[A1]]["title"] == "颱風假"
+        assert after[ids[A1]][PRIOR_FIELD] < before[ids[A1]][PRIOR_FIELD]
+        assert after[ids[B1]][PRIOR_FIELD] > before[ids[B1]][PRIOR_FIELD]
+        assert len(stub.posts) == 1
+    finally:
+        node.close()
+        admin.close()
+
+
+def test_recrawl_swap_report_counts_what_a_new_list_keeps_adds_and_drops(selectdb, tmp_path,
+                                                                        stub):
+    cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False, real_text_min_chars=10,
+                       report_rate_days=1)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _live(cfg, admin, tmp_path, [A1, A2, B1])
+        _round(cfg, admin, stub, _api(stub),
+               FakeCrawler(stub, {A1: ARTICLE, A2: ENGLISH, B1: Page(status=403)}), T0)
+        at = T0 + timedelta(hours=1)
+        same = swap_report(cfg, admin, now=at)            # the live run against itself
+        assert (same["run_label"], same["docs"], same["new"], same["dropped"]) == ("r1", 3, 0, 0)
+        assert (same["kept_fetched"], same["kept_real"], same["left"]) == (2, 2, 1)
+
+        _selection(cfg, tmp_path, "r2", [B1, C1, A1])     # written, not published
+        got = swap_report(cfg, admin, "r2", now=at)
+        totals = {k: v for k, v in got.items() if k not in ("hosts", "secs")}
+        assert totals == {
+            "run_label": "r2", "docs": 3, "kept": 2, "new": 1, "kept_fetched": 1,
+            "kept_real": 1, "kept_waiting": 0, "kept_left": 1, "dropped": 1, "dropped_fetched": 1,
+            "dropped_real": 1, "left": 2, "hosts_left": 2, "hosts_over_period": 0,
+            "left_over_period": 0, "left_without_pace": 1, "rate_days": 1,
+            "period_days": cfg.recrawl.report_period_days}
+        # b.example answered its one doc with a 403 in the last day; c.example has no pace.
+        assert got["hosts"] == [
+            {"host": "b.example", "docs": 1, "new": 0, "kept_fetched": 0, "kept_real": 0,
+             "kept_waiting": 0, "kept_left": 1, "left": 1, "per_day": 1.0, "ok_share": 0.0,
+             "days_left": 1.0, "over_period": False},
+            {"host": "c.example", "docs": 1, "new": 1, "kept_fetched": 0, "kept_real": 0,
+             "kept_waiting": 0, "kept_left": 0, "left": 1, "per_day": None, "ok_share": None,
+             "days_left": None, "over_period": False}]
+        # Over 3 days, b.example's one result is a third of a doc a day: 3 days left.
+        slow = swap_report(replace(cfg, "recrawl", report_rate_days=3, report_period_days=1,
+                                   report_top_hosts=1), admin, "r2", now=at)
+        assert (slow["hosts_over_period"], slow["left_over_period"]) == (1, 1)
+        assert [(h["host"], h["days_left"], h["over_period"]) for h in slow["hosts"]] == [
+            ("b.example", 3.0, True)]
+        # A retry due after the period (a refusal's stale_days wait) is not left.
+        _fail_until(admin, B1, at + timedelta(days=cfg.recrawl.report_period_days, seconds=1))
+        later = swap_report(cfg, admin, "r2", now=at)
+        assert (later["kept_waiting"], later["kept_left"], later["left"]) == (1, 0, 1)
+        assert [h["host"] for h in later["hosts"]] == ["c.example"]
+        # Nothing was written: A2 is still listed and C1 is not in the frontier.
+        assert _doc(admin, A2, "rank") != (None,) and _doc(admin, C1, "state") is None
     finally:
         admin.close()
 

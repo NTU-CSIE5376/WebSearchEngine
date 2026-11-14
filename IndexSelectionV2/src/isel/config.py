@@ -223,6 +223,9 @@ class RecrawlCfg:
     sync_chunk_rows: int
     real_text_min_chars: int
     challenge_sha1: list[str]
+    report_rate_days: int
+    report_period_days: int
+    report_top_hosts: int
 
 
 @dataclass(frozen=True)
@@ -256,7 +259,6 @@ class TextIndexCfg:
     prior_score_mode: str
     prior_boost: float
     prior_depth: int
-    prior_min_coverage: float
 
 
 @dataclass(frozen=True)
@@ -528,6 +530,9 @@ def _validate_recrawl(cfg: Config, need: Any) -> None:
          "recrawl.refusal_reasons must be fail reasons like http_403")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
     need(r.real_text_min_chars >= 0, "recrawl.real_text_min_chars must be >= 0")
+    need(r.report_rate_days >= 1 and r.report_period_days >= 1,
+         "recrawl.report_rate_days and report_period_days must be >= 1")
+    need(r.report_top_hosts >= 0, "recrawl.report_top_hosts must be >= 0")
     need(all(re.fullmatch(r"[0-9a-f]{40}", h) for h in r.challenge_sha1),
          "recrawl.challenge_sha1 must be 40-char lowercase hex SHA-1s")
 
@@ -574,7 +579,6 @@ def _validate_text_index(cfg: Config, need: Any) -> None:
     need(t.prior_depth >= t.fetch_k, "text_index.prior_depth must be >= fetch_k")
     need(min(t.prior_scale, t.prior_scaling_factor) > 0,
          "text_index.prior_scale and prior_scaling_factor must be > 0")
-    need(0 <= t.prior_min_coverage <= 1, "text_index.prior_min_coverage must be in [0, 1]")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:
