@@ -303,6 +303,11 @@ challenge_sha1 = [                       # report only: payload sha1 of shared b
     "f1dbc6923af7384830c2b832bc9859adacbc3b70",  # "Client Challenge", Hearst sites
     "6a92d6cd49d457a65207172eaa43ea3046dc8154",  # walmart "Robot or human?"
 ]
+report_rate_days = 3                     # swap report: a host's pace is its results per day
+                                         # in this many days of log_root
+report_period_days = 14                  # swap report: hosts whose docs left take longer
+                                         # than this (one list period) are flagged
+report_top_hosts = 30                    # swap report: hosts listed, most docs left first
 
 [text_index]                             # full-text index of the recrawl text; docs/TEXT_INDEX.md
 url = "http://127.0.0.1:9200"            # OpenSearch (deploy/compose.opensearch.yaml locally)

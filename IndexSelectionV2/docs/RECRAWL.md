@@ -232,6 +232,28 @@ run's manifest (one row per `doc_id`, its best rank) and upserts `host` and `doc
 transaction per 1M rows. Docs that left the list get `rank = NULL`, `best_rank` is
 recomputed, and hosts of new or re-ranked docs lose their backoff `next_at`.
 
+- **A new list keeps what was fetched.** `doc_id` is the canonical URL's hash, so a page
+  keeps its row across runs. The upsert writes only `rank` and `model_run_id`: a fetched
+  doc keeps its state, fetch time and text file, and a failed one its `attempts` and
+  `due_at`. A doc off the list keeps its row too, and comes back as it left. With
+  `revisit` off, a new list sends only its new docs and the kept docs not yet fetched.
+  The text Parquet is permanent, so the text index has the kept text (§13).
+- **`recrawl-sync --dry-run [--run LABEL]`** reports what a sync of a run (by default the
+  live one) would change, and writes nothing. Run it after `publish`, before `swap`.
+  It streams `recrawl.doc` out with one `COPY` (no sort) and joins it with the run's
+  manifest in DuckDB. Totals: docs `new` to the frontier, `kept` (`kept_fetched`,
+  `kept_real` as in §3, `kept_left` not yet fetched), live docs `dropped`, and `left`,
+  the docs still to send. Per host, most `left` first (`report_top_hosts`): its pace,
+  the results per day in the last `report_rate_days` of `log_root`, the share of status
+  200 among them, and `days_left` = `left` over that pace. A host above
+  `report_period_days` (one list period) is flagged; one with no recent result has no
+  pace. A kept `failed` doc counts as left even while it waits for its `due_at`.
+- Measured on Host2 on 2026-11-13, before any list swap: 70 % of the 2.80M docs left on
+  hosts with 1,000 or more were on hosts that served no page (403, 405), only AWS WAF 202
+  challenges (`www.espn.com`), or 200s without text (`www.youtube.com`). A host's pace
+  is its crawler slot: one batch of 240 at a time, 380–890 s each at p50, then about 30 s
+  to the next. Keeping fetched docs cannot help a host that serves no page.
+
 ## 7. `recrawl-plan`
 
 A loop, every 30 s. No HTTP call runs inside a transaction: jobs are claimed and

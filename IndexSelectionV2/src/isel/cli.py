@@ -300,8 +300,12 @@ def _recrawl(cfg: Config, action: Any, read_only: bool = False) -> Any:
 
 
 def cmd_recrawl_sync(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.recrawl import sync
+    from isel.recrawl import swap_report, sync
 
+    if args.dry_run:
+        return _recrawl(cfg, lambda conn: swap_report(cfg, conn, args.run), read_only=True)
+    if args.run:
+        raise SystemExit("--run needs --dry-run: a sync always loads the live run")
     return _recrawl(cfg, lambda conn: sync(cfg, conn))
 
 
@@ -402,7 +406,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("rollback", help="make the previous list live again")
     p = sub.add_parser("verify-live", help="indexed rate of a batch under the live list")
     p.add_argument("--batch", type=int, required=True)
-    sub.add_parser("recrawl-sync", help="load the live run into the recrawl frontier")
+    p = sub.add_parser("recrawl-sync", help="load the live run into the recrawl frontier")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what a sync would keep, add and drop, per host; write nothing")
+    p.add_argument("--run", help="with --dry-run: the run label to compare (default: live)")
     p = sub.add_parser("recrawl-plan", help="send due docs as jobs to the crawler API (loop)")
     p.add_argument("--once", action="store_true", help="run one cycle and exit")
     p.add_argument("--dry-run", action="store_true",
