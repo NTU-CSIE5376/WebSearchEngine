@@ -59,9 +59,10 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
     is asked in each of its candidate shards. Nothing is written to crawlerdb.
   - A run writes its files beside the dataset and puts them in its place at the end.
     A rerun replaces the dataset, and a failed run leaves the old one. After
-    `crawlerdb_text_max_minutes` no new lookup starts; the docs not asked yet stay out,
-    and the report says `stopped`. The report counts the docs wanted and found, those
-    with a title and with an anchor, the queries and the seconds.
+    `crawlerdb_text_max_minutes` of lookups no new one starts; the docs not asked yet stay
+    out, and the report says `stopped`. The limit starts at the first lookup, after the
+    local pick of the docs. The report counts the docs wanted and found, those with a
+    title and with an anchor, the queries, the seconds of the lookups and of the run.
   - The build joins the dataset onto the docs without text and fills `title` and the
     field `anchor`. A doc with text of its own never takes crawlerdb text. A title on
     more than `crawlerdb_title_max_docs` of these docs is dropped: the crawler stored a

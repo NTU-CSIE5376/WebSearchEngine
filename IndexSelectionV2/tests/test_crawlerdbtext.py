@@ -183,7 +183,7 @@ def test_a_rerun_replaces_the_dataset(cfg, tmp_path):
     assert first["files"] == len(before) == 3
     again = _pull(small, _everything(*LISTED), tmp_path)
     assert {f.name: pq.read_table(f) for f in root.iterdir()} == before
-    assert {**again, "seconds": 0} == {**first, "seconds": 0}
+    assert {**again, "seconds": 0, "lookup_seconds": 0} == {**first, "seconds": 0, "lookup_seconds": 0}
     # crawlerdb lost two of the pages: their rows go, and no older file stays.
     _pull(small, _everything(VINEGARY), tmp_path)
     assert [f.name for f in root.iterdir()] == ["part-00000.parquet"]
@@ -199,7 +199,7 @@ def test_a_run_past_its_time_stops_and_leaves_what_it_found(cfg, tmp_path):
     db = _everything(*LISTED)
     timed = replace(cfg, "text_index", crawlerdb_text_chunk=1, crawlerdb_text_max_minutes=1.0)
     report = _pull(timed, db, tmp_path, clock=lambda: next(seconds))
-    # The clock reads 0 at the start, 40 before the first lookup and 80 before the second.
+    # The lookups start at 40; the clock reads 80 before the first and 120 before the second.
     assert [urls for _, urls in db.executed] == [[CHALLENGED]]
     assert (report["stopped"], report["docs_wanted"], report["docs_found"]) == (True, 3, 1)
     assert set(_dataset(cfg)) == {_doc_id(CHALLENGED)}

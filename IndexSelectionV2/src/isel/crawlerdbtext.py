@@ -72,7 +72,7 @@ def pull_crawlerdb_text(cfg: Config, session: ReadOnlySession, router: ShardRout
     """Replaces the dataset under `crawlerdb_text_root` with what crawlerdb holds now.
 
     The docs asked for are the listed docs that `pick_docs` leaves without text, best list
-    rank first. After `crawlerdb_text_max_minutes` no further lookup starts: the docs not
+    rank first. After `crawlerdb_text_max_minutes` of lookups no further one starts: the docs not
     asked yet stay out of the dataset, and the report says `stopped`.
 
     The new files are written beside the dataset and take its place only at the end, so a
@@ -92,7 +92,6 @@ def pull_crawlerdb_text(cfg: Config, session: ReadOnlySession, router: ShardRout
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
     started = clock()
-    deadline = started + 60 * t.crawlerdb_text_max_minutes if t.crawlerdb_text_max_minutes else None
     rows: list[dict[str, Any]] = []
     files = found = titles = anchors = queries = 0
     stopped = False
@@ -116,6 +115,10 @@ def pull_crawlerdb_text(cfg: Config, session: ReadOnlySession, router: ShardRout
         (wanted,) = con.execute("SELECT count(*) FROM wanted").fetchone()
         docs = con.execute("SELECT doc_id, url FROM wanted ORDER BY rank, doc_id"
                            ).to_arrow_reader(t.read_batch_rows)
+        # The limit bounds the time on crawlerdb, not the local pick of the docs before it.
+        lookups_started = clock()
+        deadline = (lookups_started + 60 * t.crawlerdb_text_max_minutes
+                    if t.crawlerdb_text_max_minutes else None)
         for shard, urls in _chunks(docs, router, t.crawlerdb_text_chunk):
             if deadline is not None and clock() >= deadline:
                 stopped = True
@@ -136,7 +139,8 @@ def pull_crawlerdb_text(cfg: Config, session: ReadOnlySession, router: ShardRout
                 flush()
             if queries % t.progress_every == 0:
                 log.info("crawlerdb text: %d queries, %d of %d docs found in %.0f s",
-                         queries, found, wanted, clock() - started)
+                         queries, found, wanted, clock() - lookups_started)
+        lookup_seconds = clock() - lookups_started
     finally:
         con.close()
     if rows:
@@ -146,4 +150,4 @@ def pull_crawlerdb_text(cfg: Config, session: ReadOnlySession, router: ShardRout
     return {"crawlerdb_text_root": str(root), "prior_file": prior_file, "prior_run": prior_run,
             "docs_wanted": int(wanted), "docs_found": found, "with_title": titles,
             "with_anchor": anchors, "queries": queries, "files": files, "stopped": stopped,
-            "seconds": round(clock() - started, 3)}
+            "lookup_seconds": round(lookup_seconds, 3), "seconds": round(clock() - started, 3)}
