@@ -27,13 +27,13 @@ url_table_fmt = "url_state_current_{:03d}"
 split_table = "shard_split_subdomain"
 io_wait_types = ["IO"]                   # pg_stat_activity wait_event_type values the guard counts
 
-[crawlerdb.session]                      # applied at connect; the role is a superuser
+[crawlerdb.session]                      # applied at connect; YugabyteDB's `crawler` role is
+                                         # no superuser, so only settings any role may change
 default_transaction_read_only = "on"
 standard_conforming_strings = "on"       # the SQL gate lexes strings with this quoting
 statement_timeout = "120s"
 lock_timeout = "1s"
 idle_in_transaction_session_timeout = "60s"
-temp_file_limit = "0"                    # never spill on the full /data disk
 datestyle = "ISO"                        # these three fix the CSV text pull-full parses
 extra_float_digits = "1"                 # shortest exact float8 text
 client_encoding = "UTF8"
@@ -251,6 +251,11 @@ swap_freeze_window = ["11:30", "20:00"]  # random set at 12:00, head set at 18:0
                                          # (a schedule.swap_freeze_days day); docs/DESIGN.md §11
 start_days_before = 2                    # a cycle starts on G-2 ...
 start_time = "02:15"                     # ... at 02:15 UTC (01:58-02:10 is a guard gap)
+start_grace_min = 720                    # a cycle clears the previous export only within
+                                         # this long of its start (clear_by); a later first
+                                         # start or restart keeps it and skips the cycle.
+                                         # 720 leaves 33 h 45 min, ~27 h of read windows,
+                                         # before the guard closes crawlerdb on G
 swap_margin_min = 30                     # swap_by = freeze start - this = G 11:00; above the
                                          # swap retries (selectdb: 5 x 30 s)
 sync_budget_min = 120                    # recrawl-sync starts only this long before the

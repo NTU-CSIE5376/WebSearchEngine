@@ -1,6 +1,6 @@
 """PostgreSQL sessions with a read-only SQL gate, read windows and statement pacing.
 
-crawlerdb's role is a superuser, so the database cannot stop an accidental
+crawlerdb's role can write, so the database cannot stop an accidental
 write. Two independent guards apply to every session: the server-side
 `default_transaction_read_only=on` option, and a client-side gate that lexes
 each statement and rejects anything that is not a single read.
@@ -105,6 +105,30 @@ def connect(dsn: str, *, app_name: str, session: Mapping[str, str],
         keepalives_interval=10,
         keepalives_count=3,
     )
+
+
+_LOST_ERRORS = (psycopg.errors.AdminShutdown, psycopg.errors.CrashShutdown,
+                psycopg.errors.CannotConnectNow, psycopg.errors.TooManyConnections)
+# libpq gives a refusal at connect as text only, without a SQLSTATE.
+_PASSING_FATALS = ("the database system is", "too many clients",
+                   "connection slots are reserved", "due to administrator command")
+_FATAL = re.compile(r"FATAL:\s+(.*)")
+
+
+def connection_lost(exc: BaseException) -> bool:
+    """True if `exc` is a dropped or unreachable server, which a later try may get past.
+
+    False for errors a retry repeats: a refused login, a missing privilege, a setting
+    the role may not change, and every error that is not a `psycopg.OperationalError`.
+    """
+    if not isinstance(exc, psycopg.OperationalError):
+        return False
+    if isinstance(exc, _LOST_ERRORS):
+        return True
+    if exc.sqlstate is not None:
+        # Class 08, connection exception: psycopg gives its codes no common base class.
+        return exc.sqlstate.startswith("08")
+    return all(any(p in fatal for p in _PASSING_FATALS) for fatal in _FATAL.findall(str(exc)))
 
 
 def _end_of_string(text: str, start: int, backslash: bool) -> int:

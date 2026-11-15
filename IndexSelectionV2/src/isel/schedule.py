@@ -52,11 +52,12 @@ class Window:
 
     Raises:
         ValueError: On construction, if a field is naive or the fields do not satisfy
-            `start_at < swap_by < freeze_start < freeze_end <= ends_at`.
+            `start_at < clear_by < swap_by < freeze_start < freeze_end <= ends_at`.
     """
 
     golden_day: date
     start_at: datetime      # G - start_days_before at start_time: the cycle may begin
+    clear_by: datetime      # start_at + start_grace_min: no later clear of the old export
     swap_by: datetime       # freeze_start - swap_margin_min: no build step runs past it
     freeze_start: datetime  # the metric reads the list from here ...
     freeze_end: datetime    # ... to here
@@ -66,8 +67,8 @@ class Window:
         for f in fields(self):
             if f.name != "golden_day":
                 utc(getattr(self, f.name))
-        if not (self.start_at < self.swap_by < self.freeze_start < self.freeze_end
-                <= self.ends_at):
+        if not (self.start_at < self.clear_by < self.swap_by < self.freeze_start
+                < self.freeze_end <= self.ends_at):
             raise ValueError(f"the window of {self.golden_day} is out of order")
 
 
@@ -137,7 +138,9 @@ def window(golden_day: date, cfg: Config) -> Window:
         raise ValueError(f"{golden_day} is not a schedule.swap_freeze_days day")
     freeze_start, freeze_end = (_at(golden_day, v) for v in s.swap_freeze_window)
     following = next(golden_days(golden_day + timedelta(days=1), s.swap_freeze_days))
-    return Window(golden_day, _start_at(golden_day, cfg),
+    start_at = _start_at(golden_day, cfg)
+    return Window(golden_day, start_at,
+                  start_at + timedelta(minutes=cfg.refresh.start_grace_min),
                   freeze_start - timedelta(minutes=cfg.refresh.swap_margin_min),
                   freeze_start, freeze_end, _start_at(following, cfg))
 

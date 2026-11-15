@@ -49,9 +49,9 @@
 
 | Risk | Control |
 |---|---|
-| Writing crawlerdb (the role is a superuser) | Every session sets `default_transaction_read_only = on`. On top of that, `assert_read_only_sql` lexes each statement like PostgreSQL and allows one read statement only. `COPY` must be `COPY (SELECT ...) TO STDOUT`. Functions that change server state or run SQL text (`set_config`, `pg_terminate_backend`, advisory locks, `lo_*`, `query_to_xml`, ...) are refused. |
+| Writing crawlerdb (the role can write) | Every session sets `default_transaction_read_only = on`. On top of that, `assert_read_only_sql` lexes each statement like PostgreSQL and allows one read statement only. `COPY` must be `COPY (SELECT ...) TO STDOUT`. Functions that change server state or run SQL text (`set_config`, `pg_terminate_backend`, advisory locks, `lo_*`, `query_to_xml`, ...) are refused. |
 | Long statements | `statement_timeout` defaults to 120 s and never exceeds `guard.timeout_cap_s`. A shard that hits a timeout is retried on the next run. |
-| Server temp files | No server-side sort or aggregate; `temp_file_limit = 0`, `work_mem = 16MB`, no parallel workers. |
+| Server temp files | No server-side sort or aggregate, `work_mem = 16MB`, no parallel workers. YugabyteDB's `crawler` role is no superuser and may not set `temp_file_limit`. |
 | Reading while the metric works | `ReadGuard` runs before every statement. A statement may not reach into the 1st and 16th 00:00–20:00 UTC or any hour's :58–:10, even at its full timeout. It pauses while more than `guard.max_io_waiters` other sessions wait on IO (median of 3 probes). |
 | Read load | `pull-full` reads one `yb_hash_code(url)` range per `COPY`, `full.hash_chunks` ranges per shard table (§4.1). All sessions share one budget of `full.max_mb_s` CSV bytes per second, to be set from a one-shard run on the cluster. |
 | Leaking credentials | DSNs come from env variables or secret files; JSON output passes `assert_no_secrets`. |
@@ -434,9 +434,11 @@ when its `model_runs.cutoff_datetime` is at or after `start_at`.
   Gate (b) sees the new batch through the export, so it stops a broken model, not a
   slightly worse one.
 - **The first start.** The service acts on the cycle that owns the moment it
-  starts. Before that cycle's `swap_by`, the cycle begins at once: it deletes the old
-  export and reads crawlerdb. After `swap_by`, the cycle ends `skipped_late` with nothing
-  done, and work begins at the next `start_at`.
+  starts. Before that cycle's `clear_by` (`start_at` + `refresh.start_grace_min`, 12 h),
+  the cycle begins at once: it deletes the old export and reads crawlerdb. Later, it ends
+  `skipped_late` and keeps the old export, because a new one would not be ready by
+  `swap_by`. Work begins at the next `start_at`. A restart after the old export is gone
+  goes on until `swap_by`.
 - **The first swap** is followed by a cleanup that deletes every selection run but live
   and prev.
 - **The text index** stays manual: run `text-index-build` after the sync.
@@ -450,7 +452,7 @@ it: `free`, `commands` or `refresh`. The outcome of each cycle is
 |---|---|
 | `running` | the cycle has work left |
 | `done` | the new list is live, verified and synced; old selection runs are gone |
-| `skipped_late` | `swap_by` passed before the swap; the old list stays live |
+| `skipped_late` | `swap_by` passed before the swap, or the cycle had not cleared the old export by `clear_by`; the old list stays live |
 | `skipped_gate` | a gate rejected the run; nothing reached selectdb |
 | `withdrawn` | someone rolled back, abandoned or replaced this cycle's run |
 | `failed` | a step failed `max_attempts` times, or the cycle ended unfinished |
@@ -459,9 +461,14 @@ An error stores the step and the exception class only. The message is in the log
 (`$D logs refresh`).
 
 A step that raises counts one failure toward `max_attempts`. Three cases do not count,
-and the step runs again on the next tick: the export lost or could not open a crawlerdb
-connection (it resumes file by file, until `swap_by`), the export still misses shards,
-and the swap timed out on its lock.
+and the step runs again on the next tick, until its deadline:
+
+- Any step lost or could not open a database connection: crawlerdb, metricdb or
+  selectdb. Every such step is safe to rerun, and the export resumes file by file.
+  A refusal that a retry repeats does count: a wrong password, a missing privilege,
+  or a setting the role may not change (`isel.pg.connection_lost`).
+- The export still misses shards.
+- The swap timed out on its lock.
 
 **Retry a cycle.** A finished cycle never acts again. To retry a `failed` cycle, or a
 `skipped_gate` one after changing the thresholds, delete or rename its outcome file

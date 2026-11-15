@@ -536,29 +536,16 @@ def _pull_dims(job: Job) -> Any:
 
 
 def _export(job: Job) -> Any:
-    """One `pull_full` pass; raises NotYet while shards are missing.
-
-    A lost or refused crawlerdb connection is NotYet too, not a failure: the export
-    resumes file by file, it may run for days, and `swap_by` still ends it. Errors of
-    another class (a privilege, a changed layout) count toward `max_attempts`.
-    """
-    import psycopg
-
+    """One `pull_full` pass; raises NotYet while shards are missing."""
     from isel.pg import open_crawlerdb
     from isel.pull import pull_full
 
     cfg = job.cfg
-    try:
-        with ExitStack() as stack:
-            sessions = [stack.enter_context(closing(open_crawlerdb(cfg)))
-                        for _ in range(cfg.full.connections)]
-            # `now` becomes started_at only on the first pass: the cycle's export identity.
-            report = pull_full(cfg, sessions, cfg.work_dir / "full" / "export",
-                               now=job.clock())
-    except psycopg.OperationalError as exc:
-        log.warning("crawlerdb connection lost (%s); the export resumes on the next tick",
-                    type(exc).__name__, exc_info=True)
-        raise NotYet(f"crawlerdb connection lost ({type(exc).__name__})") from exc
+    with ExitStack() as stack:
+        sessions = [stack.enter_context(closing(open_crawlerdb(cfg)))
+                    for _ in range(cfg.full.connections)]
+        # `now` becomes started_at only on the first pass: the cycle's export identity.
+        report = pull_full(cfg, sessions, cfg.work_dir / "full" / "export", now=job.clock())
     if report["shards_missing"]:
         raise NotYet(f"{report['shards_missing']} shards missing")
     return report
@@ -838,7 +825,8 @@ def plan(w: Window, ev: Evidence, out: Outcome, now: datetime, rc: RefreshCfg) -
        `rc.sync_budget_min` before the freeze (deadline freeze_start) or after the
        freeze (deadline ends_at); the others run with deadline ends_at.
     3. This cycle's run was taken off by hand (`WITHDRAWN_STATUSES`): WITHDRAWN.
-    4. `now >= swap_by`: SKIPPED_LATE, pending the first BUILD step not done.
+    4. `now >= swap_by`, or the previous export is still to clear at `clear_by`:
+       SKIPPED_LATE, pending the first BUILD step not done.
     5. The gates rejected this run: SKIPPED_GATE.
     6. The first BUILD step not done, deadline swap_by.
     A step that failed `rc.max_attempts` times finishes the cycle FAILED instead.
@@ -852,13 +840,12 @@ def plan(w: Window, ev: Evidence, out: Outcome, now: datetime, rc: RefreshCfg) -
         return _exhausted(step, out, rc) or _follow(step, w, now, rc)
     if ev.db_run is not None and ev.db_run.status in WITHDRAWN_STATUSES:
         return Finish(Status.WITHDRAWN)
-    if now >= w.swap_by:
-        step = _first_pending(BUILD, ev, out)
+    step = _first_pending(BUILD, ev, out)
+    if now >= w.swap_by or (step is STEP[StepName.CLEAR] and now >= w.clear_by):
         return Finish(Status.SKIPPED_LATE, step and step.name)
     verdict = _verdict(ev, out)
     if verdict is not None and not verdict.passed:
         return Finish(Status.SKIPPED_GATE, StepName.GATES)
-    step = _first_pending(BUILD, ev, out)
     if step is None:
         return Idle("every build step is done, yet the live run is not this cycle's")
     return _exhausted(step, out, rc) or Run(step.name, w.swap_by)
@@ -923,15 +910,22 @@ def finish(out: Outcome, d: Finish, ev: Evidence, at: datetime) -> Outcome:
 def execute(act: Act, job: Job) -> RunResult:
     """Runs `act` and maps how it ended; the step process and in-process tests share it.
 
-    The traceback goes to the log; only the exception class leaves this function.
-    KeyboardInterrupt and SystemExit propagate.
+    A lost database connection is Deferred, like NotYet. The traceback goes to the log;
+    only the exception class leaves this function. KeyboardInterrupt and SystemExit
+    propagate.
     """
+    from isel.pg import connection_lost
+
     try:
         value = act(job)
     except NotYet as exc:
         log.info("not finished yet: %s", exc)
         return Deferred()
     except Exception as exc:
+        if connection_lost(exc):
+            log.warning("database connection lost; the step runs again on the next tick",
+                        exc_info=True)
+            return Deferred()
         log.exception("refresh step failed")
         return Failed(type(exc).__name__)
     return Completed(value)

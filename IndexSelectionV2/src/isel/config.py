@@ -195,6 +195,7 @@ class RefreshCfg:
 
     start_days_before: int
     start_time: str
+    start_grace_min: int
     swap_margin_min: int
     sync_budget_min: int
     min_overlap_share: float
@@ -656,8 +657,10 @@ def _validate_refresh(cfg: Config, need: Any) -> None:
          "refresh.swap_margin_min must exceed selectdb.swap_retry_attempts x "
          "swap_retry_backoff_s, or a retried swap runs into the freeze")
     freeze_start, freeze_end = (hhmm_minutes(v) for v in s.swap_freeze_window)
-    need(r.start_days_before * 24 * 60 + freeze_start - r.swap_margin_min > start,
-         "refresh.swap_margin_min leaves no time between the cycle start and swap_by")
+    swap_by = r.start_days_before * 24 * 60 + freeze_start - r.swap_margin_min - start
+    need(swap_by > 0, "refresh.swap_margin_min leaves no time between the cycle start and swap_by")
+    need(0 < r.start_grace_min < swap_by,
+         "refresh.start_grace_min must be > 0 and end before swap_by")
     need(0 < r.sync_budget_min < 24 * 60, "refresh.sync_budget_min must be 1 to 1439")
     # A cycle runs until the next one starts. On the shortest gap between golden days it
     # must still hold its whole freeze and sync_budget_min after it, or a sync that waited

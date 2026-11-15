@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
 
 import pytest
 from conftest import BASE, ROOT
 
 from isel.config import ConfigError, load_config
+from isel.schedule import window
 
 
 def _overlay(tmp_path: Path, text: str) -> list[Path]:
@@ -81,6 +83,7 @@ def test_base_config_loads(base_cfg):
     # 2 minutes is shorter than 5 swap retries x 30 s.
     ("[refresh]\nswap_margin_min = 2\n", "swap_margin_min must exceed"),
     ("[refresh]\nswap_margin_min = 3500\n", "no time between the cycle start and swap_by"),
+    ("[refresh]\nstart_grace_min = 0\n", "start_grace_min must be > 0"),
     ("[refresh]\nsync_budget_min = 0\n", "sync_budget_min must be 1 to 1439"),
     ("[refresh]\nsync_budget_min = 1440\n", "sync_budget_min must be 1 to 1439"),
     ("[refresh]\nmin_overlap_share = 1.5\n", "min_overlap_share and min_coverage_ratio"),
@@ -103,6 +106,14 @@ def test_the_deployed_config_layers_load_with_the_refresh_cycle(base_cfg, overla
     cfg = load_config([BASE, *(ROOT / o for o in overlays)])
     assert cfg.refresh == base_cfg.refresh
     assert cfg.schedule == base_cfg.schedule
+
+
+def test_config_refuses_a_start_grace_that_reaches_swap_by(base_cfg, tmp_path):
+    w = window(date(2026, 12, 1), base_cfg)
+    to_swap_by = int((w.swap_by - w.start_at).total_seconds() // 60)
+    load_config(_overlay(tmp_path, f"[refresh]\nstart_grace_min = {to_swap_by - 1}\n"))
+    with pytest.raises(ConfigError, match="start_grace_min must be > 0 and end before swap_by"):
+        load_config(_overlay(tmp_path, f"[refresh]\nstart_grace_min = {to_swap_by}\n"))
 
 
 def test_config_without_the_refresh_table_is_refused(tmp_path):

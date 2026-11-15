@@ -33,14 +33,15 @@ def test_naive_datetimes_are_refused(base_cfg):
         cycle_at(naive, base_cfg)
     w = window(date(2026, 12, 1), base_cfg)
     with pytest.raises(ValueError, match="naive"):
-        Window(w.golden_day, naive, w.swap_by, w.freeze_start, w.freeze_end, w.ends_at)
+        Window(w.golden_day, naive, w.clear_by, w.swap_by, w.freeze_start, w.freeze_end,
+               w.ends_at)
 
 
 def test_a_window_out_of_order_is_refused(base_cfg):
     w = window(date(2026, 12, 1), base_cfg)
     with pytest.raises(ValueError, match="out of order"):
-        Window(w.golden_day, w.start_at, w.freeze_start, w.freeze_start, w.freeze_end,
-               w.ends_at)
+        Window(w.golden_day, w.start_at, w.clear_by, w.freeze_start, w.freeze_start,
+               w.freeze_end, w.ends_at)
 
 
 def test_day_31_is_a_golden_day_only_in_months_that_have_it():
@@ -66,7 +67,8 @@ def test_the_shortest_gap_needs_a_golden_day():
 
 def test_the_window_of_a_golden_day(base_cfg):
     assert window(date(2026, 12, 1), base_cfg) == Window(
-        date(2026, 12, 1), start_at=_at(2026, 11, 29, 2, 15), swap_by=_at(2026, 12, 1, 11, 0),
+        date(2026, 12, 1), start_at=_at(2026, 11, 29, 2, 15),
+        clear_by=_at(2026, 11, 29, 14, 15), swap_by=_at(2026, 12, 1, 11, 0),
         freeze_start=_at(2026, 12, 1, 11, 30), freeze_end=_at(2026, 12, 1, 20, 0),
         ends_at=_at(2026, 12, 14, 2, 15))
 
