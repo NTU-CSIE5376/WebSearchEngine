@@ -330,6 +330,19 @@ def cmd_text_index_build(cfg: Config, args: argparse.Namespace) -> Any:
     return build(cfg, _text_index_client(cfg), Path(args.text_root or cfg.recrawl.text_root))
 
 
+def cmd_text_index_crawlerdb_text(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.crawlerdbtext import pull_crawlerdb_text
+    from isel.pg import open_crawlerdb
+
+    router = _router(cfg)
+    session = open_crawlerdb(cfg)
+    try:
+        return pull_crawlerdb_text(cfg, session, router,
+                                   Path(args.text_root or cfg.recrawl.text_root))
+    finally:
+        session.close()
+
+
 def cmd_text_index_eval(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.textindex import evaluate_golden
 
@@ -449,6 +462,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("text-index-build",
                        help="index the newest text of each doc; swap the alias to it")
     p.add_argument("--text-root", help="text Parquet root (default recrawl.text_root)")
+    p = sub.add_parser("text-index-crawlerdb-text",
+                       help="read crawlerdb's title and anchor text of the listed docs "
+                            "without text, for the next build")
+    p.add_argument("--text-root", help="text Parquet root (default recrawl.text_root)")
     p = sub.add_parser("text-index-eval", help="Recall@k of a golden batch on the alias")
     p.add_argument("--batch", type=int, required=True)
     p = sub.add_parser("validate-manifest")
@@ -510,6 +527,8 @@ COMMANDS: dict[str, Command] = {
     "recrawl-plan": Command(cmd_recrawl_plan, work=False),
     "recrawl-archive": Command(cmd_recrawl_archive, work=False),
     "text-index-build": Command(cmd_text_index_build, work=False),
+    # Reads dims/split_hosts.parquet, which a refresh step rewrites, and crawlerdb.
+    "text-index-crawlerdb-text": Command(cmd_text_index_crawlerdb_text, work=True),
     "text-index-eval": Command(cmd_text_index_eval, work=False),
     "validate-manifest": Command(cmd_validate_manifest, work=False),
     # Takes the lock itself, exclusively, for each tick that runs a step.
