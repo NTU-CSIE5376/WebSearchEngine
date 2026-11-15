@@ -31,13 +31,15 @@ from isel.urlnorm import md5_number_lower
 
 OLD = datetime(2026, 10, 1, tzinfo=UTC)
 NEW = datetime(2026, 10, 20, tzinfo=UTC)
+CHALLENGE_SHA1 = "c" * 40
 
 
-def _row(doc_id: int, fetched_at: datetime = NEW, title: str | None = "t", body: str = "b"):
+def _row(doc_id: int, fetched_at: datetime = NEW, title: str | None = "t", body: str = "b",
+         payload_sha1: str = "x"):
     return {"doc_id": doc_id, "batch_id": 1, "url": f"https://h{doc_id}.example/",
             "final_url": None, "fetched_at": fetched_at, "http_status": 200, "lang": "en",
             "title": title, "description": None, "body": body, "text_len": len(body),
-            "payload_sha1": "x"}
+            "payload_sha1": payload_sha1}
 
 
 def _write(path: Path, rows: list[dict]) -> None:
@@ -101,7 +103,7 @@ def test_latest_docs_keeps_the_newest_row_of_each_doc(cfg, tmp_path):
     from isel.io import open_duckdb
 
     con = open_duckdb(cfg, tmp_path / "tmp")
-    texts, url_only, off_list, reader = latest_docs(con, root, 10)
+    texts, _, url_only, off_list, reader = latest_docs(con, root, 10)
     table = reader.read_all()
     assert (texts, url_only, off_list) == (2, 0, 0)
     assert table.column_names == ["doc_id", *DOC_FIELDS, "prior_rank"]
@@ -231,14 +233,15 @@ def test_latest_docs_keeps_only_listed_docs_at_their_best_rank(cfg, tmp_path):
                       "url": ["u", "v", "w", "x"]})
     write_parquet_atomic(prior, tmp_path / "list" / "run=r" / "index_shard=00.parquet")
     glob = str(tmp_path / "list" / "run=r" / "index_shard=*.parquet")
-    texts, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root,
-                                                    10, glob)
+    texts, _, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"),
+                                                       root, 10, glob)
     table = reader.read_all()
     assert (texts, url_only, off_list) == (2, 1, 1) and table.num_rows == 3
     got = dict(zip(table["doc_id"].to_pylist(), table["prior_rank"].to_pylist(), strict=True))
     assert got == {1: 5, 2: 0, 9: 3}
     # Without a prior every doc stays, with no rank.
-    texts, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10)
+    texts, _, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"),
+                                                       root, 10)
     assert (texts, url_only, off_list, reader.read_all()["prior_rank"].null_count) == (3, 0, 0, 3)
 
 
@@ -257,8 +260,8 @@ def test_latest_docs_adds_url_only_docs_for_listed_docs_without_text(cfg, tmp_pa
                               "https://merriam-webster.com/dictionary/vinegary",
                               "https://natalie.mu/music/news/1"]})
     write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
-    texts, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10,
-                                                    str(tmp_path / "list" / "s.parquet"))
+    texts, _, url_only, off_list, reader = latest_docs(
+        open_duckdb(cfg, tmp_path / "tmp"), root, 10, str(tmp_path / "list" / "s.parquet"))
     rows = {r.pop("doc_id"): r for r in reader.read_all().to_pylist()}
     assert (texts, url_only, off_list) == (2, 2, 1)
     assert sorted(rows) == [1, 2, 5, 7]
@@ -269,6 +272,81 @@ def test_latest_docs_adds_url_only_docs_for_listed_docs_without_text(cfg, tmp_pa
     # The challenge page's row stays the doc's document; the doc gets no second one.
     assert (rows[2]["body"], rows[2]["lang"], rows[2]["prior_rank"]) == ("", "en", 6)
     assert rows[1]["title"] == "t"
+
+
+def _challenge_text(root: Path) -> None:
+    """Docs 1 and 4 have a real page; doc 1's newer row and docs 2, 3 and 6 are one shared
+    challenge page. Doc 4's page is short, as real pages can be."""
+    page = {"title": "Client Challenge", "body": "Please enable JavaScript to proceed.",
+            "payload_sha1": CHALLENGE_SHA1}
+    _write(root / "a" / "job-1.parquet", [
+        _row(1, OLD, "real", "text"), _row(2, OLD, **page), _row(4, OLD, "short", "hi")])
+    _write(root / "a" / "job-2.parquet", [
+        _row(1, NEW, **page), _row(2, NEW, **page), _row(3, NEW, **page), _row(6, NEW, **page)])
+
+
+def test_latest_docs_keeps_a_challenge_doc_without_the_challenge_text(cfg, tmp_path):
+    from isel.io import open_duckdb
+
+    root = tmp_path / "text"
+    _challenge_text(root)
+    no_text = dict.fromkeys(("lang", "title", "description", "body"))
+    con = open_duckdb(cfg, tmp_path / "tmp")
+    texts, challenges, url_only, off_list, reader = latest_docs(
+        con, root, 10, challenge_sha1=[CHALLENGE_SHA1, "d" * 40])
+    rows = {r.pop("doc_id"): r for r in reader.read_all().to_pylist()}
+    assert (texts, challenges, url_only, off_list) == (5, 3, 0, 0)
+    # The older real page beats the newer challenge page.
+    assert (rows[1]["title"], rows[1]["body"], rows[1]["lang"]) == ("real", "text", "en")
+    assert (rows[4]["title"], rows[4]["body"]) == ("short", "hi")
+    for doc_id in (2, 3, 6):
+        assert rows[doc_id] == {"url": f"https://h{doc_id}.example/", **no_text,
+                                "prior_rank": None}
+
+    # With a list, a challenge doc keeps its rank, and one off the list is not counted.
+    prior = pa.table({"doc_id": pa.array([1, 2, 3, 4, 9], pa.uint64()),
+                      "rank": pa.array([0, 1, 2, 3, 4], pa.int64()),
+                      "url": [f"https://list.example/{n}" for n in (1, 2, 3, 4, 9)]})
+    write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
+    texts, challenges, url_only, off_list, reader = latest_docs(
+        con, root, 10, str(tmp_path / "list" / "s.parquet"), [CHALLENGE_SHA1])
+    rows = {r.pop("doc_id"): r for r in reader.read_all().to_pylist()}
+    assert (texts, challenges, url_only, off_list) == (4, 2, 1, 1)
+    assert sorted(rows) == [1, 2, 3, 4, 9]
+    assert rows[2] == {"url": "https://h2.example/", **no_text, "prior_rank": 1}
+    assert (rows[1]["title"], rows[1]["prior_rank"]) == ("real", 0)
+
+    # With no hash configured the page is a text row like any other: the newest row wins.
+    texts, challenges, url_only, off_list, reader = latest_docs(con, root, 10)
+    rows = {r.pop("doc_id"): r for r in reader.read_all().to_pylist()}
+    assert (texts, challenges, url_only, off_list) == (5, 0, 0, 0)
+    assert [rows[n]["title"] for n in (1, 2, 4)] == ["Client Challenge", "Client Challenge",
+                                                     "short"]
+    assert (rows[2]["body"], rows[2]["lang"]) == ("Please enable JavaScript to proceed.", "en")
+
+
+def test_build_counts_the_challenge_docs_and_leaves_their_text_out(cfg, stub, tmp_path):
+    root = tmp_path / "text"
+    _challenge_text(root)
+    prior = pa.table({"doc_id": pa.array([1, 2, 3, 4, 9], pa.uint64()),
+                      "rank": pa.array([0, 1, 2, 3, 4], pa.int64()),
+                      "url": [f"https://list.example/{n}" for n in (1, 2, 3, 4, 9)]})
+    write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
+    cfg = replace(cfg, "recrawl", challenge_sha1=[CHALLENGE_SHA1])
+    out = build(replace(cfg, "text_index", prior_file=str(tmp_path / "list" / "s.parquet")),
+                _client(stub), root, datetime(2026, 10, 23, 1, tzinfo=UTC))
+    assert (out["docs"], out["challenge_docs"], out["fallback_docs"],
+            out["docs_off_list"]) == (5, 2, 1, 1)
+    docs = stub.indices[out["index"]]["docs"]
+    assert docs["2"] == {"doc_id": 2, "url": "https://h2.example/", PRIOR_FIELD: 1e9 / 2}
+    assert docs["1"]["title"] == "real"
+
+    # Without a list every doc with a text row is indexed, the challenge docs by URL alone.
+    out = build(cfg, _client(stub), root, datetime(2026, 10, 23, 2, tzinfo=UTC))
+    assert (out["docs"], out["challenge_docs"], out["fallback_docs"]) == (5, 3, 0)
+    docs = stub.indices[out["index"]]["docs"]
+    assert docs["6"] == {"doc_id": 6, "url": "https://h6.example/"}
+    assert docs["4"]["body"] == "hi"
 
 
 def test_build_indexes_only_the_docs_on_the_list(cfg, stub, tmp_path):
