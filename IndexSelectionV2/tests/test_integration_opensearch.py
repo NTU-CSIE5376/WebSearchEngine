@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 from conftest import ROOT, replace, small_cfg
 
+from isel.crawlerdbtext import CRAWLERDB_TEXT_SCHEMA
 from isel.golden import GOLDEN_SCHEMA, golden_path
 from isel.io import write_parquet_atomic
 from isel.recrawl import TEXT_SCHEMA
@@ -336,6 +337,60 @@ def test_a_doc_without_real_text_is_found_by_its_decoded_url(node, tmp_path):
                "query_id": n, "keyword": kw, "frequency": 1, "tags": ["head"], "rank": 1,
                "raw_url": u, "canonical_url": canonicalize(u), "host": "x"}
               for n, (kw, u) in enumerate((("東京", no_page), ("颱風警報", challenged)))]
+    write_parquet_atomic(pa.Table.from_pylist(golden, schema=GOLDEN_SCHEMA),
+                         golden_path(cfg.work_dir))
+    measured = evaluate_golden(cfg, client, 20)["all"]
+    assert (measured["presence"], measured["recall_pairs"]) == (1.0, 1.0)
+
+
+def test_a_doc_without_a_page_is_found_by_its_crawlerdb_title_and_anchor(node, tmp_path):
+    vinegary = "https://www.merriam-webster.com/dictionary/vinegary"     # Cloudflare refuses us
+    skillet = "https://shop.example.com/p/88213"                         # never fetched
+    real = DOCS[0][0]
+    listed = [real, vinegary, skillet]
+    ids = {u: md5_number_lower(canonicalize(u)) for u in listed}
+    root = tmp_path / "text"
+    write_parquet_atomic(_text([DOCS[0]], datetime(2026, 10, 20, tzinfo=UTC)),
+                         root / "job-1.parquet")
+    prior = tmp_path / "list" / "run.parquet"
+    write_parquet_atomic(pa.table({"doc_id": pa.array(list(ids.values()), pa.uint64()),
+                                   "rank": pa.array([0, 1, 2], pa.int64()), "url": listed}), prior)
+    write_parquet_atomic(pa.Table.from_pylist([
+        {"doc_id": ids[vinegary], "title": "VINEGARY Definition & Meaning - Merriam-Webster",
+         "anchor": None},
+        {"doc_id": ids[skillet], "title": None, "anchor": "Cast iron skillet"},
+        {"doc_id": ids[real], "title": "Zeppelin definition", "anchor": "zeppelin skillet"}],
+        schema=CRAWLERDB_TEXT_SCHEMA), tmp_path / "crawlerdb_text" / "part-00000.parquet")
+    cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
+                  alias="isel-text-crawlerdb", prior_file=str(prior), warmup_queries=0,
+                  settings_file=str(ROOT / "config/text_index/icu.json"))
+    client = OpenSearch(node, 60.0, 2, 1.0)
+    t = cfg.text_index
+    before = build(cfg, client, root, datetime(2026, 10, 25, tzinfo=UTC))
+    assert (before["docs"], before["fallback_docs"], before["crawlerdb_text_docs"]) == (3, 2, 0)
+    assert search(client, t, "definition")[0] == [] and search(client, t, "skillet")[0] == []
+    real_doc = client.call("GET", f"/{before['index']}/_doc/{ids[real]}")["_source"]
+
+    with_text = replace(cfg, "text_index", crawlerdb_text_root=str(tmp_path / "crawlerdb_text"))
+    out = build(with_text, client, root, datetime(2026, 10, 26, tzinfo=UTC))
+    assert (out["docs"], out["fallback_docs"], out["crawlerdb_text_docs"]) == (3, 2, 2)
+    # Each word is in the crawlerdb text of one doc without a page, and nowhere else. The
+    # doc with a page keeps its own text: crawlerdb's words for it find nothing.
+    assert search(client, t, "definition")[0] == [str(ids[vinegary])]
+    assert search(client, t, "vinegary definition")[0] == [str(ids[vinegary])]
+    assert search(client, t, "skillet")[0] == [str(ids[skillet])]
+    assert search(client, t, "zeppelin")[0] == []
+    assert client.call("GET", f"/{out['index']}/_doc/{ids[real]}")["_source"] == real_doc
+    stored = client.call("GET", f"/{out['index']}/_doc/{ids[skillet]}")["_source"]
+    assert set(stored) == {"url", "sel_prior"}        # the anchor is searched, not returned
+    stored = client.call("GET", f"/{out['index']}/_doc/{ids[vinegary]}")["_source"]
+    assert stored["title"] == "VINEGARY Definition & Meaning - Merriam-Webster"
+
+    golden = [{"batch_id": 20, "batch_created_at": datetime(2026, 10, 16, tzinfo=UTC),
+               "query_id": n, "keyword": kw, "frequency": 1, "tags": ["head"], "rank": 1,
+               "raw_url": u, "canonical_url": canonicalize(u), "host": "x"}
+              for n, (kw, u) in enumerate((("vinegary definition", vinegary),
+                                           ("cast iron skillet", skillet)))]
     write_parquet_atomic(pa.Table.from_pylist(golden, schema=GOLDEN_SCHEMA),
                          golden_path(cfg.work_dir))
     measured = evaluate_golden(cfg, client, 20)["all"]
