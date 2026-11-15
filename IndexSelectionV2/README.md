@@ -92,6 +92,7 @@ the golden keywords. `textindex.py` indexes it in OpenSearch with ICU analysis:
 | Command | Does |
 |---|---|
 | `text-index-build` | loads the newest text of each doc into a new index, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call; refuses to start or to merge if the disk would pass the flood stage; keeps the previous index for rollback if `keep_prev` is set, and every index a rank job pinned (`work/text_index/pins`) |
+| `text-index-crawlerdb-text` | reads crawlerdb's title and anchor text of the listed docs without text, by primary key and read-only, into `crawlerdb_text_root`; the next `text-index-build` adds them to those docs |
 | `text-index-eval --batch N` | searches each golden keyword of batch N and reports Recall@10 over (keyword, golden URL) pairs, as the metric's old rank code counted, and over distinct URLs |
 | `rank --loop` | for each golden day G: builds the index from the live list on G-1 and pins it on G; once Metric's rows of G match a snapshot of them, writes G's `ranked_num` and `ranked_rate` into metricdb ([docs/TEXT_INDEX.md](docs/TEXT_INDEX.md#the-rank-job)) |
 

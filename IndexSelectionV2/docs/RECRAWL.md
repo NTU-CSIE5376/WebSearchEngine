@@ -567,6 +567,7 @@ engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
 | `doc_id` | the same id as doc values only; it breaks score ties, so every build returns the same top 10 |
 | `url` | displayed; its words are searchable as `url_words`, the URL with its escapes and IDN labels decoded |
 | `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url_words` included. The body has no positions (`index_options: freqs`): the query never uses them, and they were 45 % of the index |
+| `anchor` | crawlerdb's first anchor text of a doc without text; searched, not stored in `_source` |
 | `lang` | stored; the trial measured what per-language analyzers would add |
 
 - **Live docs only.** With `prior_file = "live"` (Host2), a build indexes only docs in
@@ -600,9 +601,14 @@ Not built yet, for Host2 after WebCrawler#84 is deployed:
   words. The build now indexes the decoded URL as `url_words` (`docs/TEXT_INDEX.md`).
   Host2 needs a rebuild to get the field. The gain on a golden batch is not measured
   yet.
-- **Crawlerdb text for docs without text.** A doc without text could add crawlerdb's
-  title and anchor text to its URL. The full export must then pull `title` and
-  `anchor_text`, a crawlerdb export change that needs the TA's approval.
+- **Crawlerdb text for docs without text: built, not measured.** A doc without text
+  takes crawlerdb's title and first anchor text beside its URL. The TA approved
+  read-only access. `text-index-crawlerdb-text` reads both by primary key for exactly
+  these docs, so the full export is unchanged. The next build joins them
+  (`docs/TEXT_INDEX.md`, "Crawlerdb text" and the runbook under "Still open"). Run the
+  command, then rebuild. An earlier script read 3.5M docs in 23 minutes; 81 % had a
+  title and 94 % an anchor. The command has not run on Host2, and the gain on a golden
+  batch is not measured.
 - **Recall@10 in the metric.** The official metric hard-codes `ranked_num` to 0;
   `TypesenseRankMeasure` is a stub. `text-index-eval` measures it offline the same way;
   the official metric needs a `RankMeasure` PR.

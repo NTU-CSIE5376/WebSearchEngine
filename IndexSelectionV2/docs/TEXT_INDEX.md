@@ -20,6 +20,7 @@ metric does not search this index; [the rank job](#the-rank-job) writes its rank
 | Command | Does |
 |---|---|
 | `text-index-build [--text-root DIR]` | loads the newest text of each doc, and the URL of each listed doc without text, into a new index `isel-text-<utc id>`, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call |
+| `text-index-crawlerdb-text [--text-root DIR]` | reads crawlerdb's title and anchor text of the listed docs without text into `crawlerdb_text_root`, for the next build; read-only on crawlerdb |
 | `text-index-eval --batch N` | searches each golden keyword of batch N on the alias and reports Recall@10 against its golden URLs |
 | `rank --loop \| --once \| --dry-run [--golden-day G]` | the rank job below: on G-1 builds the index from the live list; on G writes a shadow count, then G's rank rate into metricdb |
 
@@ -42,6 +43,36 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   their own. Only the hash decides. A short real page keeps its text, and so does a new
   challenge page whose hash is not in the list yet. An empty list turns the rule off.
   The effect on the golden hit rate is not measured yet.
+- **Crawlerdb text.** A listed doc can have no text of its own: it was never fetched, the
+  host refused us, or its only page is a challenge page. Its document then has no
+  `title`, `description` or `body`. The normal crawler often read such a page before,
+  and crawlerdb keeps its title and the first anchor text that linked to it.
+  `text-index-crawlerdb-text` picks these docs with the build's own rule (`pick_docs`)
+  and needs a list (`prior_file`). It asks crawlerdb for the list URL of each doc, best
+  rank first, and writes `doc_id`, `title` and `anchor` to Parquet under
+  `crawlerdb_text_root`. One row per doc that has a title or an anchor; the anchor is cut
+  to `crawlerdb_anchor_chars`.
+  - Every statement is `SELECT url, title, anchor_text FROM url_state_current_NNN WHERE
+    url = ANY(%s)` with at most `crawlerdb_text_chunk` URLs: one primary-key read of one
+    shard table. It goes through the read-only gate, the pacer (`pull.min_interval_s`)
+    and the read guard, on one connection with the `[crawlerdb.session]` settings. A URL
+    is asked in each of its candidate shards. Nothing is written to crawlerdb.
+  - A run writes its files beside the dataset and puts them in its place at the end.
+    A rerun replaces the dataset, and a failed run leaves the old one. After
+    `crawlerdb_text_max_minutes` no new lookup starts; the docs not asked yet stay out,
+    and the report says `stopped`. The report counts the docs wanted and found, those
+    with a title and with an anchor, the queries and the seconds.
+  - The build joins the dataset onto the docs without text and fills `title` and the
+    field `anchor`. A doc with text of its own never takes crawlerdb text. A title on
+    more than `crawlerdb_title_max_docs` of these docs is dropped: the crawler stored a
+    challenge or error page there, such as "Just a moment...". Its docs keep their
+    anchor. The build reports `crawlerdb_text_docs`, the docs that took a title or an
+    anchor. They are still counted in `fallback_docs`, `challenge_docs` or the text
+    docs, as before. With `crawlerdb_text_root` unset or empty the build is as before
+    and the count is 0.
+  - `anchor` uses the `text` analyzer and is left out of `_source`: nothing reads it
+    back. The query searches it with weight 1. The weight and the title limit of 100 are
+    not tuned, and the gain on a golden batch is not measured.
 - **Document.** `_id` is the doc id in decimal. `url` and `lang` are stored; `title`,
   `description` and `body` are full text, and `body` is left out of `_source`. The body
   is indexed without positions (`index_options: freqs`): BM25 needs only term counts,
@@ -68,7 +99,8 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   the trial measures what they would add. `url_words` uses the same two steps after a
   character filter turns each run of characters that are not letters, digits or marks
   into one space.
-- **Query.** `best_fields` over `title^2`, `description`, `body` and `url_words^2`: a doc
+- **Query.** `best_fields` over `title^2`, `description`, `body`, `url_words^2` and
+  `anchor`: a doc
   scores by its best-matching field. The type and weights were chosen on half of golden
   batch 20's keywords and confirmed on the other half ([Tuning on batch
   20](#tuning-on-batch-20)); the URL weight came later, on 51M docs. The keyword is never
@@ -923,7 +955,23 @@ Choices and limits:
   when search latency matters.
 - **Still open** (`docs/RECRAWL.md` §13):
   - compact the text Parquet, before its first 30-day cycle ends;
-  - crawlerdb's title and anchor text for docs without text;
+  - the gain of crawlerdb's title and anchor text on a golden batch. The command and
+    the build are in the repo; neither has run on Host2. Runbook:
+    1. Deploy the code. `text-index-eval` then stops on the old index, which has no
+       `anchor` field, until the rebuild. So deploy, look up and rebuild in one step.
+    2. `docker compose ... run --rm text-index text-index-crawlerdb-text`. It needs
+       `dims/split_hosts.parquet` (`pull-dims`) and the crawlerdb DSN. `host2.toml`
+       puts the dataset in `/work/text_index/crawlerdb_text`.
+    3. `docker compose ... run --rm text-index text-index-build`, and check
+       `crawlerdb_text_docs` in its report.
+
+    Expected load: an earlier script asked for 3.5M docs in chunks of 2,000 URLs on one
+    connection and rested as long as each query took. It ran 23 minutes; 81 % of the
+    docs had a title and 94 % an anchor. The command sends the same statement at most
+    once per `pull.min_interval_s` (0.5 s). The read guard also holds it during the
+    closed read windows, so a run can take longer. Its own run time is not measured.
+    Do not run it while a build runs: a build that reads the dataset during the swap
+    fails and leaves the old index;
   - the gain of the decoded URL words (`url_words`) on a golden batch. It is not
     measured yet. In batch 20, 888 of 15,328 pairs have a URL with a non-ASCII escape
     and 4 have an IDN host: these are the pairs that can gain, not the gain. The index
