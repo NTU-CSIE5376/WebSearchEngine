@@ -302,3 +302,41 @@ def test_the_words_of_an_encoded_url_find_its_doc(node, tmp_path):
     assert len(ids) == 3 and doc_id["other"] in ids and len(shop & set(ids)) == 2
     stored = client.call("GET", f"/{index}/_doc/{doc_id['cjk']}")["_source"]
     assert stored["url"] == urls["cjk"] and "url_words" not in stored
+
+
+def test_a_doc_without_real_text_is_found_by_its_decoded_url(node, tmp_path):
+    no_page = "https://ja.wikipedia.org/wiki/%E6%9D%B1%E4%BA%AC"            # never fetched
+    challenged = "https://zh.example.org/wiki/%E9%A2%B1%E9%A2%A8%E8%AD%A6%E5%A0%B1"
+    sha1 = "f1dbc6923af7384830c2b832bc9859adacbc3b70"
+    root = tmp_path / "text"
+    write_parquet_atomic(_text([DOCS[0]], datetime(2026, 10, 20, tzinfo=UTC)),
+                         root / "job-1.parquet")
+    write_parquet_atomic(
+        _text([(challenged, "en", "Client Challenge", None, "Please enable JavaScript.")],
+              datetime(2026, 10, 21, tzinfo=UTC), payload_sha1=sha1), root / "job-2.parquet")
+    listed = [DOCS[0][0], no_page, challenged]
+    prior = tmp_path / "list" / "run.parquet"
+    write_parquet_atomic(pa.table({
+        "doc_id": pa.array([md5_number_lower(canonicalize(u)) for u in listed], pa.uint64()),
+        "rank": pa.array([0, 1, 2], pa.int64()), "url": listed}), prior)
+    cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
+                  alias="isel-text-combined", prior_file=str(prior), warmup_queries=0,
+                  settings_file=str(ROOT / "config/text_index/icu.json"))
+    cfg = replace(cfg, "recrawl", challenge_sha1=[sha1])
+    client = OpenSearch(node, 60.0, 2, 1.0)
+    out = build(cfg, client, root, datetime(2026, 10, 25, tzinfo=UTC))
+    assert (out["docs"], out["fallback_docs"], out["challenge_docs"]) == (3, 1, 1)
+
+    ids = {name: str(md5_number_lower(canonicalize(u)))
+           for name, u in (("no_page", no_page), ("challenged", challenged))}
+    assert search(client, cfg.text_index, "東京")[0] == [ids["no_page"]]
+    assert search(client, cfg.text_index, "颱風警報")[0] == [ids["challenged"]]
+    assert ids["challenged"] not in search(client, cfg.text_index, "Client Challenge")[0]
+    golden = [{"batch_id": 20, "batch_created_at": datetime(2026, 10, 16, tzinfo=UTC),
+               "query_id": n, "keyword": kw, "frequency": 1, "tags": ["head"], "rank": 1,
+               "raw_url": u, "canonical_url": canonicalize(u), "host": "x"}
+              for n, (kw, u) in enumerate((("東京", no_page), ("颱風警報", challenged)))]
+    write_parquet_atomic(pa.Table.from_pylist(golden, schema=GOLDEN_SCHEMA),
+                         golden_path(cfg.work_dir))
+    measured = evaluate_golden(cfg, client, 20)["all"]
+    assert (measured["presence"], measured["recall_pairs"]) == (1.0, 1.0)
