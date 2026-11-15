@@ -31,6 +31,16 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   never sorted; a second pass reads only the winners. A row with text beats any row
   without it: about 620,000 rows hold an empty WAF page from before revision `0004`. Such
   a doc stays in the index, where the words of its URL can find it.
+- **Challenge pages.** A row whose `payload_sha1` is in `[recrawl] challenge_sha1` is a
+  shared bot-challenge page: one text under many URLs. On Host2 on 2026-11-08, 453,326
+  fetched docs on 7,595 hosts held the same "Client Challenge" page. Such a row counts
+  as a row without text, so an older real page of the same doc wins. A doc whose winner
+  is a challenge row is still indexed, with its URL and its prior but no `lang`, `title`,
+  `description` or `body`. The build reports these docs as `challenge_docs`. They are
+  not part of `fallback_docs`: `docs` minus both is the docs indexed from a text row of
+  their own. Only the hash decides. A short real page keeps its text, and so does a new
+  challenge page whose hash is not in the list yet. An empty list turns the rule off.
+  The effect on the golden hit rate is not measured yet.
 - **Document.** `_id` is the doc id in decimal. `url` and `lang` are stored; `title`,
   `description` and `body` are full text, and `body` is left out of `_source`. The body
   is indexed without positions (`index_options: freqs`): BM25 needs only term counts,

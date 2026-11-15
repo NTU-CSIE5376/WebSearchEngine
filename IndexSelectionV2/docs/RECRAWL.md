@@ -65,7 +65,9 @@ the batch-20 list.
   text, and a `payload_sha1` not in `challenge_sha1`. `waf_202` is the fetched 202s.
 - These docs stay `fetched`, on the list and in the index. On the dev half of golden
   batches 20 and 21, 202 docs still hit at 0.533 and 0.426, through URL terms and list
-  rank. Their outcome, retry and host
+  rank. The text index also reads `challenge_sha1`: a doc whose page is one of these
+  hashes is indexed by its URL and rank, without the page's text (§13). Their outcome,
+  retry and host
   handling do not change: PR #29 removed the blanket 202/403 host block, because host
   probing starved healthy URLs.
 - Round 6 (2026-11-01, `index-selection` experiment 2026-10-29, with that isel wait):
@@ -581,6 +583,11 @@ engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
   text. Such docs still hit: the WAF 202 docs, with no title and no body, hit at 0.533
   and 0.426 on the dev halves of golden batches 20 and 21, through URL terms and list
   rank. The build reports these docs as `fallback_docs`; `prior_docs` counts them too.
+- **Shared challenge pages.** A fetched doc whose newest page is a shared bot-challenge
+  page (`challenge_sha1`, §3) is indexed the same way: its URL and rank, no text. An
+  older real page of the doc is used instead when there is one. Before, 453,326 docs
+  carried the same "Client Challenge" title and body. The build reports them as
+  `challenge_docs`. The effect on the golden hit rate is not measured yet.
 
 Not built yet, for Host2 after WebCrawler#84 is deployed:
 
