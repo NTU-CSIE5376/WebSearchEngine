@@ -440,6 +440,22 @@ def test_a_crawlerdb_title_shared_by_too_many_docs_is_dropped_and_the_anchor_kep
     assert counts == [3, 1, 3, 0, 4]
 
 
+def test_a_crawlerdb_anchor_shared_by_too_many_docs_is_dropped_and_the_title_kept(cfg, tmp_path):
+    from isel.io import open_duckdb
+
+    root, prior = _textless_docs(tmp_path)
+    _crawlerdb_text(tmp_path / "crawlerdb" / "part-00000.parquet", [
+        (2, "Horoscope: Leo", "Menu"), (3, None, "Menu"), (5, "Tart", "Menu"),
+        (7, None, "sour"), (8, "Vinegar", "sour")])
+    *counts, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10, prior,
+                                  [CHALLENGE_SHA1], tmp_path / "crawlerdb", 2)
+    rows = {r["doc_id"]: (r["title"], r["anchor"]) for r in reader.read_all().to_pylist()}
+    # Three docs carry the first anchor, one more than allowed; doc 3 is left with nothing.
+    assert rows == {1: ("own", None), 2: ("Horoscope: Leo", None), 3: (None, None),
+                    5: ("Tart", None), 7: (None, "sour"), 8: ("Vinegar", "sour")}
+    assert counts == [3, 1, 3, 0, 4]
+
+
 def test_build_indexes_the_crawlerdb_text_and_counts_its_docs(cfg, stub, tmp_path):
     root, prior = _textless_docs(tmp_path)
     cfg = replace(replace(cfg, "recrawl", challenge_sha1=[CHALLENGE_SHA1]), "text_index",

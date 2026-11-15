@@ -64,10 +64,11 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
     local pick of the docs. The report counts the docs wanted and found, those with a
     title and with an anchor, the queries, the seconds of the lookups and of the run.
   - The build joins the dataset onto the docs without text and fills `title` and the
-    field `anchor`. A doc with text of its own never takes crawlerdb text. A title on
-    more than `crawlerdb_title_max_docs` of these docs is dropped: the crawler stored a
-    challenge or error page there, such as "Just a moment...". Its docs keep their
-    anchor. The build reports `crawlerdb_text_docs`, the docs that took a title or an
+    field `anchor`. A doc with text of its own never takes crawlerdb text. A title or
+    an anchor on more than `crawlerdb_text_max_docs` of these docs is dropped, each on its
+    own. Such a title is a challenge or error page the crawler stored, such as "Just a
+    moment...". Such an anchor is a navigation link, such as "Menu": crawlerdb keeps only
+    the first anchor of a page. The build reports `crawlerdb_text_docs`, the docs that took a title or an
     anchor. They are still counted in `fallback_docs`, `challenge_docs` or the text
     docs, as before. With `crawlerdb_text_root` unset or empty the build is as before
     and the count is 0.

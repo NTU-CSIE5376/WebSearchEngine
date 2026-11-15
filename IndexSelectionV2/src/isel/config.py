@@ -290,7 +290,7 @@ class TextIndexCfg:
     prior_boost: float
     prior_depth: int
     crawlerdb_text_root: str
-    crawlerdb_title_max_docs: int
+    crawlerdb_text_max_docs: int
     crawlerdb_text_chunk: int
     crawlerdb_anchor_chars: int
     crawlerdb_text_file_rows: int
@@ -619,7 +619,7 @@ def _validate_text_index(cfg: Config, need: Any) -> None:
     need(t.prior_depth >= t.fetch_k, "text_index.prior_depth must be >= fetch_k")
     need(min(t.prior_scale, t.prior_scaling_factor) > 0,
          "text_index.prior_scale and prior_scaling_factor must be > 0")
-    need(min(t.crawlerdb_title_max_docs, t.crawlerdb_text_chunk, t.crawlerdb_anchor_chars,
+    need(min(t.crawlerdb_text_max_docs, t.crawlerdb_text_chunk, t.crawlerdb_anchor_chars,
              t.crawlerdb_text_file_rows) > 0,
          "text_index crawlerdb sizes and counts must be > 0")
     need(t.crawlerdb_text_max_minutes >= 0,

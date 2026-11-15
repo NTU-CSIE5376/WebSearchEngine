@@ -388,9 +388,11 @@ crawlerdb_text_root = ""                 # crawlerdb's title and anchor text of 
                                          # anchor. text-index-crawlerdb-text writes it and a
                                          # build reads it; "" or no file leaves those docs
                                          # with their URL alone. Host-specific (host2.toml)
-crawlerdb_title_max_docs = 100           # a crawlerdb title on more docs than this is a
-                                         # challenge or error page the crawler stored ("Just
-                                         # a moment..."); the build drops it. Not tuned yet
+crawlerdb_text_max_docs = 100            # the build drops a crawlerdb title or anchor on more
+                                         # docs than this: a challenge page's title ("Just a
+                                         # moment...") or a navigation link ("Menu"). In a
+                                         # 1.86M-doc trial it dropped 46 titles (16,400 docs)
+                                         # and 513 anchors (413,832 docs). Not tuned yet
 crawlerdb_text_chunk = 2000              # URLs per crawlerdb lookup, one primary-key read
 crawlerdb_anchor_chars = 200             # anchor text kept per doc
 crawlerdb_text_file_rows = 1000000       # docs per Parquet file of the dataset

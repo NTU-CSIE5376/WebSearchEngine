@@ -273,12 +273,13 @@ def pick_docs(con: duckdb.DuckDBPyConnection, text_root: Path, prior_file: str =
 
 
 def _take_crawlerdb_text(con: duckdb.DuckDBPyConnection, root: Path | None,
-                         title_max_docs: int) -> int:
+                         max_docs: int) -> int:
     """Fills the temp table `crawlerdb_text` for the docs of `TEXTLESS`; returns its rows.
 
     A row is the title and anchor text a doc takes from the dataset under `root`. A title
-    on more than `title_max_docs` of these docs is dropped: it is a challenge or error page
-    that the crawler stored, such as "Just a moment...". Its docs keep their anchor.
+    or an anchor on more than `max_docs` of these docs is dropped, each on its own. Such a
+    title is a challenge or error page that the crawler stored ("Just a moment..."), and
+    such an anchor is a navigation link ("Menu"): crawlerdb keeps only the first anchor.
     """
     found = "(SELECT NULL::UBIGINT AS doc_id, NULL AS title, NULL AS anchor WHERE false)"
     if root is not None and next(root.glob("*.parquet"), None) is not None:
@@ -287,17 +288,21 @@ def _take_crawlerdb_text(con: duckdb.DuckDBPyConnection, root: Path | None,
         WITH found AS MATERIALIZED (
             SELECT f.doc_id, f.title::VARCHAR AS title, f.anchor::VARCHAR AS anchor
             FROM {found} f SEMI JOIN ({TEXTLESS}) t ON f.doc_id = t.doc_id),
-        shared AS (SELECT title FROM found GROUP BY title HAVING count(*) > {int(title_max_docs)})
-        SELECT f.doc_id, CASE WHEN s.title IS NULL THEN f.title END AS title, f.anchor
-        FROM found f LEFT JOIN shared s ON f.title = s.title
-        WHERE (f.title IS NOT NULL AND s.title IS NULL) OR f.anchor IS NOT NULL""")
+        kept AS (
+            SELECT doc_id,
+                   CASE WHEN count(*) OVER (PARTITION BY title) <= {int(max_docs)}
+                        THEN title END AS title,
+                   CASE WHEN count(*) OVER (PARTITION BY anchor) <= {int(max_docs)}
+                        THEN anchor END AS anchor
+            FROM found)
+        SELECT * FROM kept WHERE title IS NOT NULL OR anchor IS NOT NULL""")
     (docs,) = con.execute("SELECT count(*) FROM crawlerdb_text").fetchone()
     return int(docs)
 
 
 def latest_docs(con: duckdb.DuckDBPyConnection, text_root: Path, batch_rows: int,
                 prior_file: str = "", challenge_sha1: Sequence[str] = (),
-                crawlerdb_text_root: Path | None = None, crawlerdb_title_max_docs: int = 0,
+                crawlerdb_text_root: Path | None = None, crawlerdb_text_max_docs: int = 0,
                 ) -> tuple[int, int, int, int, int, pa.RecordBatchReader]:
     """One row per doc to index, as `pick_docs` picks them.
 
@@ -311,7 +316,7 @@ def latest_docs(con: duckdb.DuckDBPyConnection, text_root: Path, batch_rows: int
     """
     texts, challenges, url_only, off_list, files = pick_docs(con, text_root, prior_file,
                                                              challenge_sha1)
-    crawlerdb_texts = _take_crawlerdb_text(con, crawlerdb_text_root, crawlerdb_title_max_docs)
+    crawlerdb_texts = _take_crawlerdb_text(con, crawlerdb_text_root, crawlerdb_text_max_docs)
     own = ", ".join("s.url" if f == "url" else f"CASE WHEN NOT w.win.c THEN s.{f} END AS {f}"
                     for f in DOC_FIELDS)
     bare = ", ".join(f if f == "url" else f"NULL AS {f}" for f in DOC_FIELDS)
@@ -605,7 +610,7 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
             texts, challenges, url_only, off_list, crawlerdb_texts, batches = latest_docs(
                 con, text_root, t.read_batch_rows, prior_file, cfg.recrawl.challenge_sha1,
                 Path(t.crawlerdb_text_root) if t.crawlerdb_text_root else None,
-                t.crawlerdb_title_max_docs)
+                t.crawlerdb_text_max_docs)
             if prior_file and not texts:
                 raise TextIndexError(f"no doc of {text_root} is on the list of {prior_file}")
             rows = texts + url_only
