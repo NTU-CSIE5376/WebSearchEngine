@@ -208,6 +208,7 @@ def test_crawlerdb_text_reads_the_title_and_anchor_of_the_docs_without_text(cfg,
     assert {k: report[k] for k in ("docs_wanted", "docs_found", "with_title", "with_anchor",
                                    "stopped")} == {
         "docs_wanted": 4, "docs_found": 3, "with_title": 2, "with_anchor": 2, "stopped": False}
-    assert {**again, "seconds": 0} == {**report, "seconds": 0}
+    timings = {"seconds": 0, "lookup_seconds": 0}
+    assert {**again, **timings} == {**report, **timings}
     assert kept == len(stored)
     assert "Index Scan" in plan and "crawlerdb_text_" in plan and "Seq Scan" not in plan, plan
