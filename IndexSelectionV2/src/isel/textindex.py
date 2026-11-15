@@ -59,6 +59,7 @@ from isel.io import (
     utc_id,
     write_parquet_atomic,
 )
+from isel.urlnorm import md5_number_lower, url_words
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ RETRY_STATUS = (429, 503)
 RESEND_STATUS = (None, *RETRY_STATUS)
 DOC_FIELDS = ("url", "lang", "title", "description", "body")
 TEXT_FIELDS = ("title", "description", "body")
+URL_WORDS_FIELD = "url_words"          # the decoded URL: searched, never returned
 # The selection model's list rank as a static score, the `rank_feature` of the mapping.
 PRIOR_FIELD = "sel_prior"
 LIVE_PRIOR = "live"                    # prior_file value: the live run's manifest
@@ -170,6 +172,7 @@ def bulk_payloads(batches: Iterable[pa.RecordBatch], max_bytes: int,
 
     A row's `prior_rank` becomes `prior_scale / (rank + 1)`: a `rank_feature` must be
     positive and larger must mean better. A row without a rank gets no such field.
+    `url_words` is the row's URL with its escapes and IDN labels decoded.
     """
     parts: list[bytes] = []
     size = 0
@@ -177,6 +180,8 @@ def bulk_payloads(batches: Iterable[pa.RecordBatch], max_bytes: int,
         for row in batch.to_pylist():
             doc = {"doc_id": row["doc_id"],
                    **{f: row[f] for f in DOC_FIELDS if row[f] is not None}}
+            if row["url"] is not None:
+                doc[URL_WORDS_FIELD] = url_words(row["url"])
             rank = row.get("prior_rank")
             if rank is not None:
                 doc[PRIOR_FIELD] = prior_scale / (rank + 1)
@@ -363,10 +368,7 @@ def _check_fields(properties: dict[str, Any], t: TextIndexCfg) -> None:
     analyzers = {}
     for spec in t.fields:
         name = spec.partition("^")[0]
-        top, _, sub = name.partition(".")
-        field = properties.get(top, {})
-        if sub:
-            field = field.get("fields", {}).get(sub, {})
+        field = properties.get(name, {})
         if field.get("type") != "text":
             raise TextIndexError(f"text_index.fields: {name} is not a text field of the index")
         analyzers[name] = field.get("analyzer", "default")
@@ -702,7 +704,6 @@ def evaluate_golden(cfg: Config, client: OpenSearch, batch_id: int,
     """Recall@k of one golden batch: each keyword's top k against its golden URLs."""
     from isel.golden import read_golden
     from isel.rankeval import run_eval
-    from isel.urlnorm import md5_number_lower
 
     t = cfg.text_index
     mapping = client.call("GET", f"/{t.alias}/_mapping", resend=True)

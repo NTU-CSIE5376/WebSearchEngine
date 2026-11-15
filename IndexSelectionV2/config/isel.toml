@@ -339,7 +339,7 @@ alias = "isel-text"                      # searches go through the alias; each b
 settings_file = "config/text_index/icu.json"   # index settings and mappings
 shards = 1                               # primary shards of a new index; host-specific
 query_type = "best_fields"               # the best field's BM25; or most_fields, combined_fields
-fields = ["title^2", "description", "body", "url.text^2"]   # tuned on golden batch 20, the
+fields = ["title^2", "description", "body", "url_words^2"]  # tuned on golden batch 20, the
                                          # URL weight on 51M docs; combined_fields needs one
                                          # analyzer and weights >= 1
 k = 10                                   # hits per query: the metric's top 10

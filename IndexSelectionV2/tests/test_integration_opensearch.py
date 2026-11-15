@@ -20,7 +20,7 @@ from isel.golden import GOLDEN_SCHEMA, golden_path
 from isel.io import write_parquet_atomic
 from isel.recrawl import TEXT_SCHEMA
 from isel.textindex import OpenSearch, build, evaluate_golden, query_body, search
-from isel.urlnorm import canonicalize, md5_number_lower
+from isel.urlnorm import canonicalize, md5_number_lower, url_words
 
 pytestmark = pytest.mark.opensearch
 
@@ -118,9 +118,9 @@ def test_build_search_and_eval(node, tmp_path):
     # "प्रधान" is indexed as "परधान", the same on the query side.
     assert _tokens(client, index, "प्रधान") == ["परधान"]
     assert _tokens(client, index, "Müller") == ["muller"]
-    # Percent escapes vanish whole, so an encoded path leaves no hex fragments.
-    assert _tokens(client, index, "https://ja.example.org/wiki/%E6%9D%B1%E4%BA%AC_2020-Games",
-                   "url") == ["https", "ja", "example", "org", "wiki", "2020", "games"]
+    slug = url_words("https://ja.example.org/wiki/%E6%9D%B1%E4%BA%AC_2020-Games")
+    assert _tokens(client, index, slug, "url") == [
+        "https", "ja", "example", "org", "wiki", "\u6771\u4eac", "2020", "games"]
 
     t = cfg.text_index
     for url, _, title, _, _ in DOCS:
@@ -275,3 +275,30 @@ def test_a_shared_challenge_page_is_found_by_its_url_not_by_its_text(node, tmp_p
     assert build(plain, client, root, datetime(2026, 10, 27, tzinfo=UTC))["challenge_docs"] == 0
     found, _ = search(client, plain.text_index, "enable JavaScript to proceed")
     assert set(found) == {ids[d[0]] for d in blocked}
+
+
+def test_the_words_of_an_encoded_url_find_its_doc(node, tmp_path):
+    slugs = [f"https://shop.example.com/bills-vs-rams/{n}" for n in range(3)]
+    urls = {"cjk": "https://ja.example.org/wiki/%E6%9D%B1%E4%BA%AC",
+            "idn": "https://xn--wgv71a119e.example/",
+            "other": "https://www.other.example/bills-vs-rams"}
+    doc_id = {name: str(md5_number_lower(canonicalize(u))) for name, u in urls.items()}
+    root = tmp_path / "text"
+    write_parquet_atomic(_text([(u, "en", "page", None, "nothing to match")
+                                for u in [*urls.values(), *slugs]],
+                               datetime(2026, 10, 20, tzinfo=UTC)), root / "job-1.parquet")
+    cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
+                  alias="isel-text-url-words", host_cap=2,
+                  settings_file=str(ROOT / "config/text_index/icu.json"))
+    client = OpenSearch(node, 60.0, 2, 1.0)
+    index = build(cfg, client, root, datetime(2026, 10, 25, tzinfo=UTC))["index"]
+
+    t = cfg.text_index
+    assert search(client, t, "\u6771\u4eac")[0] == [doc_id["cjk"]]
+    assert search(client, t, "\u65e5\u672c\u8a9e")[0] == [doc_id["idn"]]
+    # The cap reads the stored URL: two of the shop's three pages, and the other host.
+    ids, _ = search(client, t, "rams")
+    shop = {str(md5_number_lower(canonicalize(u))) for u in slugs}
+    assert len(ids) == 3 and doc_id["other"] in ids and len(shop & set(ids)) == 2
+    stored = client.call("GET", f"/{index}/_doc/{doc_id['cjk']}")["_source"]
+    assert stored["url"] == urls["cjk"] and "url_words" not in stored

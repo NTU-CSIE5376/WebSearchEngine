@@ -83,8 +83,16 @@ def test_bulk_payloads_split_by_bytes_and_keep_u64_ids():
     assert len(payloads[0]) == cap and len(payloads[1]) > cap
     assert payloads[0].startswith(b'{"index":{"_id":"18446744073709551615"}}\n')
     doc = _lines(payloads[0])[1]
-    assert set(doc) == {"doc_id", "url", "lang", "title", "body"}  # no null field
+    assert set(doc) == {"doc_id", "url", "url_words", "lang", "title", "body"}  # no null field
     assert doc["doc_id"] == big_id
+
+
+def test_bulk_payloads_spell_the_url_for_search_and_keep_it_as_stored():
+    url = "https://xn--wgv71a119e.jp/wiki/%E6%9D%B1%E4%BA%AC"
+    batch = pa.RecordBatch.from_pylist([{**_row(1), "url": url}], schema=TEXT_SCHEMA)
+    doc = _lines(next(bulk_payloads([batch], 10**6, 1e9)))[1]
+    assert doc["url"] == url                         # the host cap and the display read it
+    assert doc["url_words"] == "https://\u65e5\u672c\u8a9e.jp/wiki/\u6771\u4eac"
 
 
 def test_bulk_payloads_turn_the_rank_into_a_positive_prior():
@@ -364,14 +372,16 @@ def test_build_counts_the_challenge_docs_and_leaves_their_text_out(cfg, stub, tm
     assert (out["docs"], out["challenge_docs"], out["fallback_docs"],
             out["docs_off_list"]) == (5, 2, 1, 1)
     docs = stub.indices[out["index"]]["docs"]
-    assert docs["2"] == {"doc_id": 2, "url": "https://h2.example/", PRIOR_FIELD: 1e9 / 2}
+    assert docs["2"] == {"doc_id": 2, "url": "https://h2.example/",
+                         "url_words": "https://h2.example/", PRIOR_FIELD: 1e9 / 2}
     assert docs["1"]["title"] == "real"
 
     # Without a list every doc with a text row is indexed, the challenge docs by URL alone.
     out = build(cfg, _client(stub), root, datetime(2026, 10, 23, 2, tzinfo=UTC))
     assert (out["docs"], out["challenge_docs"], out["fallback_docs"]) == (5, 3, 0)
     docs = stub.indices[out["index"]]["docs"]
-    assert docs["6"] == {"doc_id": 6, "url": "https://h6.example/"}
+    assert docs["6"] == {"doc_id": 6, "url": "https://h6.example/",
+                         "url_words": "https://h6.example/"}
     assert docs["4"]["body"] == "hi"
 
 
@@ -389,7 +399,8 @@ def test_build_indexes_only_the_docs_on_the_list(cfg, stub, tmp_path):
     docs = stub.indices[out["index"]]["docs"]
     assert set(docs) == {"1", "9"} and PRIOR_FIELD in docs["1"]
     # The listed doc without text: its list URL and rank, nothing else.
-    assert docs["9"] == {"doc_id": 9, "url": vinegary, PRIOR_FIELD: 1e9 / 4}
+    assert docs["9"] == {"doc_id": 9, "url": vinegary, "url_words": vinegary,
+                         PRIOR_FIELD: 1e9 / 4}
 
 
 def test_build_stops_when_no_doc_is_on_the_list(cfg, stub, tmp_path):
@@ -643,9 +654,11 @@ def test_build_and_eval_reject_a_field_the_index_lacks(cfg, stub, tmp_path):
     build(cfg, _client(stub), root)
     with pytest.raises(TextIndexError, match="titel is not a text field"):
         evaluate_golden(bad, _client(stub), 20)
+    with pytest.raises(TextIndexError, match=r"url\.text is not a text field"):
+        build(replace(cfg, "text_index", fields=["title", "url.text^2"]), _client(stub), root)
     with pytest.raises(TextIndexError, match="one analyzer"):
         build(replace(cfg, "text_index", query_type="combined_fields",
-                      fields=["title", "url.text"]), _client(stub), root)
+                      fields=["title", "url_words"]), _client(stub), root)
 
 
 def test_eval_rejects_an_index_without_the_prior_field(cfg, stub):
