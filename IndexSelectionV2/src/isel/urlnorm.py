@@ -9,9 +9,10 @@ eTLD+1; a fixed override wins, else `int(md5(key), 16) % num_shards`.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Iterable, Mapping
 from functools import lru_cache
-from urllib.parse import quote, unquote_plus, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, unquote_plus, urlsplit, urlunsplit
 
 import tldextract
 from w3lib.url import canonicalize_url
@@ -22,6 +23,8 @@ HOST_RE = r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/?#]*@)?([^:/?#]+)"
 # "@" (pchar) and "/", plus "?" in a query or fragment, plus "%" so escapes stay as they are.
 PATH_SAFE = "!$&'()*+,;=:@/%"
 QUERY_SAFE = PATH_SAFE + "?"
+# An IDNA A-label of a netloc: `xn--` at the start of a host label, then punycode.
+A_LABEL_RE = re.compile(r"(?<![^.@])xn--([a-z0-9-]+)", re.IGNORECASE)
 
 
 def canonicalize(url: str) -> str:
@@ -81,6 +84,32 @@ def wire_url(url: str) -> str:
     if (path, query, fragment) == (parts.path, parts.query, parts.fragment):
         return url
     return urlunsplit(parts._replace(path=path, query=query, fragment=fragment))
+
+
+def _u_label(match: re.Match[str]) -> str:
+    try:
+        label = match[1].encode("ascii").decode("punycode")
+        label.encode("utf-8")  # punycode can spell a lone surrogate, which JSON cannot carry
+    except UnicodeError:
+        return match[0]
+    return label
+
+
+def url_words(url: str) -> str:
+    """Returns `url` spelled for search, or `url` itself if it cannot parse.
+
+    The canonical URL carries non-ASCII words as UTF-8 percent escapes and as `xn--`
+    host labels. Both are decoded here, so an analyzer sees the words. An escape that is
+    not UTF-8 becomes U+FFFD, and a label that is not punycode stays as it is. The result
+    is text to index, not a URL to fetch: a decoded `%2F` is a plain `/`.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    return urlunsplit(parts._replace(netloc=A_LABEL_RE.sub(_u_label, parts.netloc),
+                                     path=unquote(parts.path), query=unquote(parts.query),
+                                     fragment=unquote(parts.fragment)))
 
 
 def md5_number_lower(text: str) -> int:

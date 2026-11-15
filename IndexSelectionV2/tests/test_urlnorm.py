@@ -13,6 +13,7 @@ from isel.urlnorm import (
     lookup_urls,
     md5_number_lower,
     strip_srsltid,
+    url_words,
     wire_url,
 )
 
@@ -101,3 +102,33 @@ def test_lookup_urls_add_only_the_srsltid_variant():
     assert lookup_urls("https://a.com/p?utm_source=x") == ["https://a.com/p?utm_source=x"]
     golden = canonicalize(f"https://a.com/p?srsltid={TOKEN}&id=1")
     assert lookup_urls(golden) == [golden, "https://a.com/p?id=1"]
+
+
+@pytest.mark.parametrize(("url", "words"), [
+    ("https://ja.wikipedia.org/wiki/%E6%9D%B1%E4%BA%AC", "https://ja.wikipedia.org/wiki/\u6771\u4eac"),
+    ("https://x.com/caf%C3%A9?q=%E4%B8%AD#%E6%96%87", "https://x.com/caf\u00e9?q=\u4e2d#\u6587"),
+    ("https://xn--wgv71a119e.jp/a", "https://\u65e5\u672c\u8a9e.jp/a"),
+    ("https://www.xn--mnchen-3ya.de:8080/", "https://www.m\u00fcnchen.de:8080/"),
+    # Not punycode: the label stays, and the rest is still decoded.
+    ("https://xn--!!.example/%C3%A9", "https://xn--!!.example/\u00e9"),
+    ("https://xn--99999999999999999999.example/", "https://xn--99999999999999999999.example/"),
+    # Punycode for a lone surrogate, which a bulk request could not encode.
+    ("https://xn--ib9b.example/", "https://xn--ib9b.example/"),
+    # Not UTF-8: one U+FFFD each, which no analyzer keeps as a word.
+    ("https://x.com/a%FFb/%E6%9D", "https://x.com/a\ufffdb/\ufffd"),
+    ("https://x.com/s?q=new+york%20city%2Bguide", "https://x.com/s?q=new+york city+guide"),
+    ("http://[bad/%C3%A9", "http://[bad/%C3%A9"),
+])
+def test_url_words_decodes_escapes_and_idn_labels(url, words):
+    assert url_words(url) == words
+
+
+@pytest.mark.parametrize("url", [
+    "https://news.example.com/olympics/2020-Games_x?a=1&b=2#top",
+    "https://u:p@x.com:8080/~a/b-c_d.e/!$&'()*+,;=:@",
+    "https://www.espn.com/nfl/story/_/id/123/bills-vs-rams-highlights-week-5",
+    "http://[2001:db8::1]:80/a",
+    "https://x.com",
+])
+def test_url_words_keeps_an_ascii_url(url):
+    assert url_words(url) == url
