@@ -66,6 +66,19 @@ def cfg(base_cfg, tmp_path, monkeypatch, yb_dsn):
     return replace(cfg, "full", hash_chunks=8, chunks_per_file=3, min_free_gb=0.0)
 
 
+def test_a_role_without_superuser_opens_a_crawlerdb_session(cfg, yb_dsn, monkeypatch):
+    with psycopg.connect(yb_dsn, autocommit=True) as conn:
+        conn.execute("CREATE ROLE isel_plain LOGIN NOSUPERUSER")
+    monkeypatch.setenv(cfg.crawlerdb.dsn_env, yb_dsn.replace("yugabyte@", "isel_plain@"))
+    session = open_crawlerdb(cfg)
+    session.guard = ReadGuard(cfg.guard, session.io_waiters, now=lambda: ALLOWED)
+    try:
+        assert session.fetchone("SELECT current_setting('default_transaction_read_only')") == (
+            "on",)
+    finally:
+        session.close()
+
+
 def _session(cfg):
     session = open_crawlerdb(cfg)
     session.guard = ReadGuard(cfg.guard, session.io_waiters, now=lambda: ALLOWED)

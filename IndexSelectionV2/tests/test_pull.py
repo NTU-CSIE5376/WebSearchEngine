@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import psycopg
 import pyarrow.parquet as pq
 import pytest
 from conftest import replace
@@ -21,10 +22,12 @@ class FakeSession:
     """Answers the catalog query `pull` sends; COPY returns `csv` for every chunk."""
 
     def __init__(self, failing: set[str] = frozenset(), csv: bytes = b"",
-                 broken: set[str] = frozenset(), restarts: dict[str, int] | None = None):
+                 broken: set[str] = frozenset(), restarts: dict[str, int] | None = None,
+                 copies_before_drop: int | None = None):
         self.failing = set(failing)
         self.broken = set(broken)   # tables whose COPY raises a non-retryable error
         self.restarts = dict(restarts or {})   # serialization failures left per table
+        self.copies_before_drop = copies_before_drop
         self.queries: list[str] = []
         self.csv = csv
         self.timeout_s = 120
@@ -43,6 +46,8 @@ class FakeSession:
     def copy_bytes(self, query):
         assert_read_only_sql(query)
         self.copies.append((query, self.timeout_s))
+        if self.copies_before_drop is not None and len(self.copies) > self.copies_before_drop:
+            raise psycopg.OperationalError("server closed the connection unexpectedly")
         if any(f"FROM {table} " in query for table in self.failing):
             raise errors.QueryCanceled("canceling statement due to statement timeout")
         if any(f"FROM {table} " in query for table in self.broken):
@@ -164,6 +169,15 @@ def test_a_broken_session_stops_the_export_and_raises(tmp_path, base_cfg):
     with pytest.raises(RuntimeError, match="closed the connection"):
         pull_full(cfg, [broken, FakeSession()], tmp_path, now=T0)
     assert "finished_at" not in read_json(tmp_path / "_meta.json")
+
+
+def test_an_export_cut_off_in_its_first_shard_keeps_its_start(tmp_path, base_cfg):
+    cfg = _cfg(base_cfg)
+    session = FakeSession(copies_before_drop=cfg.full.chunks_per_file)
+    with pytest.raises(psycopg.OperationalError):
+        pull_full(cfg, [session], tmp_path, now=T0)
+    assert list((tmp_path / "shard=000").glob("part-*.parquet"))
+    assert read_json(tmp_path / "_meta.json")["started_at"] == T0.isoformat()
 
 
 def test_every_chunk_charges_its_csv_bytes_to_the_shared_rate(tmp_path, base_cfg):

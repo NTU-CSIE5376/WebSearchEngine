@@ -142,6 +142,19 @@ def test_plan_skips_a_cycle_that_missed_swap_by(cfg, w):
     assert decision == Finish(Status.SKIPPED_LATE, S.SCORED)
 
 
+def test_plan_keeps_the_previous_export_when_a_cycle_begins_too_late(cfg, w):
+    old = evidence_through(None)
+    assert plan(w, old, Outcome(G), w.clear_by - timedelta(minutes=1), cfg.refresh) == Run(
+        S.CLEAR, w.swap_by)
+    assert plan(w, old, Outcome(G), w.clear_by, cfg.refresh) == Finish(Status.SKIPPED_LATE,
+                                                                       S.CLEAR)
+
+
+def test_plan_goes_on_after_clear_by_once_the_previous_export_is_gone(cfg, w):
+    assert plan(w, evidence_through(S.CLEAR), Outcome(G), w.clear_by, cfg.refresh) == Run(
+        S.GOLDEN, w.swap_by)
+
+
 def test_plan_follows_a_live_run_of_this_cycle_after_swap_by(cfg, w):
     # A swap that committed before a crash: the frontier must still follow.
     decision = plan(w, evidence_through(S.SWAP), Outcome(G), _at(12, 1, 11, 10), cfg.refresh)
@@ -542,6 +555,16 @@ def test_tick_leaves_a_renamed_outcome_file_alone(cfg, db):
     assert refresh.outcome_path(cfg, G).exists()
 
 
+def test_tick_a_late_first_start_leaves_the_previous_export_on_disk(cfg, db):
+    build_disk(cfg.work_dir, S.SELECTION, started="2026-11-14T03:00:00+00:00")
+    late = window(G, cfg).clear_by
+    result = tick(cfg, lambda: late, _never)
+    assert result.decision == Finish(Status.SKIPPED_LATE, S.CLEAR)
+    assert read_outcome(cfg, G).status is Status.SKIPPED_LATE
+    assert (cfg.work_dir / "full" / "export" / "_meta.json").exists()
+    assert (cfg.work_dir / "full" / "scored" / "_meta.json").exists()
+
+
 def test_tick_writes_the_terminal_outcome_once(cfg, db):
     # 2026-12-01 11:00 is swap_by and nothing was built.
     result = tick(cfg, lambda: _at(12, 1, 11), _never)
@@ -794,11 +817,22 @@ def test_the_export_step_waits_for_missing_shards(cfg, w, monkeypatch):
     assert calls == [(cfg.full.connections, _at(11, 29, 3))] * 2 and opened == []
 
 
+REFUSED_AT = 'connection failed: connection to server at "172.16.191.3", port 5433 failed: '
+LOST = REFUSED_AT + "Connection refused\n\tIs the server running on that host?"
+
+
 @pytest.mark.parametrize("connect_error, export_error, result", [
-    ("connection refused", None, Deferred()),
+    (LOST, None, Deferred()),
+    (REFUSED_AT + "FATAL:  the database system is starting up", None, Deferred()),
+    (REFUSED_AT + "FATAL:  sorry, too many clients already", None, Deferred()),
+    (REFUSED_AT + 'FATAL:  permission denied to set parameter "temp_file_limit"', None,
+     Failed("OperationalError")),
+    (REFUSED_AT + 'FATAL:  password authentication failed for user "crawler"', None,
+     Failed("OperationalError")),
     (None, "terminating connection due to administrator command", Deferred()),
     (None, "permission denied for table", Failed("InsufficientPrivilege")),
-])
+], ids=["refused", "starting_up", "too_many_clients", "temp_file_limit", "password",
+        "admin_shutdown", "privilege"])
 def test_the_export_step_resumes_after_a_lost_connection(cfg, w, monkeypatch, connect_error,
                                                          export_error, result):
     import psycopg
@@ -828,6 +862,30 @@ def test_the_export_step_resumes_after_a_lost_connection(cfg, w, monkeypatch, co
     job = Job(cfg, w, evidence_through(S.DIMS), lambda: _at(11, 29, 3))
     assert execute(refresh.STEP[S.EXPORT].act, job) == result
     assert opened == []
+
+
+@pytest.mark.parametrize("step, module, opener", [
+    (S.GOLDEN, "isel.pg", "open_metricdb"),
+    (S.DIMS, "isel.pg", "open_crawlerdb"),
+    (S.PUBLISH, "isel.selectdb", "connect"),
+], ids=["golden", "dims", "publish"])
+@pytest.mark.parametrize("error, result", [
+    (LOST, Deferred()),
+    (REFUSED_AT + 'FATAL:  password authentication failed for user "isel"',
+     Failed("OperationalError")),
+], ids=["lost", "password"])
+def test_every_database_step_waits_out_a_lost_connection(cfg, w, monkeypatch, step, module,
+                                                         opener, error, result):
+    import importlib
+
+    import psycopg
+
+    def refuse(*args, **kwargs):
+        raise psycopg.OperationalError(error)
+
+    monkeypatch.setattr(importlib.import_module(module), opener, refuse)
+    job = Job(cfg, w, evidence_through(S.GATES), lambda: _at(11, 29, 3))
+    assert execute(refresh.STEP[step].act, job) == result
 
 
 @pytest.mark.parametrize("answer, result", [
