@@ -114,10 +114,10 @@ def test_latest_docs_keeps_the_newest_row_of_each_doc(cfg, tmp_path):
     from isel.io import open_duckdb
 
     con = open_duckdb(cfg, tmp_path / "tmp")
-    texts, _, url_only, off_list, reader = latest_docs(con, root, 10)
+    texts, _, url_only, off_list, _, reader = latest_docs(con, root, 10)
     table = reader.read_all()
     assert (texts, url_only, off_list) == (2, 0, 0)
-    assert table.column_names == ["doc_id", *DOC_FIELDS, "prior_rank"]
+    assert table.column_names == ["doc_id", *DOC_FIELDS, "anchor", "prior_rank"]
     # doc 2 ties on fetched_at: the larger file name (job-2) wins.
     assert sorted(zip(table["doc_id"].to_pylist(), table["title"].to_pylist(),
                       strict=True)) == [(1, "new"), (2, "b")]
@@ -267,14 +267,14 @@ def test_latest_docs_keeps_only_listed_docs_at_their_best_rank(cfg, tmp_path):
                       "url": ["u", "v", "w", "x"]})
     write_parquet_atomic(prior, tmp_path / "list" / "run=r" / "index_shard=00.parquet")
     glob = str(tmp_path / "list" / "run=r" / "index_shard=*.parquet")
-    texts, _, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"),
+    texts, _, url_only, off_list, _, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"),
                                                        root, 10, glob)
     table = reader.read_all()
     assert (texts, url_only, off_list) == (2, 1, 1) and table.num_rows == 3
     got = dict(zip(table["doc_id"].to_pylist(), table["prior_rank"].to_pylist(), strict=True))
     assert got == {1: 5, 2: 0, 9: 3}
     # Without a prior every doc stays, with no rank.
-    texts, _, url_only, off_list, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"),
+    texts, _, url_only, off_list, _, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"),
                                                        root, 10)
     assert (texts, url_only, off_list, reader.read_all()["prior_rank"].null_count) == (3, 0, 0, 3)
 
@@ -294,12 +294,12 @@ def test_latest_docs_adds_url_only_docs_for_listed_docs_without_text(cfg, tmp_pa
                               "https://merriam-webster.com/dictionary/vinegary",
                               "https://natalie.mu/music/news/1"]})
     write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
-    texts, _, url_only, off_list, reader = latest_docs(
+    texts, _, url_only, off_list, _, reader = latest_docs(
         open_duckdb(cfg, tmp_path / "tmp"), root, 10, str(tmp_path / "list" / "s.parquet"))
     rows = {r.pop("doc_id"): r for r in reader.read_all().to_pylist()}
     assert (texts, url_only, off_list) == (2, 2, 1)
     assert sorted(rows) == [1, 2, 5, 7]
-    no_text = dict.fromkeys(("lang", "title", "description", "body"))
+    no_text = dict.fromkeys(("lang", "title", "description", "body", "anchor"))
     assert rows[5] == {"url": "https://merriam-webster.com/dictionary/vinegary",
                        **no_text, "prior_rank": 3}
     assert rows[7] == {"url": "https://natalie.mu/music/news/1", **no_text, "prior_rank": 1}
@@ -324,9 +324,9 @@ def test_latest_docs_keeps_a_challenge_doc_without_the_challenge_text(cfg, tmp_p
 
     root = tmp_path / "text"
     _challenge_text(root)
-    no_text = dict.fromkeys(("lang", "title", "description", "body"))
+    no_text = dict.fromkeys(("lang", "title", "description", "body", "anchor"))
     con = open_duckdb(cfg, tmp_path / "tmp")
-    texts, challenges, url_only, off_list, reader = latest_docs(
+    texts, challenges, url_only, off_list, _, reader = latest_docs(
         con, root, 10, challenge_sha1=[CHALLENGE_SHA1, "d" * 40])
     rows = {r.pop("doc_id"): r for r in reader.read_all().to_pylist()}
     assert (texts, challenges, url_only, off_list) == (5, 3, 0, 0)
@@ -342,7 +342,7 @@ def test_latest_docs_keeps_a_challenge_doc_without_the_challenge_text(cfg, tmp_p
                       "rank": pa.array([0, 1, 2, 3, 4], pa.int64()),
                       "url": [f"https://list.example/{n}" for n in (1, 2, 3, 4, 9)]})
     write_parquet_atomic(prior, tmp_path / "list" / "s.parquet")
-    texts, challenges, url_only, off_list, reader = latest_docs(
+    texts, challenges, url_only, off_list, _, reader = latest_docs(
         con, root, 10, str(tmp_path / "list" / "s.parquet"), [CHALLENGE_SHA1])
     rows = {r.pop("doc_id"): r for r in reader.read_all().to_pylist()}
     assert (texts, challenges, url_only, off_list) == (4, 2, 1, 1)
@@ -351,7 +351,7 @@ def test_latest_docs_keeps_a_challenge_doc_without_the_challenge_text(cfg, tmp_p
     assert (rows[1]["title"], rows[1]["prior_rank"]) == ("real", 0)
 
     # With no hash configured the page is a text row like any other: the newest row wins.
-    texts, challenges, url_only, off_list, reader = latest_docs(con, root, 10)
+    texts, challenges, url_only, off_list, _, reader = latest_docs(con, root, 10)
     rows = {r.pop("doc_id"): r for r in reader.read_all().to_pylist()}
     assert (texts, challenges, url_only, off_list) == (5, 0, 0, 0)
     assert [rows[n]["title"] for n in (1, 2, 4)] == ["Client Challenge", "Client Challenge",
@@ -383,6 +383,85 @@ def test_build_counts_the_challenge_docs_and_leaves_their_text_out(cfg, stub, tm
     assert docs["6"] == {"doc_id": 6, "url": "https://h6.example/",
                          "url_words": "https://h6.example/"}
     assert docs["4"]["body"] == "hi"
+
+
+def _crawlerdb_text(path: Path, rows: list[tuple[int, str | None, str | None]]) -> None:
+    ids, titles, anchors = zip(*rows, strict=True)
+    write_parquet_atomic(pa.table({"doc_id": pa.array(ids, pa.uint64()),
+                                   "title": pa.array(titles, pa.string()),
+                                   "anchor": pa.array(anchors, pa.string())}), path)
+
+
+def _textless_docs(tmp_path: Path) -> tuple[Path, str]:
+    """Doc 1 has a page. Docs 2 (challenge page), 3 (empty page) and 5, 7, 8 (no row) do not."""
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [
+        _row(1, title="own", body="own text"), _row(3, title=None, body=""),
+        _row(2, title="Client Challenge", body="Enable JavaScript.", payload_sha1=CHALLENGE_SHA1)])
+    listed = [1, 2, 3, 5, 7, 8]
+    write_parquet_atomic(pa.table({"doc_id": pa.array(listed, pa.uint64()),
+                                   "rank": pa.array(range(len(listed)), pa.int64()),
+                                   "url": [f"https://list.example/{n}" for n in listed]}),
+                         tmp_path / "list" / "s.parquet")
+    return root, str(tmp_path / "list" / "s.parquet")
+
+
+def test_only_a_doc_without_text_takes_the_crawlerdb_title_and_anchor(cfg, tmp_path):
+    from isel.io import open_duckdb
+
+    root, prior = _textless_docs(tmp_path)
+    _crawlerdb_text(tmp_path / "crawlerdb" / "part-00000.parquet", [
+        (1, "crawlerdb title", "crawlerdb anchor"), (2, "Horoscope: Leo", "leo today"),
+        (3, "VINEGARY Definition", None), (5, None, "tart"), (9, "off the list", "x")])
+    *counts, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10, prior,
+                                  [CHALLENGE_SHA1], tmp_path / "crawlerdb", 2)
+    rows = {r["doc_id"]: (r["title"], r["body"], r["anchor"])
+            for r in reader.read_all().to_pylist()}
+    # texts, challenges, URL-only, off the list, with crawlerdb text.
+    assert counts == [3, 1, 3, 0, 3]
+    assert rows == {1: ("own", "own text", None), 2: ("Horoscope: Leo", None, "leo today"),
+                    3: ("VINEGARY Definition", "", None), 5: (None, None, "tart"),
+                    7: (None, None, None), 8: (None, None, None)}
+
+
+def test_a_crawlerdb_title_shared_by_too_many_docs_is_dropped_and_the_anchor_kept(cfg, tmp_path):
+    from isel.io import open_duckdb
+
+    root, prior = _textless_docs(tmp_path)
+    _crawlerdb_text(tmp_path / "crawlerdb" / "part-00000.parquet", [
+        (2, "Just a moment...", "leo today"), (3, "Just a moment...", None),
+        (5, "Just a moment...", "tart"), (7, "Vinegar", None), (8, "Vinegar", "sour")])
+    *counts, reader = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), root, 10, prior,
+                                  [CHALLENGE_SHA1], tmp_path / "crawlerdb", 2)
+    rows = {r["doc_id"]: (r["title"], r["anchor"]) for r in reader.read_all().to_pylist()}
+    # Three docs carry the first title, one more than allowed; doc 3 is left with nothing.
+    assert rows == {1: ("own", None), 2: (None, "leo today"), 3: (None, None),
+                    5: (None, "tart"), 7: ("Vinegar", None), 8: ("Vinegar", "sour")}
+    assert counts == [3, 1, 3, 0, 4]
+
+
+def test_build_indexes_the_crawlerdb_text_and_counts_its_docs(cfg, stub, tmp_path):
+    root, prior = _textless_docs(tmp_path)
+    cfg = replace(replace(cfg, "recrawl", challenge_sha1=[CHALLENGE_SHA1]), "text_index",
+                  prior_file=prior, crawlerdb_text_root=str(tmp_path / "crawlerdb"))
+    # A root without files is the same as no root.
+    empty = build(cfg, _client(stub), root, datetime(2026, 10, 23, 1, tzinfo=UTC))
+    bare = stub.indices[empty["index"]]["docs"]
+    assert empty["crawlerdb_text_docs"] == 0
+    assert bare["5"] == {"doc_id": 5, "url": "https://list.example/5",
+                         "url_words": "https://list.example/5", PRIOR_FIELD: 1e9 / 4}
+
+    _crawlerdb_text(tmp_path / "crawlerdb" / "part-00000.parquet", [
+        (1, "crawlerdb title", "crawlerdb anchor"), (2, "Horoscope: Leo", "leo today"),
+        (5, None, "tart")])
+    out = build(cfg, _client(stub), root, datetime(2026, 10, 23, 2, tzinfo=UTC))
+    assert (out["docs"], out["rows"], out["challenge_docs"], out["fallback_docs"],
+            out["docs_off_list"], out["crawlerdb_text_docs"]) == (6, 6, 1, 3, 0, 2)
+    docs = stub.indices[out["index"]]["docs"]
+    assert docs["5"] == {**bare["5"], "anchor": "tart"}
+    assert docs["2"] == {**bare["2"], "title": "Horoscope: Leo", "anchor": "leo today"}
+    assert docs["1"] == bare["1"] and docs["7"] == bare["7"]
+    assert out["text_bytes"] == empty["text_bytes"] + len("Horoscope: Leoleo todaytart")
 
 
 def test_build_indexes_only_the_docs_on_the_list(cfg, stub, tmp_path):

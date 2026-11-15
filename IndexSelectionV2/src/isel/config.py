@@ -289,6 +289,8 @@ class TextIndexCfg:
     prior_score_mode: str
     prior_boost: float
     prior_depth: int
+    crawlerdb_text_root: str
+    crawlerdb_title_max_docs: int
 
 
 @dataclass(frozen=True)
@@ -613,6 +615,7 @@ def _validate_text_index(cfg: Config, need: Any) -> None:
     need(t.prior_depth >= t.fetch_k, "text_index.prior_depth must be >= fetch_k")
     need(min(t.prior_scale, t.prior_scaling_factor) > 0,
          "text_index.prior_scale and prior_scaling_factor must be > 0")
+    need(t.crawlerdb_title_max_docs > 0, "text_index.crawlerdb_title_max_docs must be > 0")
 
 
 def _validate_full(cfg: Config, need: Any) -> None:
