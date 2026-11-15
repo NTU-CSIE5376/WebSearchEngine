@@ -565,8 +565,8 @@ engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
 |---|---|
 | `_id` | the doc id; a hit matches a golden URL only by it. A golden URL that redirects is on the list under its own URL, so it still matches |
 | `doc_id` | the same id as doc values only; it breaks score ties, so every build returns the same top 10 |
-| `url` | displayed; its words are searchable as `url.text` |
-| `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url.text` included. The body has no positions (`index_options: freqs`): the query never uses them, and they were 45 % of the index |
+| `url` | displayed; its words are searchable as `url_words`, the URL with its escapes and IDN labels decoded |
+| `title`, `description`, `body` | full text, one ICU analyzer; `best_fields` scores a doc by its best field, `url_words` included. The body has no positions (`index_options: freqs`): the query never uses them, and they were 45 % of the index |
 | `lang` | stored; the trial measured what per-language analyzers would add |
 
 - **Live docs only.** With `prior_file = "live"` (Host2), a build indexes only docs in
@@ -576,7 +576,7 @@ engine choice and the trial are in [`TEXT_INDEX.md`](TEXT_INDEX.md).
   reports `docs_off_list`.
 - **Docs without text.** With a prior, a listed doc with no text row (not yet fetched,
   `failed`, `gone`) is indexed by its URL alone: the URL listed at its best rank,
-  searchable as `url.text`, and that rank as its prior. A doc with any text row, even an
+  searchable as `url_words`, and that rank as its prior. A doc with any text row, even an
   empty WAF page, keeps that row. On Host2 on 2026-11-14, about 9M listed docs had no
   document. 44 % of the 2.36M docs still pending sat on hosts that refuse every
   non-browser client (Cloudflare challenges, AWS WAF CAPTCHA), so they will never get
@@ -595,10 +595,11 @@ Not built yet, for Host2 after WebCrawler#84 is deployed:
   drops the older rows, so every `stale_days` cycle adds about one more copy of the
   text (0.22–0.4 TB at 128M). Needed before the first cycle ends, 30 days after the
   recrawl starts; the text index build reads only each doc's newest row.
-- **Words of percent-escaped URLs.** Most CJK and Indic URLs are percent escaped, and
-  `url.text` drops the escapes, so those URLs give no words. Indexing the decoded URL
-  could add them. Golden batch 20 already chose the query, so this waits for batch 21
-  (11-01) to tune and test it.
+- **Words of percent-escaped URLs: built, not measured.** Most CJK and Indic URLs are
+  percent escaped, and the old `url.text` dropped the escapes, so those URLs gave no
+  words. The build now indexes the decoded URL as `url_words` (`docs/TEXT_INDEX.md`).
+  Host2 needs a rebuild to get the field. The gain on a golden batch is not measured
+  yet.
 - **Crawlerdb text for docs without text.** A doc without text could add crawlerdb's
   title and anchor text to its URL. The full export must then pull `title` and
   `anchor_text`, a crawlerdb export change that needs the TA's approval.

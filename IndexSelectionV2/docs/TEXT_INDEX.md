@@ -45,11 +45,17 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
 - **Document.** `_id` is the doc id in decimal. `url` and `lang` are stored; `title`,
   `description` and `body` are full text, and `body` is left out of `_source`. The body
   is indexed without positions (`index_options: freqs`): BM25 needs only term counts,
-  and positions were 45 % of the index. The URL's words are searchable as `url.text`.
+  and positions were 45 % of the index. The URL's words are searchable as `url_words`.
+  The build fills it with `url_words(url)` (`urlnorm.py`): the stored URL with its
+  percent escapes decoded as UTF-8 and its `xn--` host labels decoded to Unicode. So
+  `/wiki/%E6%9D%B1%E4%BA%AC` gives the word `東京`. `url` itself is unchanged, and
+  `url_words` is left out of `_source`. Until 2026-11-15 the field was `url.text`, a
+  sub-field of the stored URL: escapes gave no words, and an IDN host gave punycode.
+  The numbers below that name `url.text` were measured on that field.
   `doc_id` holds the same id as doc values only, for sorting. `sel_prior` is a
   `rank_feature`, `prior_scale / (rank + 1)`, from the doc's rank in the selection manifest
   (`prior_file`). With a prior, only the docs on that list are indexed. A listed doc with
-  no text row gets a document of its list URL and rank alone, so `url.text` and the prior
+  no text row gets a document of its list URL and rank alone, so `url_words` and the prior
   can still find it (`fallback_docs` in the build report). A build fails when no doc with
   text is on the list. `prior_file = "live"` reads the live run's label from selectdb and
   checks its manifest (`validate_run`), so a swap needs only a rebuild. The `refresh`
@@ -59,9 +65,10 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
 - **Analysis.** One analyzer for every text field and language: `icu_tokenizer` (Unicode
   word breaks with dictionaries for CJK and Thai) and `icu_folding` (case, accents,
   width). A keyword's language is unknown, so per-language analyzers would need routing;
-  the trial measures what they would add. `url.text` uses the same two steps after a
-  character filter turns each run of punctuation and percent escapes into one space.
-- **Query.** `best_fields` over `title^2`, `description`, `body` and `url.text^2`: a doc
+  the trial measures what they would add. `url_words` uses the same two steps after a
+  character filter turns each run of characters that are not letters, digits or marks
+  into one space.
+- **Query.** `best_fields` over `title^2`, `description`, `body` and `url_words^2`: a doc
   scores by its best-matching field. The type and weights were chosen on half of golden
   batch 20's keywords and confirmed on the other half ([Tuning on batch
   20](#tuning-on-batch-20)); the URL weight came later, on 51M docs. The keyword is never
@@ -846,11 +853,13 @@ exists. Batch 22 is read once: the ranking stays if the 95 % interval of its gai
   10 s. The create-index block was still set 90 s after the watermarks were reset and
   gone at the next check, less than a minute later.
 - OpenSearch has `combined_fields` since 3.2; it needs one analyzer across the fields
-  and field weights of at least 1. So it cannot search `url.text`, whose analyzer
+  and field weights of at least 1. So it cannot search `url_words`, whose analyzer
   differs.
 - In a `pattern_replace` filter, `%[0-9A-F]{2}|[^\p{L}\p{N}]+` leaves hex fragments:
   after a `/`, the second branch also takes the `%` of the next escape, so `/%E0` keeps
-  `E0`. The filter now repeats one group of both, with `%` out of the second branch.
+  `E0`. The filter no longer handles escapes: the build decodes them before the
+  analyzer sees the URL. A query is not decoded, so a keyword that holds an escape
+  gives hex fragments. Golden batches 7 to 20 hold no such keyword.
 - A force merge commits shard by shard, but each shard's old segments stay on disk until
   a refresh, and the build refreshed only when the whole task had ended. So a rebuild
   held three indices, not two. OpenSearch also merges several shards at once (the
@@ -915,6 +924,12 @@ Choices and limits:
 - **Still open** (`docs/RECRAWL.md` §13):
   - compact the text Parquet, before its first 30-day cycle ends;
   - crawlerdb's title and anchor text for docs without text;
+  - the gain of the decoded URL words (`url_words`) on a golden batch. It is not
+    measured yet. In batch 20, 888 of 15,328 pairs have a URL with a non-ASCII escape
+    and 4 have an IDN host: these are the pairs that can gain, not the gain. The index
+    size with the new field is not measured either. Both need a rebuild. Deploy the
+    code and rebuild in one step: a search on an older index skips `url_words`, so it
+    loses the URL's words until the rebuild;
   - one read of batch 22 (created 11-16), if it holds no `goto` URLs, with the node restarted.
 
 ## Reproduction
