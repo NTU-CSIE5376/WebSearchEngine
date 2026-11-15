@@ -76,11 +76,12 @@ def node():
         subprocess.run(["docker", "stop", name], check=False, capture_output=True)
 
 
-def _text(docs, fetched_at: datetime) -> pa.Table:
+def _text(docs, fetched_at: datetime, payload_sha1: str = "x") -> pa.Table:
     return pa.Table.from_pylist([{
         "doc_id": md5_number_lower(canonicalize(u)), "batch_id": 1, "url": u, "final_url": u,
         "fetched_at": fetched_at, "http_status": 200, "lang": lang, "title": title,
-        "description": desc, "body": body, "text_len": len(body), "payload_sha1": "x"}
+        "description": desc, "body": body, "text_len": len(body),
+        "payload_sha1": payload_sha1}
         for u, lang, title, desc, body in docs], schema=TEXT_SCHEMA)
 
 
@@ -228,3 +229,49 @@ def test_a_listed_doc_without_text_is_found_by_its_url(node, tmp_path):
                          golden_path(cfg.work_dir))
     measured = evaluate_golden(cfg, client, 20)["all"]
     assert (measured["presence"], measured["recall_pairs"]) == (1.0, 1.0)
+
+
+def test_a_shared_challenge_page_is_found_by_its_url_not_by_its_text(node, tmp_path):
+    sha1 = "c" * 40
+    page = ("en", "Client Challenge", None, "Please enable JavaScript to proceed.")
+    blocked = [(f"https://www.{name}.example.com/{path}", *page) for name, path in
+               (("cosmo", "horoscope-leo"), ("esquire", "negroni-recipe"), ("elle", "runway"))]
+    real = ("https://security.example.org/bots", "en", "Client challenge pages explained", None,
+            "Why a site answers a crawler with a challenge instead of its page.")
+    unfetched = "https://www.merriam-webster.com/dictionary/vinegary"
+    root = tmp_path / "text"
+    write_parquet_atomic(_text([real], datetime(2026, 10, 20, tzinfo=UTC)),
+                         root / "job-1.parquet")
+    write_parquet_atomic(_text(blocked, datetime(2026, 10, 20, tzinfo=UTC), sha1),
+                         root / "job-2.parquet")
+    listed = [real[0], *(d[0] for d in blocked), unfetched]
+    ids = {u: str(md5_number_lower(canonicalize(u))) for u in listed}
+    prior = tmp_path / "list" / "run.parquet"
+    write_parquet_atomic(pa.table({
+        "doc_id": pa.array([int(ids[u]) for u in listed], pa.uint64()),
+        "rank": pa.array(range(len(listed)), pa.int64()), "url": listed}), prior)
+    cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
+                  alias="isel-text-challenge", prior_file=str(prior),
+                  settings_file=str(ROOT / "config/text_index/icu.json"))
+    cfg = replace(cfg, "recrawl", challenge_sha1=[sha1])
+    client = OpenSearch(node, 60.0, 2, 1.0)
+    out = build(cfg, client, root, datetime(2026, 10, 26, tzinfo=UTC))
+    assert (out["docs"], out["challenge_docs"], out["fallback_docs"],
+            out["docs_off_list"]) == (5, 3, 1, 0)
+
+    # The page's words find the page about challenges, and none of the docs that got it.
+    for words in ("Client Challenge", "enable JavaScript to proceed"):
+        found, _ = search(client, cfg.text_index, words)
+        assert not set(found) & {ids[d[0]] for d in blocked}, words
+    assert search(client, cfg.text_index, "Client Challenge")[0] == [ids[real[0]]]
+    assert search(client, cfg.text_index, "horoscope")[0] == [ids[blocked[0][0]]]
+    assert search(client, cfg.text_index, "negroni recipe")[0][0] == ids[blocked[1][0]]
+    source = client.call("GET", f"/{out['index']}/_doc/{ids[blocked[0][0]]}")["_source"]
+    assert set(source) == {"url", "sel_prior"}        # no lang, title or description
+
+    # With no hash configured, the same text makes every blocked doc match the page's words.
+    plain = replace(replace(cfg, "recrawl", challenge_sha1=[]), "text_index",
+                    alias="isel-text-challenge-off")
+    assert build(plain, client, root, datetime(2026, 10, 27, tzinfo=UTC))["challenge_docs"] == 0
+    found, _ = search(client, plain.text_index, "enable JavaScript to proceed")
+    assert set(found) == {ids[d[0]] for d in blocked}
