@@ -840,6 +840,8 @@ def _child_main(act: Act, job: Job, send: Connection) -> None:
 def _signal_group(proc: multiprocessing.process.BaseProcess, sig: int) -> None:
     try:
         os.killpg(proc.pid, sig)
+    except PermissionError:    # macOS, while every process left in the group has exited
+        pass
     except ProcessLookupError:
         if proc.is_alive():    # the child has not called setpgid yet
             os.kill(proc.pid, sig)
