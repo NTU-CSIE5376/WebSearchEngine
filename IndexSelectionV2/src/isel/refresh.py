@@ -16,9 +16,9 @@ Shape: observe, plan, act.
   cycle's sample exists", not "a sample exists".
 - `plan` is a pure function of (window, evidence, outcome, now). It names the next
   step, idles, or finishes the cycle.
-- The step runs in a fresh spawned process, in its own process group, until it returns
-  or its deadline passes. The parent then records the result in the cycle's `Outcome`
-  and checks that the step's evidence now holds.
+- The step runs in a fresh spawned process, in its own process group, until it returns,
+  dies or its deadline passes. The parent ends what is left of the group, records the
+  result in the cycle's `Outcome` and checks that the step's evidence now holds.
 
 Done-ness is never stored for a step whose rerun after an unrecorded success would fail
 or redo hours of work (derive refuses an existing meta, publish hits `run_label`
@@ -846,7 +846,11 @@ def _signal_group(proc: multiprocessing.process.BaseProcess, sig: int) -> None:
 
 
 def _end_group(proc: multiprocessing.process.BaseProcess, grace_s: float) -> None:
-    """SIGTERM to the step's process group, then SIGKILL after `grace_s`."""
+    """SIGTERM to what is left of the step's process group, then SIGKILL.
+
+    The grace `grace_s` waits for the step process only. When it is already gone, its
+    workers get both signals at once: nothing is left to take their results.
+    """
     _signal_group(proc, signal.SIGTERM)
     proc.join(grace_s)
     _signal_group(proc, signal.SIGKILL)   # also a grandchild that outlived the child
@@ -865,9 +869,10 @@ def run_in_child(act: Act, job: Job, deadline: datetime) -> RunResult:
     """Runs `act(job)` in a fresh spawned, non-daemon process until `deadline`.
 
     Not a daemon: select_full starts its own worker processes. Not fork: the parent
-    holds pyarrow threads. On the deadline, or on any exception in the parent (SIGTERM
-    from `docker compose stop`), the child's whole process group gets SIGTERM, then
-    SIGKILL after `refresh.kill_grace_s`.
+    holds pyarrow threads. However the step ends (a result, its own death, the
+    deadline, or an exception in the parent such as SIGTERM from `docker compose
+    stop`), what is left of the child's process group gets SIGTERM, then SIGKILL after
+    `refresh.kill_grace_s`, before this returns.
     """
     grace = job.cfg.refresh.kill_grace_s
     if deadline <= job.clock():
@@ -880,21 +885,16 @@ def run_in_child(act: Act, job: Job, deadline: datetime) -> RunResult:
     send.close()
     try:
         if not _result_by(recv, deadline, job.clock):
-            _end_group(proc, grace)
             return Killed()
         try:
             result = recv.recv()
         except EOFError:
             result = None
         proc.join(grace)
-        if proc.is_alive():
-            _end_group(proc, grace)
-        return Failed(f"exit:{proc.exitcode}") if result is None else result
-    except BaseException:
-        _end_group(proc, grace)
-        raise
     finally:
+        _end_group(proc, grace)
         recv.close()
+    return Failed(f"exit:{proc.exitcode}") if result is None else result
 
 
 def spawn_runner(job: Job, step: StepName, deadline: datetime) -> RunResult:
