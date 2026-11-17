@@ -249,6 +249,17 @@ def test_a_rejected_gate_leaves_selectdb_untouched(selectdb, tmp_path, world):
     assert _db(cfg, "SELECT run_label, status FROM model_runs") == [("r0", "live")]
 
 
+def test_a_list_unlike_the_live_one_goes_live(selectdb, tmp_path, world):
+    # A model update may replace most of the old list; refresh does not judge the model.
+    cfg = replace(small_cfg(tmp_path), "full", sample_percent=100.0)
+    r0_urls = _live_r0(cfg, world,
+                       urls=[f"https://elsewhere{i}.example/" for i in range(R0_URLS)])
+    clock = Clock(START)
+    out = _until_finished(cfg, clock, _runner(world, clock))
+    assert out.status is Status.DONE and out.failures == {}, out
+    _assert_refreshed(cfg, r0_urls)
+
+
 def test_a_crash_after_the_swap_still_syncs_after_swap_by(selectdb, tmp_path, world):
     cfg = _cycle_cfg(tmp_path)
     r0_urls = _live_r0(cfg, world)
