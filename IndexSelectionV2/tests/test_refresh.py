@@ -5,12 +5,15 @@ selectdb is replaced by `FakeDb` at `refresh._read_db`, the one function that re
 
 from __future__ import annotations
 
+import contextlib
 import json
+import multiprocessing
 import os
 import signal
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -708,12 +711,47 @@ def _sleep_with_a_grandchild(job):
     time.sleep(60)
 
 
+def _work_forever(pid_dir: str) -> None:
+    (Path(pid_dir) / str(os.getpid())).touch()
+    while True:
+        time.sleep(1)
+
+
+def _die_beside_busy_workers(job):
+    pid_dir = job.cfg.work_dir / "workers"
+    pid_dir.mkdir()
+    pool = ProcessPoolExecutor(2, mp_context=multiprocessing.get_context("spawn"))
+    for _ in range(2):
+        pool.submit(_work_forever, str(pid_dir))
+    while len(list(pid_dir.iterdir())) < 2:
+        time.sleep(0.05)
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _return_beside_a_stray(job):
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]).pid
+
+
 def _gone(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return True
     return False
+
+
+def _wait_gone(pids: list[int], timeout_s: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while not all(_gone(p) for p in pids) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return all(_gone(p) for p in pids)
+
+
+def _kill(pids: list[int]) -> None:
+    """Ends what a failed assertion left running: a pool worker never exits on its own."""
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
 
 
 def test_a_step_runs_in_its_own_process(cfg, w):
@@ -729,10 +767,29 @@ def test_a_step_past_its_deadline_is_killed_with_its_children(cfg, w):
     result = run_in_child(_sleep_with_a_grandchild, job, utcnow() + timedelta(seconds=3))
     assert result == Killed() and time.monotonic() - started < 15
     pids = [int(p) for p in (cfg.work_dir / "pids").read_text().split()]
-    deadline = time.monotonic() + 5
-    while not all(_gone(p) for p in pids) and time.monotonic() < deadline:
-        time.sleep(0.1)
-    assert all(_gone(p) for p in pids)
+    assert _wait_gone(pids)
+
+
+def test_a_step_that_dies_takes_its_pool_workers_with_it(cfg, w):
+    cfg.work_dir.mkdir(parents=True)
+    job = Job(replace(cfg, "refresh", kill_grace_s=0.5), w, evidence_through(None), utcnow)
+    result = run_in_child(_die_beside_busy_workers, job, utcnow() + timedelta(seconds=60))
+    pids = [int(p.name) for p in (cfg.work_dir / "workers").iterdir()]
+    try:
+        assert result == Failed("exit:-9") and len(pids) == 2
+        assert _wait_gone(pids)
+    finally:
+        _kill(pids)
+
+
+def test_a_step_that_returns_leaves_no_process_behind(cfg, w):
+    job = Job(replace(cfg, "refresh", kill_grace_s=0.5), w, evidence_through(None), utcnow)
+    result = run_in_child(_return_beside_a_stray, job, utcnow() + timedelta(seconds=60))
+    assert isinstance(result, Completed)
+    try:
+        assert _wait_gone([result.value])
+    finally:
+        _kill([result.value])
 
 
 def test_the_cleanup_step_crosses_into_its_process(cfg, w):
