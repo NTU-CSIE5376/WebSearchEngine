@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -732,6 +733,22 @@ def _return_beside_a_stray(job):
     return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]).pid
 
 
+@dataclass(frozen=True)
+class _StopOnceStarted:
+    """The parent's clock: SIGTERM's SystemExit (`run_loop`) once the step wrote its pids.
+
+    Until then it stands just before the deadline, so the parent polls in short slices.
+    """
+
+    pids: Path
+    deadline: datetime
+
+    def __call__(self) -> datetime:
+        if self.pids.exists() and len(self.pids.read_text().split()) == 2:
+            raise SystemExit(0)
+        return self.deadline - timedelta(seconds=0.2)
+
+
 def _gone(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -778,6 +795,20 @@ def test_a_step_that_dies_takes_its_pool_workers_with_it(cfg, w):
     try:
         assert result == Failed("exit:-9") and len(pids) == 2
         assert _wait_gone(pids)
+    finally:
+        _kill(pids)
+
+
+def test_an_exception_in_the_parent_ends_the_step_with_its_children(cfg, w):
+    cfg.work_dir.mkdir(parents=True)
+    deadline = utcnow() + timedelta(seconds=60)
+    clock = _StopOnceStarted(cfg.work_dir / "pids", deadline)
+    job = Job(replace(cfg, "refresh", kill_grace_s=0.5), w, evidence_through(None), clock)
+    with pytest.raises(SystemExit):
+        run_in_child(_sleep_with_a_grandchild, job, deadline)
+    pids = [int(p) for p in (cfg.work_dir / "pids").read_text().split()]
+    try:
+        assert len(pids) == 2 and _wait_gone(pids)
     finally:
         _kill(pids)
 
