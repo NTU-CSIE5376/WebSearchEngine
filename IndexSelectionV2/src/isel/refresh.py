@@ -871,8 +871,8 @@ def run_in_child(act: Act, job: Job, deadline: datetime) -> RunResult:
     Not a daemon: select_full starts its own worker processes. Not fork: the parent
     holds pyarrow threads. However the step ends (a result, its own death, the
     deadline, or an exception in the parent such as SIGTERM from `docker compose
-    stop`), what is left of the child's process group gets SIGTERM, then SIGKILL after
-    `refresh.kill_grace_s`, before this returns.
+    stop`), what is left of the child's process group gets SIGTERM, then SIGKILL, before
+    this returns (`_end_group`).
     """
     grace = job.cfg.refresh.kill_grace_s
     if deadline <= job.clock():

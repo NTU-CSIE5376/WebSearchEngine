@@ -425,8 +425,9 @@ when its `model_runs.cutoff_datetime` is at or after `start_at`.
   step is planned again and starts from what it left.
 - **One step process.** Each step runs in its own spawned process and process group.
   However the step ends, by returning, by dying or at its deadline, what is left of the
-  group gets SIGTERM, then SIGKILL after `refresh.kill_grace_s`, before the outcome is
-  written. A step process killed by the OOM killer thus takes its pool workers with it.
+  group gets SIGTERM, then SIGKILL, before the outcome is written. A step process still
+  alive gets up to `refresh.kill_grace_s` between the two. A step process killed by the
+  OOM killer thus takes its pool workers with it at once.
   `docker compose stop refresh` ends the group the same way.
 - **What a cycle checks.** A step is done only when its evidence holds. Every export
   shard finished. The sample, positives, model and scores carry the stamps of this

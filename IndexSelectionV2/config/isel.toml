@@ -263,7 +263,7 @@ sync_budget_min = 120                    # recrawl-sync starts only this long be
 max_attempts = 3                         # failures of one step before the cycle is `failed`
 poll_s = 300.0                           # seconds between ticks with nothing to do; also the
                                          # wait before a retry
-kill_grace_s = 30.0                      # SIGTERM to SIGKILL for a step past its deadline
+kill_grace_s = 30.0                      # SIGTERM to SIGKILL while the step process lives
 
 [recrawl]                                # recrawl frontier in selectdb `recrawl`; docs/RECRAWL.md
 api_url = "http://127.0.0.1:4000"        # crawler API (WebCrawler PR #84), host network only
