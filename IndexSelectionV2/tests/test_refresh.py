@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import json
 import multiprocessing
+import multiprocessing.connection
 import os
 import signal
 import subprocess
@@ -821,6 +822,15 @@ def test_a_step_that_returns_leaves_no_process_behind(cfg, w):
         assert _wait_gone([result.value])
     finally:
         _kill([result.value])
+
+
+def test_ending_a_group_whose_processes_all_exited_does_not_raise():
+    # macOS refuses killpg (EPERM) while every member is a zombie; Linux delivers it.
+    proc = multiprocessing.get_context("spawn").Process(target=os.setpgid, args=(0, 0))
+    proc.start()
+    multiprocessing.connection.wait([proc.sentinel])   # exited, not yet reaped
+    refresh._end_group(proc, 0.5)
+    assert proc.exitcode == 0
 
 
 def test_the_cleanup_step_crosses_into_its_process(cfg, w):
