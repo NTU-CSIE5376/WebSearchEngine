@@ -2,7 +2,7 @@
 
 One cycle per golden day G (`isel.schedule.Window`). From `start_at` the cycle clears
 the old export, pulls golden and dims, exports crawlerdb, derives, trains, scores,
-selects, gates, publishes and swaps, all before `swap_by`. Once the live list is this
+selects, publishes and swaps, all before `swap_by`. Once the live list is this
 cycle's, it verifies it, syncs the recrawl frontier and drops old selection runs, even
 after `swap_by`. The text index stays manual.
 
@@ -23,8 +23,12 @@ Shape: observe, plan, act.
 Done-ness is never stored for a step whose rerun after an unrecorded success would fail
 or redo hours of work (derive refuses an existing meta, publish hits `run_label`
 UNIQUE). Those are `DerivedStep`s: their `done` takes `Evidence` only, so it cannot read
-the outcome. The outcome keeps results only for `RecordedStep`s (gates, verify, sync),
-which are safe to rerun.
+the outcome. The outcome keeps results only for `RecordedStep`s (verify, sync), which
+are safe to rerun.
+
+A cycle checks that each step did its job: every export shard finished, each artifact
+carries the stamps of what it was made from, the manifest passes publish's checks, the
+swap and the sync took effect. It does not judge the model.
 
 Single writer: only a tick holding the work lock exclusively runs a step or writes an
 outcome file. CLI commands that touch the work dir hold it shared, so they still run
@@ -288,7 +292,6 @@ class Status(enum.StrEnum):
     RUNNING = "running"
     DONE = "done"
     SKIPPED_LATE = "skipped_late"
-    SKIPPED_GATE = "skipped_gate"
     WITHDRAWN = "withdrawn"
     FAILED = "failed"
 
@@ -303,7 +306,6 @@ class StepName(enum.StrEnum):
     MODEL = "model"
     SCORED = "scored"
     SELECTION = "selection"
-    GATES = "gates"
     PUBLISH = "publish"
     SWAP = "swap"
     VERIFY = "verify"
@@ -322,25 +324,6 @@ class StepError:
 
     step: StepName | None
     kind: str
-
-
-@dataclass(frozen=True)
-class TagCoverage:
-    new: float              # metric rate of the target batch under the new run's URLs
-    live: float             # ... under the live run's URLs
-    ratio: float | None     # new / live; None when the live run found none (passes)
-
-
-@dataclass(frozen=True)
-class GateVerdict:
-    """Both gates on one run, before anything of it reaches selectdb."""
-
-    run_label: str
-    live_label: str
-    batch: int                          # newest golden batch not in golden.exclude_batches
-    overlap_share: float                # the new run's doc_ids on the live run's manifest
-    coverage: Mapping[str, TagCoverage]
-    passed: bool
 
 
 @dataclass(frozen=True)
@@ -375,7 +358,6 @@ class Outcome:
     failures: Mapping[StepName, int] = field(default_factory=dict)
     error: StepError | None = None
     pending: StepName | None = None         # the step a finished cycle stopped at
-    gates: GateVerdict | None = None
     verify: VerifyRecord | None = None
     synced_run_id: int | None = None        # model_run_id that recrawl-sync loaded
     audit: Audit | None = None
@@ -390,12 +372,12 @@ class Outcome:
         return {"golden_day": self.golden_day.isoformat(), "status": self.status.value,
                 "failures": {s.value: n for s, n in self.failures.items()},
                 "error": plain(self.error), "pending": self.pending,
-                "gates": plain(self.gates), "verify": plain(self.verify),
-                "synced_run_id": self.synced_run_id, "audit": audit}
+                "verify": plain(self.verify), "synced_run_id": self.synced_run_id,
+                "audit": audit}
 
     @staticmethod
     def from_json(data: Mapping[str, Any]) -> Outcome:
-        error, gates, verify, audit = (data[k] for k in ("error", "gates", "verify", "audit"))
+        error, verify, audit = (data[k] for k in ("error", "verify", "audit"))
         return Outcome(
             golden_day=date.fromisoformat(data["golden_day"]),
             status=Status(data["status"]),
@@ -403,8 +385,6 @@ class Outcome:
             error=error and StepError(error["step"] and StepName(error["step"]),
                                       error["kind"]),
             pending=data["pending"] and StepName(data["pending"]),
-            gates=gates and GateVerdict(**{**gates, "coverage": {
-                tag: TagCoverage(**c) for tag, c in gates["coverage"].items()}}),
             verify=verify and VerifyRecord(**verify),
             synced_run_id=data["synced_run_id"],
             audit=audit and Audit(**{**audit, "finished_at": datetime.fromisoformat(
@@ -441,10 +421,6 @@ class NotYet(Exception):
     """
 
 
-class GateInputMissing(RuntimeError):
-    """Raised when the gates have nothing to compare with: no live run or its manifest."""
-
-
 class SwapRefused(RuntimeError):
     """Raised when `publish.swap` refuses the run for good (no loaded table)."""
 
@@ -477,7 +453,7 @@ class RecordedStep:
     """A step safe to rerun; the outcome keeps its result.
 
     `record` stores what `act` returned; `done` matches that record against the
-    evidence (the gated run label, the live label or id).
+    evidence (the live label or id).
     """
 
     name: StepName
@@ -589,7 +565,7 @@ def _select(job: Job) -> Any:
 
 
 def target_batch(golden_rows: list[Mapping[str, Any]], exclude: list[int]) -> int:
-    """The newest golden batch not excluded: the batch both the gates and verify read.
+    """The newest golden batch not excluded: the batch verify reads.
 
     Raises:
         RuntimeError: If every batch is excluded or golden is empty.
@@ -598,76 +574,6 @@ def target_batch(golden_rows: list[Mapping[str, Any]], exclude: list[int]) -> in
     if not batches:
         raise RuntimeError("golden has no batch outside golden.exclude_batches")
     return max(batches)
-
-
-def judge(overlap_share: float, coverage: Mapping[str, TagCoverage], rc: RefreshCfg) -> bool:
-    """Both gates: overlap >= min_overlap_share and, per tag, ratio >= min_coverage_ratio.
-
-    A tag whose ratio is None passes: the live list found none of its golden URLs.
-    """
-    return overlap_share >= rc.min_overlap_share and all(
-        c.ratio is None or c.ratio >= rc.min_coverage_ratio for c in coverage.values())
-
-
-def _gates(job: Job) -> GateVerdict:
-    """Gate (a) overlap and gate (b) coverage, from the two manifests on disk.
-
-    Reads no selectdb table and writes nothing.
-
-    Raises:
-        GateInputMissing: If there is no live run or its manifest is not on disk.
-    """
-    import pyarrow as pa
-
-    from isel.evaluate import golden_by_tag, metric_rate
-    from isel.golden import read_golden
-    from isel.io import open_duckdb, sql_str
-
-    cfg, ev = job.cfg, job.evidence
-    if ev.live is None:
-        raise GateInputMissing("selectdb has no live run to compare with")
-    selection = cfg.work_dir / "full" / "selection"
-    if not (selection / f"run={ev.live.label}" / MANIFEST_FILE).exists():
-        raise GateInputMissing(f"the live run {ev.live.label} has no manifest in the work dir")
-    new, live = (sql_str(str(selection / f"run={label}" / "manifest" / "*.parquet"))
-                 for label in (ev.run, ev.live.label))
-    con = open_duckdb(cfg, cfg.work_dir / SCRATCH_DIR)
-    try:
-        (share,) = con.execute(
-            "SELECT count(l.doc_id)::DOUBLE / count(*) "
-            f"FROM (SELECT DISTINCT doc_id FROM read_parquet({new})) n "
-            f"LEFT JOIN (SELECT DISTINCT doc_id FROM read_parquet({live})) l "
-            "USING (doc_id)").fetchone()
-        rows = read_golden(cfg.work_dir).to_pylist()
-        batch = target_batch(rows, cfg.golden.exclude_batches)
-        coverage = {}
-        for tag, g in golden_by_tag(rows, batch, cfg.golden.tags).items():
-            # The spellings verify_live looks up, so the rate under the new run equals
-            # what verify reads once publish has loaded exactly this manifest.
-            con.register("spellings", pa.table(
-                {"url": sorted(set(g.urls) | set(g.canonical.values()))}))
-            rates = []
-            for manifest in (new, live):
-                listed = {u for (u,) in con.execute(
-                    f"SELECT DISTINCT url FROM read_parquet({manifest}) "
-                    "SEMI JOIN spellings USING (url)").fetchall()}
-                rates.append(metric_rate(g, listed))
-            con.unregister("spellings")
-            coverage[tag] = TagCoverage(rates[0], rates[1],
-                                        rates[0] / rates[1] if rates[1] else None)
-    finally:
-        con.close()
-    share = float(share or 0.0)
-    return GateVerdict(ev.run, ev.live.label, batch, share, coverage,
-                       judge(share, coverage, cfg.refresh))
-
-
-def _verdict(ev: Evidence, out: Outcome) -> GateVerdict | None:
-    """The recorded verdict if it judged this run against the current live run."""
-    g = out.gates
-    if g is None or ev.live is None or (g.run_label, g.live_label) != (ev.run, ev.live.label):
-        return None
-    return g
 
 
 def _publish(job: Job) -> Any:
@@ -748,9 +654,6 @@ STEPS: tuple[Step, ...] = (
     DerivedStep(StepName.SCORED, Phase.BUILD,
                 lambda e: e.scored is ScoredState.FINISHED, _score),
     DerivedStep(StepName.SELECTION, Phase.BUILD, lambda e: e.run is not None, _select),
-    RecordedStep(StepName.GATES, Phase.BUILD,
-                 lambda e, o: _verdict(e, o) is not None, _gates,
-                 lambda o, verdict: replace(o, gates=verdict)),
     DerivedStep(StepName.PUBLISH, Phase.BUILD, lambda e: e.db_run is not None, _publish),
     DerivedStep(StepName.SWAP, Phase.BUILD,
                 lambda e: e.live is not None and e.live.label == e.run, _swap),
@@ -827,8 +730,7 @@ def plan(w: Window, ev: Evidence, out: Outcome, now: datetime, rc: RefreshCfg) -
     3. This cycle's run was taken off by hand (`WITHDRAWN_STATUSES`): WITHDRAWN.
     4. `now >= swap_by`, or the previous export is still to clear at `clear_by`:
        SKIPPED_LATE, pending the first BUILD step not done.
-    5. The gates rejected this run: SKIPPED_GATE.
-    6. The first BUILD step not done, deadline swap_by.
+    5. The first BUILD step not done, deadline swap_by.
     A step that failed `rc.max_attempts` times finishes the cycle FAILED instead.
     """
     if out.status is not Status.RUNNING:
@@ -843,9 +745,6 @@ def plan(w: Window, ev: Evidence, out: Outcome, now: datetime, rc: RefreshCfg) -
     step = _first_pending(BUILD, ev, out)
     if now >= w.swap_by or (step is STEP[StepName.CLEAR] and now >= w.clear_by):
         return Finish(Status.SKIPPED_LATE, step and step.name)
-    verdict = _verdict(ev, out)
-    if verdict is not None and not verdict.passed:
-        return Finish(Status.SKIPPED_GATE, StepName.GATES)
     if step is None:
         return Idle("every build step is done, yet the live run is not this cycle's")
     return _exhausted(step, out, rc) or Run(step.name, w.swap_by)
@@ -1176,14 +1075,6 @@ def _evidence_json(ev: Evidence) -> dict[str, Any]:
             "selection": sorted(ev.selection), "selectdb_bytes": ev.selectdb_bytes}
 
 
-def _verify_matches_gate(out: Outcome) -> bool | None:
-    """Verify read what the gate measured; None until both judged the same run."""
-    if out.verify is None or out.gates is None or out.verify.run_label != out.gates.run_label:
-        return None
-    return out.verify.batch == out.gates.batch and dict(out.verify.rates) == {
-        tag: c.new for tag, c in out.gates.coverage.items()}
-
-
 def status(cfg: Config, clock: Clock = utcnow) -> dict[str, Any]:
     """The cycle, its outcome, the evidence per step and the next decision.
 
@@ -1195,8 +1086,7 @@ def status(cfg: Config, clock: Clock = utcnow) -> dict[str, Any]:
     w = cycle_at(now, cfg)
     out = read_outcome(cfg, w.golden_day)
     report: dict[str, Any] = {"now": now.isoformat(), "cycle": _window_json(w),
-                              "work_lock": work_lock_holder(cfg), "outcome": out.to_json(),
-                              "verify_matches_gate": _verify_matches_gate(out)}
+                              "work_lock": work_lock_holder(cfg), "outcome": out.to_json()}
     try:
         ev = observe(cfg, w)
     except Exception as exc:

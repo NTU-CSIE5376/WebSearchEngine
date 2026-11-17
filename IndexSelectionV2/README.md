@@ -47,7 +47,7 @@ flowchart LR
 | Refresh | `refresh --loop` (service), `refresh --status` | all of the above | a new live list before every golden day, then `recrawl-sync` |
 
 The opt-in `refresh` service runs these steps for every golden day (the 1st and 16th).
-It gates the new list against the live one before `publish` and swaps it before the
+It checks that each step did its job, publishes the new list and swaps it before the
 metric reads it ([`docs/DESIGN.md`](docs/DESIGN.md) §11). Every other command is one
 container run, except the two opt-in recrawl services below.
 
@@ -59,8 +59,8 @@ container run, except the two opt-in recrawl services below.
   or in each hour's :58–:10 window, when the metric scans the crawl tables.
 - It never swaps the list on the 1st and 16th between 11:30 and 20:00 UTC, so the head
   and random sets of one batch see the same list.
-- The `refresh` service never publishes a list that failed its gates, and never rebuilds
-  the text index.
+- The `refresh` service never publishes a manifest that fails its checksums or row
+  count, and never rebuilds the text index.
 - It never writes `/data/ipc` or `/data/manual_bulk_crawls`. Recrawl jobs go through the
   crawler's API, the crawler's result files are read-only for us, and we delete them
   through the same API.

@@ -10,7 +10,7 @@
 
 - Every two weeks, pick K = 64,000,000 of the ~1.66 billion crawled URLs so that the
   next golden batch's `indexed_rate` is as high as possible.
-- Do it unattended. The `refresh` service builds, gates and swaps a new list before
+- Do it unattended. The `refresh` service builds, publishes and swaps a new list before
   every golden day, and the recrawl frontier follows it (§11).
 - Keep the method explainable, the evaluation free of leaks, and every number
   reproducible.
@@ -413,7 +413,7 @@ Each G owns one cycle (`isel/schedule.py`, `[refresh]` in the config):
 | Time (UTC) | What happens |
 |---|---|
 | `start_at` = G−2, 02:15 | clear the old export; pull golden and dims; export crawlerdb |
-| until `swap_by` = G 11:00 | derive the sample and positives, train, score, select; the two gates; publish; swap |
+| until `swap_by` = G 11:00 | derive the sample and positives, train, score, select; publish; swap |
 | after the swap | verify; `recrawl-sync`, which starts only with 2 h left before the 11:30 freeze or after the freeze ends; delete every selection run but live and prev |
 | `ends_at` = the next G−2, 02:15 | the next cycle starts |
 
@@ -426,13 +426,16 @@ when its `model_runs.cutoff_datetime` is at or after `start_at`.
 - **One step process.** Each step runs in its own spawned process and process group.
   At its deadline, the whole group gets SIGTERM, then SIGKILL after
   `refresh.kill_grace_s`. `docker compose stop refresh` ends it the same way.
-- **The gates** run before `publish`, so a rejected run never reaches selectdb. Gate (a):
-  at least `min_overlap_share` of the new run's `doc_id`s are on the live run's
-  manifest. Gate (b): for each tag of the newest golden batch, the metric rate under the
-  new run is at least `min_coverage_ratio` of the rate under the live run. Both read the
-  manifests in the work dir, so the live run's `full/selection/run=<id>` must be there.
-  Gate (b) sees the new batch through the export, so it stops a broken model, not a
-  slightly worse one.
+- **What a cycle checks.** A step is done only when its evidence holds. Every export
+  shard finished. The sample, positives, model and scores carry the stamps of this
+  export. The selection run has K rows and a `_MANIFEST.json`. `publish` verifies the
+  manifest's checksums and loads exactly K unique URLs. The live row is this cycle's
+  run, `verify` reads exactly one live row, and the sync loaded the live run's id. A
+  step that returns without its evidence counts as a failure.
+- **No model judgment.** A cycle does not compare the new list with the live one, so a
+  new model may replace most of the old list. `verify` records the metric rate per tag,
+  and the live and prev runs stay in the work dir until the next cleanup. Quality
+  thresholds, if any, belong to a separate evaluation.
 - **The first start.** The service acts on the cycle that owns the moment it
   starts. Before that cycle's `clear_by` (`start_at` + `refresh.start_grace_min`, 12 h),
   the cycle begins at once: it deletes the old export and reads crawlerdb. Later, it ends
@@ -453,7 +456,6 @@ it: `free`, `commands` or `refresh`. The outcome of each cycle is
 | `running` | the cycle has work left |
 | `done` | the new list is live, verified and synced; old selection runs are gone |
 | `skipped_late` | `swap_by` passed before the swap, or the cycle had not cleared the old export by `clear_by`; the old list stays live |
-| `skipped_gate` | a gate rejected the run; nothing reached selectdb |
 | `withdrawn` | someone rolled back, abandoned or replaced this cycle's run |
 | `failed` | a step failed `max_attempts` times, or the cycle ended unfinished |
 
@@ -470,11 +472,10 @@ and the step runs again on the next tick, until its deadline:
 - The export still misses shards.
 - The swap timed out on its lock.
 
-**Retry a cycle.** A finished cycle never acts again. To retry a `failed` cycle, or a
-`skipped_gate` one after changing the thresholds, delete or rename its outcome file
-`work_dir/refresh/outcomes/<G>.json` before `swap_by`. The next tick plans from the
-evidence: the export, sample, model, scores and selection run on disk are kept, and the
-gates run again. Refresh reads only `<YYYY-MM-DD>.json` names there, so a renamed copy
+**Retry a cycle.** A finished cycle never acts again. To retry a `failed` cycle, delete
+or rename its outcome file `work_dir/refresh/outcomes/<G>.json` before `swap_by`. The
+next tick plans from the evidence: the export, sample, model, scores and selection run
+on disk are kept. Refresh reads only `<YYYY-MM-DD>.json` names there, so a renamed copy
 such as `<G>.failed.json` stays as a record.
 
 **The work lock.** A refresh tick holds `work_dir/refresh/lock` exclusively while it

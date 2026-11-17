@@ -86,8 +86,6 @@ def test_base_config_loads(base_cfg):
     ("[refresh]\nstart_grace_min = 0\n", "start_grace_min must be > 0"),
     ("[refresh]\nsync_budget_min = 0\n", "sync_budget_min must be 1 to 1439"),
     ("[refresh]\nsync_budget_min = 1440\n", "sync_budget_min must be 1 to 1439"),
-    ("[refresh]\nmin_overlap_share = 1.5\n", "min_overlap_share and min_coverage_ratio"),
-    ("[refresh]\nmin_coverage_ratio = -0.1\n", "min_overlap_share and min_coverage_ratio"),
     ("[refresh]\nmax_attempts = 0\n", "max_attempts must be >= 1"),
     ("[refresh]\npoll_s = 0.0\n", "poll_s must be > 0"),
     ("[refresh]\nkill_grace_s = -1.0\n", "kill_grace_s must be >= 0"),

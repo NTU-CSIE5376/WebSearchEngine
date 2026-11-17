@@ -260,10 +260,6 @@ swap_margin_min = 30                     # swap_by = freeze start - this = G 11:
                                          # swap retries (selectdb: 5 x 30 s)
 sync_budget_min = 120                    # recrawl-sync starts only this long before the
                                          # freeze; otherwise after the freeze ends
-min_overlap_share = 0.3                  # gate (a): share of the new run's doc_ids on the live
-                                         # run's manifest; the 2026-10 model change kept 42 %
-min_coverage_ratio = 0.9                 # gate (b): newest golden batch, per tag, metric rate
-                                         # under the new run / under the live run
 max_attempts = 3                         # failures of one step before the cycle is `failed`
 poll_s = 300.0                           # seconds between ticks with nothing to do; also the
                                          # wait before a retry

@@ -82,7 +82,7 @@ services:
     cpus: 8                             # archive_workers; 6.5 ms per 590 KB page each
 
   # A new list for every golden day (docs/DESIGN.md §11): export, train, score, select,
-  # gate, publish, swap, verify, recrawl-sync. The same bridge network, secrets, /work
+  # publish, swap, verify, recrawl-sync. The same bridge network, secrets, /work
   # and limits as the `run --rm isel ...` jobs it replaces; one step process at a time.
   #   docker compose ... --profile refresh up -d refresh
   #   docker compose ... run --rm isel refresh --status

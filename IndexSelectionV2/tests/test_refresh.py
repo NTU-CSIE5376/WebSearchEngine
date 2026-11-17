@@ -33,7 +33,6 @@ from isel.refresh import (
     ExportState,
     Failed,
     Finish,
-    GateVerdict,
     Idle,
     Job,
     Killed,
@@ -43,10 +42,8 @@ from isel.refresh import (
     ScoredState,
     Status,
     StepName,
-    TagCoverage,
     VerifyRecord,
     execute,
-    judge,
     plan,
     read_outcome,
     record,
@@ -66,7 +63,6 @@ EXPORT_ID = "2026-11-29T03:00:00+00:00"
 CUTOFF = datetime.fromisoformat(EXPORT_ID)
 OLD = DbRun(1, "r0", "live", datetime(2026, 11, 14, 3, tzinfo=UTC))
 NEW_LIVE = DbRun(2, "r1", "live", CUTOFF)
-PASSED = GateVerdict("r1", "r0", 9, 0.5, {"head": TagCoverage(0.5, 0.4, 1.25)}, True)
 S = StepName
 
 
@@ -111,17 +107,10 @@ def evidence_through(step: StepName | None, **over) -> Evidence:
     return Evidence(**{**fields, **over})
 
 
-def outcome_through(step: StepName | None, **over) -> Outcome:
-    gated = step is not None and [s.name for s in BUILD].index(step) >= [
-        s.name for s in BUILD].index(S.GATES)
-    return Outcome(G, gates=PASSED if gated else None, **over)
-
-
 @pytest.mark.parametrize("i", range(len(BUILD)))
 def test_plan_runs_the_first_build_step_not_done(cfg, w, i):
     before = BUILD[i - 1].name if i else None
-    decision = plan(w, evidence_through(before), outcome_through(before), _at(11, 29, 3),
-                    cfg.refresh)
+    decision = plan(w, evidence_through(before), Outcome(G), _at(11, 29, 3), cfg.refresh)
     assert decision == Run(BUILD[i].name, w.swap_by)
 
 
@@ -169,22 +158,8 @@ def test_plan_reads_a_live_row_without_cutoff_as_an_earlier_cycle(cfg, w):
 @pytest.mark.parametrize("taken_off", ["rolled_back", "abandoned", "retired"])
 def test_plan_stops_a_cycle_whose_run_was_taken_off(cfg, w, taken_off):
     ev = evidence_through(S.PUBLISH, db_run=DbRun(2, "r1", taken_off, CUTOFF))
-    decision = plan(w, ev, outcome_through(S.PUBLISH), _at(12, 1, 9), cfg.refresh)
+    decision = plan(w, ev, Outcome(G), _at(12, 1, 9), cfg.refresh)
     assert decision == Finish(Status.WITHDRAWN)
-
-
-def test_plan_stops_at_a_rejected_gate(cfg, w):
-    rejected = dc_replace(PASSED, passed=False)
-    decision = plan(w, evidence_through(S.SELECTION), Outcome(G, gates=rejected),
-                    _at(11, 30, 3), cfg.refresh)
-    assert decision == Finish(Status.SKIPPED_GATE, S.GATES)
-
-
-def test_plan_gates_again_when_the_verdict_was_for_another_run(cfg, w):
-    other = dc_replace(PASSED, run_label="r9", passed=False)
-    decision = plan(w, evidence_through(S.SELECTION), Outcome(G, gates=other), _at(11, 30, 3),
-                    cfg.refresh)
-    assert decision == Run(S.GATES, w.swap_by)
 
 
 def test_plan_fails_a_step_after_max_attempts(cfg, w):
@@ -202,7 +177,7 @@ def test_plan_counts_failures_per_step(cfg, w):
         S.MODEL, w.swap_by)
 
 
-VERIFIED = outcome_through(S.SWAP, verify=VerifyRecord("r1", 9, {"head": 0.5}))
+VERIFIED = Outcome(G, verify=VerifyRecord("r1", 9, {"head": 0.5}))
 
 
 @pytest.mark.parametrize("now, decision", [
@@ -222,7 +197,7 @@ def test_plan_starts_a_sync_only_with_its_budget_outside_the_freeze(cfg, w, now,
 
 def test_plan_verifies_inside_the_freeze(cfg, w):
     # verify reads 15k URLs as the metric does; only the sync waits for the freeze.
-    assert plan(w, evidence_through(S.SWAP), outcome_through(S.SWAP), _at(12, 1, 12),
+    assert plan(w, evidence_through(S.SWAP), Outcome(G), _at(12, 1, 12),
                 cfg.refresh) == Run(S.VERIFY, w.ends_at)
 
 
@@ -232,11 +207,6 @@ def test_plan_cleans_up_then_finishes(cfg, w):
     assert plan(w, stray, synced, _at(12, 1, 21), cfg.refresh) == Run(S.CLEANUP, w.ends_at)
     assert plan(w, evidence_through(S.SWAP), synced, _at(12, 1, 21),
                 cfg.refresh) == Finish(Status.DONE)
-
-
-def test_plan_never_builds_after_a_swap_even_without_a_gate_record(cfg, w):
-    decision = plan(w, evidence_through(S.SWAP), Outcome(G), _at(11, 30, 3), cfg.refresh)
-    assert decision == Run(S.VERIFY, w.ends_at)
 
 
 def test_plan_syncs_again_when_the_live_run_changed(cfg, w):
@@ -259,14 +229,6 @@ def test_evidence_refuses_a_chain_with_a_missing_link(over):
 def test_evidence_refuses_a_row_of_another_run():
     with pytest.raises(ValueError, match="inconsistent evidence"):
         evidence_through(S.PUBLISH, db_run=DbRun(5, "r5", "validated", CUTOFF))
-
-
-def test_judge_needs_both_gates():
-    rc = load_config([BASE]).refresh                    # overlap 0.3, coverage 0.9
-    good = {"head": TagCoverage(0.5, 0.5, 1.0), "random": TagCoverage(0.2, 0.0, None)}
-    assert judge(0.3, good, rc) is True                 # at the threshold; no live hit passes
-    assert judge(0.29, good, rc) is False
-    assert judge(0.9, {**good, "head": TagCoverage(0.44, 0.5, 0.88)}, rc) is False
 
 
 # ---------------------------------------------------------------- evidence on disk
@@ -416,31 +378,32 @@ def test_disk_a_run_without_its_manifest_file_is_selected_again_and_cleaned(cfg,
     assert next_step(cfg).step is S.SELECTION
 
 
-def test_disk_a_finished_run_goes_to_the_gates(cfg, db):
+def test_disk_a_finished_run_goes_to_publish(cfg, db):
     build_disk(cfg.work_dir, S.SELECTION)
-    assert next_step(cfg).step is S.GATES
+    assert next_step(cfg).step is S.PUBLISH
 
 
 # ---------------------------------------------------------------- outcome
 
 
 def test_record_counts_failures_per_step_and_keeps_only_the_kind():
-    gates = refresh.STEP[S.GATES]
-    out = record(Outcome(G), gates, Failed("OperationalError"))
+    verify = refresh.STEP[S.VERIFY]
+    out = record(Outcome(G), verify, Failed("OperationalError"))
     out = record(out, refresh.STEP[S.EXPORT], Failed("QueryCanceled"))
-    assert out.failures == {S.GATES: 1, S.EXPORT: 1}
+    assert out.failures == {S.VERIFY: 1, S.EXPORT: 1}
     assert out.error == refresh.StepError(S.EXPORT, "QueryCanceled")
-    killed = record(out, gates, Killed())
+    killed = record(out, verify, Killed())
     assert killed.failures == out.failures and killed.error.kind == "deadline"
-    assert record(out, gates, Deferred()) == out
+    assert record(out, verify, Deferred()) == out
     assert record(out, refresh.STEP[S.SAMPLE], Completed({"rows": 1})) == out
-    assert record(out, gates, Completed(PASSED)).gates == PASSED
+    verified = VerifyRecord("r1", 9, {"head": 0.25})
+    assert record(out, verify, Completed(verified)).verify == verified
 
 
 def test_outcome_round_trips_through_its_file(cfg):
     out = Outcome(
         G, status=Status.DONE, failures={S.EXPORT: 2}, error=refresh.StepError(None, "x"),
-        pending=S.SYNC, gates=PASSED, verify=VerifyRecord("r1", 9, {"head": 0.25}),
+        pending=S.SYNC, verify=VerifyRecord("r1", 9, {"head": 0.25}),
         synced_run_id=7, audit=refresh.Audit("r1", 2, "r1", 10, "dev", _at(12, 1, 21)))
     write_outcome(cfg, out)
     assert read_outcome(cfg, G) == out
@@ -618,9 +581,9 @@ def test_status_changes_nothing(cfg, db):
     before = tree()
     report = status(cfg, lambda: _at(11, 30, 3))
     assert tree() == before
-    assert report["next"] == {"run": "gates", "deadline": _at(12, 1, 11).isoformat()}
+    assert report["next"] == {"run": "publish", "deadline": _at(12, 1, 11).isoformat()}
     assert report["work_lock"] == "free"
-    assert [s["done"] for s in report["steps"]] == [True] * 9 + [False] * 6
+    assert [s["done"] for s in report["steps"]] == [True] * 9 + [False] * 5
 
 
 def test_status_names_the_error_when_selectdb_cannot_be_read(cfg, monkeypatch):
@@ -786,7 +749,6 @@ def test_the_steps_table_matches_the_cycle():
     assert [s.name for s in STEPS] == list(StepName)
     assert [s.name for s in refresh.FOLLOW] == [S.VERIFY, S.SYNC, S.CLEANUP]
     assert BUILD[-1].name is S.SWAP
-    assert [s.name for s in BUILD].index(S.GATES) < [s.name for s in BUILD].index(S.PUBLISH)
 
 
 def test_the_export_step_waits_for_missing_shards(cfg, w, monkeypatch):
@@ -884,7 +846,7 @@ def test_every_database_step_waits_out_a_lost_connection(cfg, w, monkeypatch, st
         raise psycopg.OperationalError(error)
 
     monkeypatch.setattr(importlib.import_module(module), opener, refuse)
-    job = Job(cfg, w, evidence_through(S.GATES), lambda: _at(11, 29, 3))
+    job = Job(cfg, w, evidence_through(S.SELECTION), lambda: _at(11, 29, 3))
     assert execute(refresh.STEP[step].act, job) == result
 
 

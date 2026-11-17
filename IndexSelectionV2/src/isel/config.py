@@ -198,8 +198,6 @@ class RefreshCfg:
     start_grace_min: int
     swap_margin_min: int
     sync_budget_min: int
-    min_overlap_share: float
-    min_coverage_ratio: float
     max_attempts: int
     poll_s: float
     kill_grace_s: float
@@ -669,8 +667,6 @@ def _validate_refresh(cfg: Config, need: Any) -> None:
     need((gap - r.start_days_before) * 24 * 60 + start - freeze_end >= r.sync_budget_min,
          f"refresh.start_days_before is too large for the {gap}-day gap between "
          "schedule.swap_freeze_days: the next cycle would start before this one can sync")
-    need(0 <= r.min_overlap_share <= 1 and 0 <= r.min_coverage_ratio <= 1,
-         "refresh.min_overlap_share and min_coverage_ratio must be in [0, 1]")
     need(r.max_attempts >= 1, "refresh.max_attempts must be >= 1")
     need(r.poll_s > 0, "refresh.poll_s must be > 0")
     need(r.kill_grace_s >= 0, "refresh.kill_grace_s must be >= 0")
