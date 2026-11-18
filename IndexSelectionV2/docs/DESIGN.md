@@ -8,16 +8,17 @@
 
 **Goals**
 
-- Every two weeks, pick K = 128,000,000 of the ~1.66 billion crawled URLs so that the
+- Every two weeks, pick K = 64,000,000 of the ~1.66 billion crawled URLs so that the
   next golden batch's `indexed_rate` is as high as possible.
+- Do it unattended. The `refresh` service builds, publishes and swaps a new list before
+  every golden day, and the recrawl frontier follows it (§11).
 - Keep the method explainable, the evaluation free of leaks, and every number
   reproducible.
 - Publish the list where the official metric reads it, with the metric's own query.
 
 **Non-goals**
 
-- No scheduler. Each command is one run, except the two opt-in recrawl services
-  ([`RECRAWL.md`](RECRAWL.md)).
+- No automatic rollback and no automatic text index rebuild. Both stay manual (§11).
 - No writes to crawlerdb, metricdb, the v1 selectdb (`:5444`) or `/data/ipc`. The
   recrawl's results are deleted only through the crawler's API.
 - No page fetching of our own and no index building yet. The recrawl asks the crawler
@@ -48,9 +49,9 @@
 
 | Risk | Control |
 |---|---|
-| Writing crawlerdb (the role is a superuser) | Every session sets `default_transaction_read_only = on`. On top of that, `assert_read_only_sql` lexes each statement like PostgreSQL and allows one read statement only. `COPY` must be `COPY (SELECT ...) TO STDOUT`. Functions that change server state or run SQL text (`set_config`, `pg_terminate_backend`, advisory locks, `lo_*`, `query_to_xml`, ...) are refused. |
+| Writing crawlerdb (the role can write) | Every session sets `default_transaction_read_only = on`. On top of that, `assert_read_only_sql` lexes each statement like PostgreSQL and allows one read statement only. `COPY` must be `COPY (SELECT ...) TO STDOUT`. Functions that change server state or run SQL text (`set_config`, `pg_terminate_backend`, advisory locks, `lo_*`, `query_to_xml`, ...) are refused. |
 | Long statements | `statement_timeout` defaults to 120 s and never exceeds `guard.timeout_cap_s`. A shard that hits a timeout is retried on the next run. |
-| Server temp files | No server-side sort or aggregate; `temp_file_limit = 0`, `work_mem = 16MB`, no parallel workers. |
+| Server temp files | No server-side sort or aggregate, `work_mem = 16MB`, no parallel workers. YugabyteDB's `crawler` role is no superuser and may not set `temp_file_limit`. |
 | Reading while the metric works | `ReadGuard` runs before every statement. A statement may not reach into the 1st and 16th 00:00–20:00 UTC or any hour's :58–:10, even at its full timeout. It pauses while more than `guard.max_io_waiters` other sessions wait on IO (median of 3 probes). |
 | Read load | `pull-full` reads one `yb_hash_code(url)` range per `COPY`, `full.hash_chunks` ranges per shard table (§4.1). All sessions share one budget of `full.max_mb_s` CSV bytes per second, to be set from a one-shard run on the cluster. |
 | Leaking credentials | DSNs come from env variables or secret files; JSON output passes `assert_no_secrets`. |
@@ -339,6 +340,7 @@ distinct canonical golden URLs.
 |---|---|
 | `profiles: [job]`, used with `run --rm` | one container per command; `up` starts nothing |
 | except `recrawl-plan`, `recrawl-archive` (`profiles: [recrawl]`) | long-running loops with `restart: unless-stopped`, one instance each (advisory lock). `recrawl-plan` uses `network_mode: host` to reach the crawler API on `127.0.0.1:4000`; both mount `/data/manual_bulk_crawls/results` read-only and `/data/isel` writable |
+| and `refresh` (`profiles: [refresh]`) | the refresh loop (§11) with `restart: unless-stopped`. It extends `isel`: the same bridge network, secrets, `/work` and limits as the jobs it replaces. It runs one step process at a time. `OPENBLAS_NUM_THREADS=1`, because the parent loads numpy and idles for days |
 | `read_only: true`, `tmpfs: /tmp` | only `/work` is writable |
 | secrets as `<NAME>_FILE` | DSNs never appear in `docker inspect`, env or logs |
 | `mem_limit` 128g, `cpus` 32 | DuckDB 96 GB and LightGBM 32 threads fit below the limit |
@@ -380,7 +382,7 @@ $J recrawl-sync --dry-run --run <id>   # what the swap keeps, adds and drops; wr
 $J swap --db-run-id <n>
 $J verify-live --batch <b>
 # recrawl (docs/RECRAWL.md §11), against the crawler API as Host2 runs it
-$J recrawl-sync                        # after each swap; refused in the freeze window
+$J recrawl-sync                        # after a manual swap; refused in the freeze window
 $D run --rm text-index text-index-build   # after each sync: index the new list's docs
 $J recrawl-plan --dry-run              # per-host capacity report; sends nothing
 $D --profile recrawl up -d recrawl-archive recrawl-plan
@@ -389,6 +391,113 @@ $D --profile recrawl stop recrawl-plan # stops sending new jobs at once
 
 **Recovery**
 
-- A bad list: `$J rollback` restores the previous list at once.
+- A bad list: stop `refresh`, then run `$J rollback` and `$J recrawl-sync` (below).
 - The metric back on v1: the TA sets `--select_db_url` back to `:5444`.
-- Every command resumes: rerun it after an interruption.
+- After an interruption, `pull-full` and `score-full` resume, and `swap` and
+  `recrawl-sync` are safe to rerun.
+- `derive-sample` refuses a finished sample, and `derive-positives` refuses files
+  without `_meta.json`. Move the directory away first.
+- `publish` loads in one transaction. A second `publish` of a run that loaded fails on
+  `run_label`.
+- `refresh` handles all of these cases from the evidence on disk.
+
+### Automatic refresh
+
+`$D --profile refresh up -d refresh` starts a loop that makes a new list live before
+every golden day G (a `schedule.swap_freeze_days` day). Run `check-config` on the image
+first. The service needs the TA's standing approval: it reads crawlerdb (`pull-full`)
+and metricdb (`pull-golden`) every two weeks.
+
+Each G owns one cycle (`isel/schedule.py`, `[refresh]` in the config):
+
+| Time (UTC) | What happens |
+|---|---|
+| `start_at` = G−2, 02:15 | clear the old export; pull golden and dims; export crawlerdb |
+| until `swap_by` = G 11:00 | derive the sample and positives, train, score, select; publish; swap |
+| after the swap | verify; `recrawl-sync`, which starts only with 2 h left before the 11:30 freeze or after the freeze ends; delete every selection run but live and prev |
+| `ends_at` = the next G−2, 02:15 | the next cycle starts |
+
+The steps after the swap run even after `swap_by`. The live run belongs to the cycle
+when its `model_runs.cutoff_datetime` is at or after `start_at`.
+
+- **No progress file.** Before each step, `refresh` reads the evidence: the stamps in
+  `_meta.json`, `meta.json` and `_MANIFEST.json`, and the `model_runs` rows. A killed
+  step is planned again and starts from what it left.
+- **One step process.** Each step runs in its own spawned process and process group.
+  However the step ends, by returning, by dying or at its deadline, what is left of the
+  group gets SIGTERM, then SIGKILL, before the outcome is written. A step process still
+  alive gets up to `refresh.kill_grace_s` between the two. A step process killed by the
+  OOM killer thus takes its pool workers with it at once.
+  `docker compose stop refresh` ends the group the same way.
+- **What a cycle checks.** A step is done only when its evidence holds. Every export
+  shard finished. The sample, positives, model and scores carry the stamps of this
+  export. The selection run has K rows and a `_MANIFEST.json`. `publish` verifies the
+  manifest's checksums and loads exactly K unique URLs. The live row is this cycle's
+  run, `verify` reads exactly one live row, and the sync loaded the live run's id. A
+  step that returns without its evidence counts as a failure.
+- **No model judgment.** A cycle does not compare the new list with the live one, so a
+  new model may replace most of the old list. `verify` records the metric rate per tag,
+  and the live and prev runs stay in the work dir until the next cleanup. Quality
+  thresholds, if any, belong to a separate evaluation.
+- **The first start.** The service acts on the cycle that owns the moment it
+  starts. Before that cycle's `clear_by` (`start_at` + `refresh.start_grace_min`, 12 h),
+  the cycle begins at once: it deletes the old export and reads crawlerdb. Later, it ends
+  `skipped_late` and keeps the old export, because a new one would not be ready by
+  `swap_by`. Work begins at the next `start_at`. A restart after the old export is gone
+  goes on until `swap_by`.
+- **The first swap** is followed by a cleanup that deletes every selection run but live
+  and prev.
+- **The text index** stays manual: run `text-index-build` after the sync.
+
+`$J refresh --status` prints the cycle, its outcome, the evidence, each step's state and
+the next decision. It writes nothing and holds no lock; `work_lock` says who holds
+it: `free`, `commands` or `refresh`. The outcome of each cycle is
+`work_dir/refresh/outcomes/<G>.json`:
+
+| Status | Meaning |
+|---|---|
+| `running` | the cycle has work left |
+| `done` | the new list is live, verified and synced; old selection runs are gone |
+| `skipped_late` | `swap_by` passed before the swap, or the cycle had not cleared the old export by `clear_by`; the old list stays live |
+| `withdrawn` | someone rolled back, abandoned or replaced this cycle's run |
+| `failed` | a step failed `max_attempts` times, or the cycle ended unfinished |
+
+An error stores the step and the exception class only. The message is in the log
+(`$D logs refresh`).
+
+A step that raises counts one failure toward `max_attempts`. Three cases do not count,
+and the step runs again on the next tick, until its deadline:
+
+- Any step lost or could not open a database connection: crawlerdb, metricdb or
+  selectdb. Every such step is safe to rerun, and the export resumes file by file.
+  A refusal that a retry repeats does count: a wrong password, a missing privilege,
+  or a setting the role may not change (`isel.pg.connection_lost`).
+- The export still misses shards.
+- The swap timed out on its lock.
+
+**Retry a cycle.** A finished cycle never acts again. To retry a `failed` cycle, delete
+or rename its outcome file `work_dir/refresh/outcomes/<G>.json` before `swap_by`. The
+next tick plans from the evidence: the export, sample, model, scores and selection run
+on disk are kept. Refresh reads only `<YYYY-MM-DD>.json` names there, so a renamed copy
+such as `<G>.failed.json` stays as a record.
+
+**The work lock.** A refresh tick holds `work_dir/refresh/lock` exclusively while it
+observes and runs a step. Every command that reads or writes what refresh rebuilds, or
+uses `duckdb_tmp`, holds it shared: `pull-*`, `derive-*`, `validate-routing`,
+`build-dataset`, `backtest`, `train`, `forward-eval`, `select-sample`, `score-full`,
+`select-full`, `migrate-selectdb`, `publish`, `swap`, `rollback` and `recrawl-sync`.
+These commands still run beside each other. Beside a refresh step they exit with code 3,
+and refresh skips its ticks while they run. `check-config`, `report`, `verify-live`,
+`validate-manifest`, the recrawl loops and the text index commands never take the lock.
+
+**Roll back by hand.**
+
+```bash
+$D --profile refresh stop refresh      # ends the running step's process group
+$J rollback
+$J recrawl-sync                        # the frontier follows the restored list
+$D --profile refresh up -d refresh     # a cycle whose run was rolled back ends `withdrawn`
+```
+
+A finished cycle never acts again. After a manual swap or rollback, run
+`recrawl-sync` by hand.

@@ -23,7 +23,6 @@ before it merges.
 
 from __future__ import annotations
 
-import fcntl
 import http.client
 import json
 import logging
@@ -34,7 +33,6 @@ import urllib.request
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import contextmanager
 from datetime import datetime
 from hashlib import sha256
 from math import ceil
@@ -50,6 +48,7 @@ from isel.config import Config, TextIndexCfg
 from isel.io import (
     atomic_write_json,
     code_version,
+    file_lock,
     open_duckdb,
     sql_str,
     utc_id,
@@ -372,18 +371,6 @@ def _drop(client: OpenSearch, index: str) -> None:
         log.exception("could not delete the failed index %s", index)
 
 
-@contextmanager
-def _build_lock(path: Path) -> Iterator[None]:
-    """Holds `path` during one build: a second build would delete the first one's index."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as fh:
-        try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise TextIndexError(f"another text-index-build holds {path}") from exc
-        yield
-
-
 def _swap(client: OpenSearch, alias: str, index: str, previous: list[str]) -> None:
     """Moves `alias` from `previous` to `index` in one call.
 
@@ -434,9 +421,10 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
     """Builds a new index from `text_root` and makes it the alias's only index.
 
     Raises:
-        TextIndexError: If another build holds the lock, a request fails, the disk lacks
-            room, or the index does not hold every doc; the new index is then deleted
-            and the alias is left as it was.
+        LockBusy: If another build holds `text_index/build.lock`: a second build would
+            delete the first one's index.
+        TextIndexError: If a request fails, the disk lacks room, or the index does not
+            hold every doc; the new index is then deleted and the alias is left as it was.
     """
     t = cfg.text_index
     spec_bytes = Path(t.settings_file).read_bytes()
@@ -447,7 +435,7 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
     built = cfg.work_dir / "text_index" / "build"
     started = time.monotonic()
     prior_file, prior_run = resolve_prior(cfg)
-    with _build_lock(cfg.work_dir / "text_index" / "build.lock"):
+    with file_lock(cfg.work_dir / "text_index" / "build.lock"):
         con = open_duckdb(cfg, cfg.work_dir / "text_index" / "tmp")
         try:
             rows, off_list, batches = latest_docs(con, text_root, t.read_batch_rows,

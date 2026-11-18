@@ -39,7 +39,9 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   `rank_feature`, `prior_scale / (rank + 1)`, from the doc's rank in the selection manifest
   (`prior_file`). With a prior, only the docs on that list are indexed, and a build with
   none of them fails. `prior_file = "live"` reads the live run's label from selectdb and
-  checks its manifest (`validate_run`), so a swap needs only a rebuild.
+  checks its manifest (`validate_run`), so a swap needs only a rebuild. The `refresh`
+  service does not rebuild the index: once its `recrawl-sync` is done (`refresh --status`),
+  run `text-index-build` by hand.
   `config/text_index/icu.json` holds the settings and mappings.
 - **Analysis.** One analyzer for every text field and language: `icu_tokenizer` (Unicode
   word breaks with dictionaries for CJK and Thai) and `icu_folding` (case, accents,

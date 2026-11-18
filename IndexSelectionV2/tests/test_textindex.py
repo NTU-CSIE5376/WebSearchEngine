@@ -12,7 +12,7 @@ from conftest import ROOT, replace, small_cfg
 from opensearch_fakes import OpenSearchStub
 
 from isel.golden import GOLDEN_SCHEMA, golden_path
-from isel.io import write_parquet_atomic
+from isel.io import LockBusy, write_parquet_atomic
 from isel.recrawl import TEXT_SCHEMA
 from isel.textindex import (
     DOC_FIELDS,
@@ -487,7 +487,7 @@ def test_a_second_build_waits_for_no_lock(cfg, stub, tmp_path):
     lock.parent.mkdir(parents=True)
     with lock.open("a") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
-        with pytest.raises(TextIndexError, match="another text-index-build"):
+        with pytest.raises(LockBusy):
             build(cfg, _client(stub), root)
     assert stub.paths("PUT") == []
 

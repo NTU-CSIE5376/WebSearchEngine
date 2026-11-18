@@ -26,11 +26,12 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
-from isel.config import Config, ScheduleCfg, hhmm_minutes
+from isel.config import Config
 from isel.evaluate import bootstrap, golden_by_tag, metric_rate, rates
 from isel.golden import read_golden
 from isel.io import assert_no_secrets, open_duckdb, sql_str
 from isel.manifest import validate_run
+from isel.schedule import swap_allowed
 from isel.schema import LIST_TABLE
 from isel.selectdb import assert_ready, connect
 
@@ -38,15 +39,6 @@ CURRENT = LIST_TABLE
 PREV = "selected_urls_prev"
 SWAP_TMP = "selected_urls_swap_tmp"
 RUN_TABLE_RE = r"^selected_urls_r[0-9]+$"
-
-
-def swap_allowed(now: datetime, cfg: ScheduleCfg) -> bool:
-    """False while the metric may read the list (measurement days, freeze window, UTC)."""
-    now = now.astimezone(UTC)
-    if now.day not in cfg.swap_freeze_days:
-        return True
-    start, end = (hhmm_minutes(v) for v in cfg.swap_freeze_window)
-    return not start <= now.hour * 60 + now.minute < end
 
 
 def _table_exists(cur: psycopg.Cursor, name: str) -> bool:

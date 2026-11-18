@@ -223,11 +223,12 @@ def pull_full(cfg: Config, sessions: Sequence[ReadOnlySession], out_dir: Path,
     layout is refused and file ranges never move. A shard
     whose COPY hits its timeout or lock_timeout, or fails serialization after
     `full.chunk_retries` rereads, is recorded in `shards_failed` and resumed by
-    the next run at file granularity. Any other error stops every
-    session after its current shard and is raised. `finished_at` is set once
-    every configured shard is done. The pool filter `last_fetch_ok < as_of`
-    drops rows fetched after the sample's S0, so a later export still scores
-    consistently.
+    the next run at file granularity. Any other error stops every session after
+    its current shard and is raised. `_meta.json` holds `started_at` before the
+    first part file, so an export cut off in its first shard still has its start.
+    `finished_at` is set once every configured shard is done. The pool filter
+    `last_fetch_ok < as_of` drops rows fetched after the sample's S0, so a later
+    export still scores consistently.
     """
     now = now or datetime.now(UTC)
     rate = rate or ByteRate(cfg.full.max_mb_s * 1e6)
@@ -243,17 +244,19 @@ def pull_full(cfg: Config, sessions: Sequence[ReadOnlySession], out_dir: Path,
     done = set(meta.get("shards_done", []))
     failed: dict[str, str] = meta.setdefault("shards_failed", {})
     meta.setdefault("shards_done", sorted(done))
+    lock = threading.Lock()   # guards `meta` and its file
+
+    def save() -> None:
+        with lock:
+            atomic_write_json(meta_path, meta)
+
+    save()
     todo: queue.Queue[int] = queue.Queue()
     for shard in _shards(cfg, shards):
         if shard not in done:
             todo.put(shard)
     total = todo.qsize()
-    lock = threading.Lock()   # guards `meta` and its file
     stop = threading.Event()
-
-    def save() -> None:
-        with lock:
-            atomic_write_json(meta_path, meta)
 
     def export(session: ReadOnlySession, shard: int) -> None:
         key = str(shard)
