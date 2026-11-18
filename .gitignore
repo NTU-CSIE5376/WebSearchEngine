@@ -2,3 +2,10 @@ __pycache__
 */__pycache__
 */*/__pycache__
 .env
+.env.selectdb
+runtime/
+IndexSelection_v1/data/
+IndexSelection_v1/artifacts/
+IndexSelection/data/
+IndexSelection/artifacts/
+IndexSelection/runtime/
