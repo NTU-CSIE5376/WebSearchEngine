@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -351,6 +351,29 @@ def cmd_refresh(cfg: Config, args: argparse.Namespace) -> Any:
     refresh.run_loop(cfg)
 
 
+def cmd_rank(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel import rankjob
+    from isel.recrawl import run_loop
+
+    golden_day = args.golden_day and date.fromisoformat(args.golden_day)
+    if golden_day and golden_day.day not in cfg.schedule.swap_freeze_days:
+        raise SystemExit(f"{golden_day} is not a schedule.swap_freeze_days day")
+    if args.loop and golden_day:
+        raise SystemExit("--golden-day runs once; it does not go with --loop")
+    if not (args.loop or args.once or args.dry_run or golden_day):
+        raise SystemExit("choose --loop, --once, --dry-run or --golden-day")
+
+    def once() -> dict[str, Any]:
+        with rankjob.real_ports(cfg) as ports:
+            if args.dry_run:
+                return rankjob.dry_run(cfg, ports, golden_day=golden_day)
+            return rankjob.tick(cfg, ports, golden_day=golden_day)
+
+    if args.loop:
+        run_loop(once, cfg.rank.poll_s, once=False)
+    return once()
+
+
 def cmd_check_config(cfg: Config, args: argparse.Namespace) -> Any:
     out: dict[str, Any] = {"config_sha256": cfg.sha256()}
     from isel.features import resolve_set
@@ -431,6 +454,17 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--status", action="store_true",
                       help="print the cycle, its outcome, the evidence and the next step; "
                            "change nothing")
+    p = sub.add_parser("rank", help="the rank rate of each golden day G, written at G+3")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--loop", action="store_true", help="tick until stopped (the service)")
+    mode.add_argument("--once", action="store_true", help="run one tick and print it")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="print what a tick would decide and the counts on the current "
+                           "index; build nothing, write nothing")
+    p.add_argument("--golden-day", metavar="YYYY-MM-DD",
+                   help="this golden day, before its due time too, and whoever activated "
+                        "the live run; a done, refused or failed record stays: delete "
+                        "work/rank/<G>.json to run it again")
     return parser
 
 
@@ -474,6 +508,8 @@ COMMANDS: dict[str, Command] = {
     "validate-manifest": Command(cmd_validate_manifest, work=False),
     # Takes the lock itself, exclusively, for each tick that runs a step.
     "refresh": Command(cmd_refresh, work=False),
+    # A loop service like the recrawl loops; its build reads only the live run.
+    "rank": Command(cmd_rank, work=False),
 }
 
 

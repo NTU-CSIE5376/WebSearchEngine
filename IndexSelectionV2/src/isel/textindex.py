@@ -33,7 +33,7 @@ import urllib.request
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from datetime import datetime
+from datetime import UTC, datetime
 from hashlib import sha256
 from math import ceil
 from pathlib import Path
@@ -50,6 +50,7 @@ from isel.io import (
     code_version,
     file_lock,
     open_duckdb,
+    read_json,
     sql_str,
     utc_id,
     write_parquet_atomic,
@@ -387,6 +388,22 @@ def _swap(client: OpenSearch, alias: str, index: str, previous: list[str]) -> No
             return
         _drop(client, index)
         raise
+
+
+def alias_build(cfg: Config, client: OpenSearch) -> dict[str, Any] | None:
+    """The build record of the alias's only index, with its `started_at` (the UTC id).
+
+    None if the alias names no index or several, or the index has no build record.
+    """
+    t = cfg.text_index
+    names = _aliased(client, t.alias)
+    if len(names) != 1 or not _physical(t.alias).fullmatch(names[0]):
+        return None
+    out = read_json(cfg.work_dir / "text_index" / "build" / f"{names[0]}.json")
+    if out is None:
+        return None
+    started = datetime.strptime(names[0][len(t.alias) + 1:].upper(), "%Y%m%dT%H%M%S%fZ")
+    return {**out, "started_at": started.replace(tzinfo=UTC)}
 
 
 def resolve_prior(cfg: Config) -> tuple[str, str | None]:
