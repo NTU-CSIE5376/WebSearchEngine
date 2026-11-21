@@ -465,8 +465,8 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--loop", action="store_true", help="tick until stopped (the service)")
     mode.add_argument("--once", action="store_true", help="run one tick and print it")
     mode.add_argument("--dry-run", action="store_true",
-                      help="print what a tick would decide and the counts on the current "
-                           "index; build nothing, write nothing")
+                      help="print what a tick would decide and, if the alias holds a "
+                           "build, its counts; build nothing, write nothing")
     p.add_argument("--golden-day", metavar="YYYY-MM-DD",
                    help="this golden day, before its due time too, and whoever activated "
                         "the live run; a done, refused or failed record stays: delete "

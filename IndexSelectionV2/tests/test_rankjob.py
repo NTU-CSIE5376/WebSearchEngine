@@ -327,8 +327,6 @@ def test_a_small_drift_from_the_head_run_still_writes(world):
     world.metric.coverage["metric_headset_total"][head].update(total=203, indexed_num=104)
     world.tick(DUE)
     assert world.record().status is Status.DONE
-
-
     # The row keeps its own denominator: 201, not the recomputed 200.
     row = world.metric.coverage["metric_headset_a"][head]
     assert row["ranked_rate"] == pytest.approx(row["ranked_num"] / 201)
@@ -375,6 +373,14 @@ def test_dry_run_builds_and_writes_nothing(world):
     assert out["measured"]["random"]["teams"]["a"]["ranked_num"] == 1
     assert world.builds == [] and world.metric.writes == 0
     assert not (world.cfg.work_dir / "rank").exists()
+
+
+def test_dry_run_without_an_index_reports_instead_of_searching(world):
+    # Host2 before the first G+3: the alias names no index, so a search would 404.
+    out = dry_run(world.cfg, world.ports(Clock(DUE)), Clock(DUE))
+    assert (out["would"], out["index"], out["index_fresh"]) == ("build", None, False)
+    assert "measured" not in out
+    assert not [p for p in world.stub.paths("POST") if "_search" in p]
 
 
 def test_rerun_after_a_crash_past_commit_converges(world):

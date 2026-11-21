@@ -124,8 +124,8 @@ list: on run 3, 74.8 % of the 64M URLs after 72 h, 86.4 % after 14 days.
   counts; `<G>.ranked.parquet` holds each row's flags. The build is not recorded: the
   alias's index counts as built if its build record names the live run and it started
   after the due time. Every step can run again after a crash and gives the same values.
-- `--dry-run` prints what a tick would do and the counts on the current index, with every
-  refusal reason; it builds and writes nothing. `--golden-day G` runs G before its due
+- `--dry-run` prints what a tick would do and every refusal reason, plus the counts on
+  the alias's index if it holds a build; it builds and writes nothing. `--golden-day G` runs G before its due
   time and over a later activation.
 
 ## Decision rule (written before the NanoMIRACL runs, 2026-10-23 05:40 UTC)

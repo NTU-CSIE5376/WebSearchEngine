@@ -573,10 +573,11 @@ def tick(cfg: Config, ports: Ports, clock: Clock = utcnow,
 
 def dry_run(cfg: Config, ports: Ports, clock: Clock = utcnow,
             golden_day: date | None = None) -> dict[str, Any]:
-    """What a tick would decide, and the counts on the current alias; writes nothing.
+    """What a tick would decide, and the counts on the alias's index; writes nothing.
 
     It neither builds nor writes a file or a row. Refusal reasons, the live run's
-    activation included, come back as `problems`; the counts are measured anyway.
+    activation included, come back as `problems`; the counts are measured anyway, unless
+    the alias holds no build (before the first G+3 there is no index to search).
     """
     now = clock()
     g = pick_golden_day(now, cfg) if golden_day is None else golden_day
@@ -591,7 +592,7 @@ def dry_run(cfg: Config, ports: Ports, clock: Clock = utcnow,
         "index": ev.build and ev.build.index,
         "index_fresh": fresh(ev, min(due_at(g, cfg.rank), utc(now))),
     }
-    if ev.rows:
+    if ev.rows and ev.build is not None:
         out["measured"] = tag_results(count_ranks(ev.rows, ports.search, cfg.golden.tags,
                                                   cfg.rank), ev)
     return out
