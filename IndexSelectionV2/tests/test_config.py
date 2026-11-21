@@ -74,6 +74,15 @@ def test_base_config_loads(base_cfg):
     ("[text_index]\nprior_scale = 0.0\n", "prior_scale and prior_scaling_factor must be > 0"),
     ("[text_index]\nprior_scaling_factor = 0.0\n", "prior_scale and prior_scaling_factor"),
     ("[schedule]\nswap_freeze_days = []\n", "swap_freeze_days must not be empty"),
+    ("[rank]\nwriter_dsn_env = 'ISEL_METRICDB_DSN'\n", "rank.writer_dsn_env"),
+    # G+11 is the next cycle's start (13-day gap, start_days_before 2): it may swap.
+    ("[rank]\ndelay_days = 11\n", "before the next refresh cycle starts"),
+    ("[rank]\nstart_time = '24:00'\n", "rank.start_time must be before 24:00"),
+    ("[rank]\ncoverage_table_fmt = 'metric_{tag}set'\n", "{tag} and {team}"),
+    ("[rank]\nteams = { total = [0, 255] }\n", "must not be empty or name"),
+    ("[rank]\nteams = { a = [0, 128], b = [128, 255] }\n", "must not overlap"),
+    ("[rank]\nteams = { a = [0, 256] }\n", "shard ranges"),
+    ("[rank.session]\nstatement_timeout = '1000s'\n", "rank.session.statement_timeout"),
     # Feb 16 to Mar 1 is 13 days: a cycle that starts 13 days early overlaps the last one.
     ("[refresh]\nstart_days_before = 13\n", "start_days_before is too large"),
     ("[schedule]\nswap_freeze_days = [1, 2]\n", "start_days_before is too large"),

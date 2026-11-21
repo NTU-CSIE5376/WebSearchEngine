@@ -152,6 +152,20 @@ services:
     memswap_limit: 24g
     cpus: 4
 
+  # The rank rate of each golden day G, written at G+3 (docs/TEXT_INDEX.md): builds the
+  # text index from the live list, then writes only the rank fields of G's coverage rows
+  # as the metricdb role isel_rank. `run --rm rank rank --dry-run` writes nothing.
+  #   docker compose ... --profile rank up -d rank
+  rank:
+    extends: {service: text-index}
+    profiles: [rank]
+    command: ["rank", "--loop"]
+    restart: unless-stopped             # the state lives in /work/rank/<G>.json
+    environment:
+      ISEL_METRICDB_RANK_DSN_FILE: /run/secrets/metricdb_rank_dsn
+      OPENBLAS_NUM_THREADS: "1"         # the loop loads numpy through pyarrow and idles
+    secrets: [metricdb_rank_dsn]
+
 secrets:
   crawlerdb_yb_dsn:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/crawlerdb_yb_dsn
@@ -163,3 +177,5 @@ secrets:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_dsn
   selectdb_reader_password:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_password
+  metricdb_rank_dsn:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/metricdb_rank_dsn

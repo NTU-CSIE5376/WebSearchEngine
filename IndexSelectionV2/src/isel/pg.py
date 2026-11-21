@@ -515,3 +515,25 @@ def open_metricdb(cfg: Config) -> ReadOnlySession:
     """Opens metricdb under the same read windows, so a golden pull never sees half a batch."""
     m = cfg.metricdb
     return _open(cfg, m.dsn_env, "metric", m.session, m.connect_timeout_s, 0.0)
+
+
+def open_metricdb_writer(cfg: Config) -> psycopg.Connection:
+    """Opens metricdb as the rank writer (`rank.writer_dsn_env`), never the read DSN.
+
+    The role may only update the rank fields; this end checks the target is metricdb.
+
+    Raises:
+        RuntimeError: If the connection reaches a database without `metric_url`.
+    """
+    conn = connect(require_env(cfg.rank.writer_dsn_env), app_name=f"{cfg.run.app_name}_rank",
+                   session=cfg.rank.session, connect_timeout_s=cfg.metricdb.connect_timeout_s)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.metric_url') IS NOT NULL")
+            if not cur.fetchone()[0]:
+                raise RuntimeError(f"{cfg.rank.writer_dsn_env} reaches a database without "
+                                   "metric_url")
+    except BaseException:
+        conn.close()
+        raise
+    return conn

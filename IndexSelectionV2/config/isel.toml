@@ -376,3 +376,26 @@ flood_free_ratio = 0.05                  # free share the node's flood stage kee
 expected_bytes_per_doc = 1003            # icu.json on 44k crawled pages; a build needs
                                          # twice this per doc free before it loads
 progress_every = 1000                    # _bulk requests between progress log lines
+
+[rank]                                   # `isel rank --loop`: the rank rate of golden day G,
+                                         # written into G's coverage rows; docs/TEXT_INDEX.md
+delay_days = 3                           # due on G+3 ...
+start_time = "00:15"                     # ... at 00:15 UTC (23:58-00:10 is a guard gap). 72 h
+                                         # of recrawl fetched 74.8 % of the 64M list (run 3)
+poll_s = 600.0                           # seconds between ticks
+max_attempts = 3                         # failed ticks of one G before its record is `failed`
+writer_dsn_env = "ISEL_METRICDB_RANK_DSN"   # metricdb role isel_rank: UPDATE on
+                                         # metric_url.is_ranked and the coverage ranked_* only
+coverage_table_fmt = "metric_{tag}set_{team}"
+total_team = "total"                     # every URL, a -1 shard included
+teams = { a = [0, 127], b = [128, 255] } # [first, last] shard of each team, as the metric splits
+max_drift = 0.01                         # share a G row's total and indexed_num may differ from
+                                         # the batch rows. The 18:00 head measurement refetches
+                                         # the URLs of keywords shared with random (~50): b20
+                                         # random moved by 5 of 4,098 and 3 of 1,849. A later
+                                         # re-measure moves far more (b21 on 11-12: 655 to 1,343)
+
+[rank.session]
+statement_timeout = "120s"
+lock_timeout = "5s"
+idle_in_transaction_session_timeout = "60s"
