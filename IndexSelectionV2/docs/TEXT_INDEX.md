@@ -107,13 +107,19 @@ list: on run 3, 74.8 % of the 64M URLs after 72 h, 86.4 % after 14 days.
 - **Refusals.** The job writes nothing, and records why, if no batch or no rows of a
   tag exist; if the live run was activated after G's freeze began; if a table has not
   exactly one row dated G or G+1; or if that row's counts differ from the batch's rows,
-  which means a later measurement rewrote them. The total team's `total` must match
-  exactly; the other counts may drift by `rank.max_drift` (1 %), because the 18:00 head
-  measurement rewrites the rows it shares with random (b20: 5 of 4,098 URLs, 3 of 1,849
-  indexed). A re-measure moves far more (b21 on 11-12: 655 to 1,343 indexed).
+  which means a later measurement rewrote them. Every count may drift by
+  `rank.max_drift` (1 %). The 18:00 head measurement deletes and refetches the URLs of
+  the keywords it shares with random (52 in b20, 48 in b21) and rewrites their flags, so
+  random's 12:00 row counted a slightly different URL set (b20: 5 of 4,098 URLs, 3 of
+  1,849 indexed). A re-measure moves far more (b21 on 11-12: 655 to 1,343 indexed).
+  `ranked_rate` divides by the row's own `total`.
 - **Outages.** A lost database connection, an OpenSearch node that does not answer, or a
   manual `text-index-build` holding the build lock defers to the next tick. Any other
-  error counts an attempt; after `rank.max_attempts` the record is `failed`.
+  error, an HTTP error reply included, counts an attempt; after `rank.max_attempts` the
+  record is `failed`.
+- **Config.** `isel rank` stops at once unless `text_index.prior_file = "live"`, as
+  `config/text_index/host2.toml` sets it. The job owns the alias: at each G+3 it replaces
+  whatever index the alias holds, a manual experiment's included.
 - **State.** `work/rank/<G>.json` holds `pending`, `done`, `refused` or `failed` and the
   counts; `<G>.ranked.parquet` holds each row's flags. The build is not recorded: the
   alias's index counts as built if its build record names the live run and it started

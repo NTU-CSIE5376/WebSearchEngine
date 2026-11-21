@@ -359,9 +359,10 @@ def refusals(cfg: Config, golden_day: date, ev: Evidence, check_activation: bool
     """Why G's coverage rows cannot take a rank; empty if they can.
 
     The recomputed counts must match the row's: a mismatch means a later measurement
-    rewrote `is_indexed`, or the row is another measurement's. The total team's `total`
-    must be exact; the rest may drift by `rank.max_drift`, because the head measurement
-    rewrites the `is_indexed` and `shard_id` of rows it shares with random.
+    rewrote `is_indexed`, or the row is another measurement's. They may drift by
+    `rank.max_drift`: the 18:00 head measurement replaces the URLs of the keywords it
+    shares with random (about 50 per batch) and rewrites their `is_indexed` and
+    `shard_id`, so random's 12:00 row counted a slightly different URL set.
     """
     if ev.batch is None:
         return [f"no metric batch was created before {golden_day + timedelta(days=1)}"]
@@ -382,8 +383,7 @@ def refusals(cfg: Config, golden_day: date, ev: Evidence, check_activation: bool
             reasons.append(f"{table} has {len(rows)} rows dated {golden_day} or the day after")
             continue
         got, want = rows[0], counts[tag].teams[team]
-        exact_total = team == cfg.rank.total_team
-        if not (_close(got.total, want.total, 0.0 if exact_total else cfg.rank.max_drift)
+        if not (_close(got.total, want.total, cfg.rank.max_drift)
                 and _close(got.indexed_num, want.indexed_num, cfg.rank.max_drift)):
             reasons.append(f"{table} {got.stat_date}: total {got.total} and indexed_num "
                            f"{got.indexed_num}, batch {ev.batch.id} gives {want.total} "
@@ -450,16 +450,22 @@ def _reason(exc: BaseException) -> str:
 
 
 def tag_results(ranking: Ranking, ev: Evidence) -> dict[str, Any]:
-    """The record's per-tag counts; `stat_date` is None where no single row matched."""
+    """The record's per-tag counts; `stat_date` is None where no single row matched.
+
+    `ranked_rate` divides by the row's own `total`, so the row stays consistent with
+    the rates Metric wrote; without a single row it divides by the recomputed total.
+    """
     out: dict[str, Any] = {}
     for tag, tc in ranking.tags.items():
         teams = {}
         for team, c in tc.teams.items():
             rows = ev.coverage.get((tag, team), ())
-            teams[team] = {"stat_date": rows[0].stat_date.isoformat() if len(rows) == 1 else None,
+            row = rows[0] if len(rows) == 1 else None
+            total = row.total if row is not None and row.total is not None else c.total
+            teams[team] = {"stat_date": row and row.stat_date.isoformat(),
                            "total": c.total, "indexed_num": c.indexed_num,
                            "ranked_num": c.ranked_num,
-                           "ranked_rate": c.ranked_num / c.total if c.total else 0.0}
+                           "ranked_rate": c.ranked_num / total if total else 0.0}
         out[tag] = {"pairs_found": tc.pairs_found, "pairs_total": tc.pairs_total,
                     "teams": teams}
     return out
@@ -499,8 +505,10 @@ def transient(exc: BaseException) -> bool:
 
     if isinstance(exc, LockBusy) or connection_lost(exc):
         return True
-    return isinstance(exc, TextIndexError) and isinstance(
-        exc.__cause__, OSError | http.client.HTTPException)
+    # An HTTP reply carries a status; urllib's HTTPError is an OSError too, and a
+    # reply a retry repeats (400, 403, 500) must use up attempts.
+    return (isinstance(exc, TextIndexError) and exc.status is None
+            and isinstance(exc.__cause__, OSError | http.client.HTTPException))
 
 
 def _step(cfg: Config, now: datetime, record: RankRecord, ports: Ports, clock: Clock,

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import dataclasses
+import urllib.error
 from datetime import UTC, date, datetime, timedelta
 
 import psycopg
 import pyarrow.parquet as pq
 import pytest
-from conftest import replace
+from conftest import BASE, replace
 from opensearch_fakes import OpenSearchStub
 
 from isel import rankjob, textindex
+from isel.cli import main as cli_main
 from isel.io import LockBusy, atomic_write_json, utc_id
 from isel.rankjob import (
     Batch,
@@ -327,16 +329,24 @@ def test_a_small_drift_from_the_head_run_still_writes(world):
     assert world.record().status is Status.DONE
 
 
-def test_the_total_teams_total_must_be_exact(world):
-    extra = [_row(100 + n, "delta", ["head"], f"https://a.com/p{n}", True, 7)
+    # The row keeps its own denominator: 201, not the recomputed 200.
+    row = world.metric.coverage["metric_headset_a"][head]
+    assert row["ranked_rate"] == pytest.approx(row["ranked_num"] / 201)
+
+
+@pytest.mark.parametrize(("total", "status"), [(205, Status.DONE), (206, Status.REFUSED)])
+def test_the_total_team_may_drift_by_max_drift_only(world, total, status):
+    # The head run replaces the URLs of keywords it shares with random, so even the
+    # total moves. The batch gives 203: 2 of 205 is within 1 %, 3 of 206 is not.
+    extra = [_row(100 + n, "delta", ["head"], f"https://a.com/p{n}", n < 100, 7)
              for n in range(199)]
     world.metric.rows[22] = list(ROWS) + extra
+    world.metric.is_ranked.update({r.id: None for r in extra})
     head = STAT_DATE["head"]
-    world.metric.coverage["metric_headset_a"][head].update(total=200, indexed_num=200)
-    world.metric.coverage["metric_headset_total"][head].update(total=204, indexed_num=202)
+    world.metric.coverage["metric_headset_a"][head].update(total=200, indexed_num=101)
+    world.metric.coverage["metric_headset_total"][head].update(total=total, indexed_num=103)
     world.tick(DUE)
-    assert world.record().status is Status.REFUSED
-    assert "metric_headset_total" in world.record().reason
+    assert world.record().status is status
 
 
 def test_named_golden_day_runs_early_and_past_a_later_activation(world):
@@ -422,6 +432,23 @@ def test_a_failed_build_check_uses_an_attempt(world):
     world.build_error = textindex.TextIndexError("isel-text-x holds 9 docs, expected 10")
     world.tick(DUE)
     assert world.record().attempts == 1
+
+
+def test_an_http_error_reply_uses_an_attempt(world):
+    # urllib's HTTPError is an OSError; a reply the node repeats is not an outage.
+    error = textindex.TextIndexError("PUT /isel-text-x: HTTP 403 cluster_block_exception", 403)
+    error.__cause__ = urllib.error.HTTPError("http://127.0.0.1:9200", 403, "Forbidden",
+                                             None, None)
+    world.build_error = error
+    world.tick(DUE)
+    assert world.record().attempts == 1
+
+
+def test_rank_refuses_a_config_without_the_live_prior(tmp_path):
+    overlay = tmp_path / "overlay.toml"
+    overlay.write_text(f'[run]\nwork_dir = "{tmp_path / "work"}"\n')
+    with pytest.raises(SystemExit, match="prior_file"):
+        cli_main(["--config", str(BASE), "--config", str(overlay), "rank", "--once"])
 
 
 def test_ranked_urls_are_a_subset_of_indexed_ones(base_cfg):

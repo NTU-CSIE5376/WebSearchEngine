@@ -354,6 +354,7 @@ def cmd_refresh(cfg: Config, args: argparse.Namespace) -> Any:
 def cmd_rank(cfg: Config, args: argparse.Namespace) -> Any:
     from isel import rankjob
     from isel.recrawl import run_loop
+    from isel.textindex import LIVE_PRIOR
 
     golden_day = args.golden_day and date.fromisoformat(args.golden_day)
     if golden_day and golden_day.day not in cfg.schedule.swap_freeze_days:
@@ -362,6 +363,11 @@ def cmd_rank(cfg: Config, args: argparse.Namespace) -> Any:
         raise SystemExit("--golden-day runs once; it does not go with --loop")
     if not (args.loop or args.once or args.dry_run or golden_day):
         raise SystemExit("choose --loop, --once, --dry-run or --golden-day")
+    # Without the live list as prior, a build records no prior run, so the job would
+    # rebuild the shared alias on every attempt and never find it fresh.
+    if cfg.text_index.prior_file != LIVE_PRIOR:
+        raise SystemExit(f"rank needs text_index.prior_file = {LIVE_PRIOR!r} "
+                         "(config/text_index/host2.toml)")
 
     def once() -> dict[str, Any]:
         with rankjob.real_ports(cfg) as ports:
