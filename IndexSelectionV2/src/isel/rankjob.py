@@ -26,6 +26,7 @@ doc id, so the same index gives the same top k.
 from __future__ import annotations
 
 import enum
+import http.client
 import logging
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -479,6 +480,21 @@ def _measure_write(cfg: Config, record: RankRecord, ev: Evidence, ports: Ports,
                    written_at=clock(), tags=tags)
 
 
+def transient(exc: BaseException) -> bool:
+    """True for an outage a later tick may get past; it must not use up an attempt.
+
+    A dropped or unreachable database server, an OpenSearch node that did not answer,
+    and a manual `text-index-build` that holds the build lock.
+    """
+    from isel.pg import connection_lost
+    from isel.textindex import TextIndexError
+
+    if isinstance(exc, LockBusy) or connection_lost(exc):
+        return True
+    return isinstance(exc, TextIndexError) and isinstance(
+        exc.__cause__, OSError | http.client.HTTPException)
+
+
 def _step(cfg: Config, now: datetime, record: RankRecord, ports: Ports, clock: Clock,
           scheduled: bool) -> tuple[Decision, RankRecord]:
     ev = observe(cfg, record.golden_day, ports)
@@ -504,8 +520,8 @@ def tick(cfg: Config, ports: Ports, clock: Clock = utcnow,
 
     A final record, a tick before the due time and a busy lock idle without reading a
     database. Otherwise the tick refuses, or builds the index if it is not fresh, then
-    measures and writes. An exception counts an attempt; at `rank.max_attempts` the
-    record is `failed`.
+    measures and writes. A `transient` error defers to the next tick; any other
+    exception counts an attempt, and at `rank.max_attempts` the record is `failed`.
     """
     now = clock()
     scheduled = golden_day is None
@@ -518,12 +534,17 @@ def tick(cfg: Config, ports: Ports, clock: Clock = utcnow,
                 try:
                     decision, record = _step(cfg, now, record, ports, clock, scheduled)
                 except Exception as exc:
-                    log.exception("rank tick of %s failed", g)
-                    attempts = record.attempts + 1
-                    failed = attempts >= cfg.rank.max_attempts
-                    decision = Idle(f"attempt {attempts} failed")
-                    record = replace(record, attempts=attempts, reason=_reason(exc),
-                                     status=Status.FAILED if failed else Status.PENDING)
+                    if transient(exc):
+                        log.warning("rank tick of %s deferred: %s", g, _reason(exc))
+                        decision = Idle(f"deferred: {_reason(exc)}")
+                        record = replace(record, reason=decision.why)
+                    else:
+                        log.exception("rank tick of %s failed", g)
+                        attempts = record.attempts + 1
+                        failed = attempts >= cfg.rank.max_attempts
+                        decision = Idle(f"attempt {attempts} failed")
+                        record = replace(record, attempts=attempts, reason=_reason(exc),
+                                         status=Status.FAILED if failed else Status.PENDING)
                 _save(cfg, record)
     except LockBusy:
         return {"golden_day": g.isoformat(), "decision": "idle",

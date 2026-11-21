@@ -3,13 +3,14 @@ from __future__ import annotations
 import dataclasses
 from datetime import UTC, date, datetime, timedelta
 
+import psycopg
 import pyarrow.parquet as pq
 import pytest
 from conftest import replace
 from opensearch_fakes import OpenSearchStub
 
 from isel import rankjob, textindex
-from isel.io import atomic_write_json, utc_id
+from isel.io import LockBusy, atomic_write_json, utc_id
 from isel.rankjob import (
     Batch,
     CoverageRow,
@@ -140,6 +141,7 @@ class World:
         self.metric = FakeMetricDb()
         self.live = LIVE
         self.builds = []
+        self.build_error = None
         self.client = textindex.OpenSearch(stub.url, 5.0, 0, 0.0)
 
     def put_index(self, started_at, prior_run):
@@ -155,6 +157,8 @@ class World:
 
     def ports(self, clock):
         def build():
+            if self.build_error is not None:
+                raise self.build_error
             self.builds.append(self.put_index(clock(), self.live and self.live.label))
 
         return Ports(metric=self.metric, live_run=lambda: self.live,
@@ -362,6 +366,36 @@ def test_attempts_end_in_failed(world):
     assert record.attempts == world.cfg.rank.max_attempts
     assert "metricdb down" in record.reason
     assert world.tick(DUE + timedelta(hours=2))["decision"] == "idle"
+
+
+@pytest.mark.parametrize("outage", [
+    psycopg.errors.AdminShutdown("terminating connection due to administrator command"),
+    textindex.TextIndexError("GET /_alias/isel-text: ConnectionRefusedError()"),
+    LockBusy("another process holds text_index/build.lock"),
+])
+def test_an_outage_defers_without_using_an_attempt(world, outage):
+    if isinstance(outage, textindex.TextIndexError):
+        outage.__cause__ = ConnectionRefusedError()
+
+    def down(*args):
+        raise outage
+
+    world.metric.batch_before = down
+    for n in range(world.cfg.rank.max_attempts + 1):
+        out = world.tick(DUE + timedelta(minutes=10 * n))
+        assert out["decision"] == "idle" and out["why"].startswith("deferred")
+    record = world.record()
+    assert record.status is Status.PENDING and record.attempts == 0
+    del world.metric.batch_before
+    world.tick(DUE + timedelta(hours=1))
+    assert world.record().status is Status.DONE
+    assert world.ranked() == RANKED
+
+
+def test_a_failed_build_check_uses_an_attempt(world):
+    world.build_error = textindex.TextIndexError("isel-text-x holds 9 docs, expected 10")
+    world.tick(DUE)
+    assert world.record().attempts == 1
 
 
 def test_ranked_urls_are_a_subset_of_indexed_ones(base_cfg):
