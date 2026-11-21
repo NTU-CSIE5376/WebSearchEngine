@@ -4,7 +4,18 @@ import hashlib
 
 import pytest
 
-from isel.urlnorm import DomainKeyer, ShardRouter, canonicalize, md5_number_lower, wire_url
+from isel.urlnorm import (
+    DomainKeyer,
+    ShardRouter,
+    canonicalize,
+    lookup_urls,
+    md5_number_lower,
+    strip_srsltid,
+    wire_url,
+)
+
+# The cases of Metric tests/test_coverage_srsltid.py: the rank job must count the same URLs.
+TOKEN = "AfmBOoqfCkB7Gr36L8FzV4ncwpCatQZRYNOjavRk_Qp1ZbjcmArzMmZw"
 
 
 def test_shard_router_matches_crawler_rule(base_cfg):
@@ -58,3 +69,24 @@ def test_wire_url_encodes_what_the_api_rejects(url, wire):
 ])
 def test_wire_url_keeps_a_valid_url(url):
     assert wire_url(url) == url
+
+
+@pytest.mark.parametrize(("url", "stripped"), [
+    (f"https://ew.com/story-12174222?srsltid={TOKEN}", "https://ew.com/story-12174222"),
+    (f"https://a.com/s?sort=relevance&srsltid={TOKEN}&term=b",
+     "https://a.com/s?sort=relevance&term=b"),
+    ("https://a.com/?SrsLtId=x", "https://a.com/"),
+    ("https://a.com/p?srsltid=x#reviews", "https://a.com/p#reviews"),
+    ("https://a.com/p?id=1", "https://a.com/p?id=1"),
+    ("https://a.com/p?xsrsltid=1", "https://a.com/p?xsrsltid=1"),
+    ("https://a.com/srsltid/page", "https://a.com/srsltid/page"),
+])
+def test_strip_srsltid(url, stripped):
+    assert strip_srsltid(url) == stripped
+
+
+def test_lookup_urls_add_only_the_srsltid_variant():
+    assert lookup_urls("https://a.com/p?id=1") == ["https://a.com/p?id=1"]
+    assert lookup_urls("https://a.com/p?utm_source=x") == ["https://a.com/p?utm_source=x"]
+    golden = canonicalize(f"https://a.com/p?srsltid={TOKEN}&id=1")
+    assert lookup_urls(golden) == [golden, "https://a.com/p?id=1"]

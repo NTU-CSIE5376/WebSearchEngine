@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable, Mapping
 from functools import lru_cache
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote_plus, urlsplit, urlunsplit
 
 import tldextract
 from w3lib.url import canonicalize_url
@@ -30,6 +30,37 @@ def canonicalize(url: str) -> str:
         return canonicalize_url(url)
     except Exception:
         return url
+
+
+def strip_srsltid(url: str) -> str:
+    """Returns `url` without Google's `srsltid` tracking parameter.
+
+    Google appends `srsltid` to result links for Merchant Center attribution; it does
+    not change the page and differs per search. Other query pieces keep their encoding
+    and order. Same rule as Metric `strip_srsltid` and WebCrawler `libs.urls`.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if "srsltid" not in parts.query.lower():
+        return url
+    kept = [piece for piece in parts.query.split("&")
+            if unquote_plus(piece.partition("=")[0]).lower() != "srsltid"]
+    query = "&".join(kept)
+    if query == parts.query:
+        return url
+    return urlunsplit(parts._replace(query=query))
+
+
+def lookup_urls(canonical: str) -> list[str]:
+    """The stored URLs that count as the golden URL `canonical`, as the metric counts them.
+
+    The golden URL itself, plus its `srsltid`-stripped form: golden_inject stores the
+    stripped form and the spider may store either. Metric `golden_lookup_urls`.
+    """
+    stripped = strip_srsltid(canonical)
+    return [canonical] if stripped == canonical else [canonical, stripped]
 
 
 def wire_url(url: str) -> str:
