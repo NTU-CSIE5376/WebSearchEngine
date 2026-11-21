@@ -106,8 +106,14 @@ list: on run 3, 74.8 % of the 64M URLs after 72 h, 86.4 % after 14 days.
   before G+1.
 - **Refusals.** The job writes nothing, and records why, if no batch or no rows of a
   tag exist; if the live run was activated after G's freeze began; if a table has not
-  exactly one row dated G or G+1; or if that row's `total` or `indexed_num` differs from
-  the batch's rows, which means a later measurement rewrote them.
+  exactly one row dated G or G+1; or if that row's counts differ from the batch's rows,
+  which means a later measurement rewrote them. The total team's `total` must match
+  exactly; the other counts may drift by `rank.max_drift` (1 %), because the 18:00 head
+  measurement rewrites the rows it shares with random (b20: 5 of 4,098 URLs, 3 of 1,849
+  indexed). A re-measure moves far more (b21 on 11-12: 655 to 1,343 indexed).
+- **Outages.** A lost database connection, an OpenSearch node that does not answer, or a
+  manual `text-index-build` holding the build lock defers to the next tick. Any other
+  error counts an attempt; after `rank.max_attempts` the record is `failed`.
 - **State.** `work/rank/<G>.json` holds `pending`, `done`, `refused` or `failed` and the
   counts; `<G>.ranked.parquet` holds each row's flags. The build is not recorded: the
   alias's index counts as built if its build record names the live run and it started
