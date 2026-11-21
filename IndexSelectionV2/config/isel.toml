@@ -389,6 +389,11 @@ writer_dsn_env = "ISEL_METRICDB_RANK_DSN"   # metricdb role isel_rank: UPDATE on
 coverage_table_fmt = "metric_{tag}set_{team}"
 total_team = "total"                     # every URL, a -1 shard included
 teams = { a = [0, 127], b = [128, 255] } # [first, last] shard of each team, as the metric splits
+max_drift = 0.01                         # share a G row's team totals and indexed_num may differ
+                                         # from the batch rows. The 18:00 head measurement
+                                         # rewrites rows shared with random: b20 random moved by
+                                         # 5 of 4,098 and 3 of 1,849. A later re-measure moves far
+                                         # more (b21 on 11-12: 655 to 1,343). Total stays exact
 
 [rank.session]
 statement_timeout = "120s"

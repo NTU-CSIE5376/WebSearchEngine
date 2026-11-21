@@ -313,6 +313,32 @@ def test_refusals_write_nothing_and_stay_refused(world, break_it, reason):
     assert world.tick(DUE + timedelta(hours=1))["decision"] == "idle"
 
 
+def test_a_small_drift_from_the_head_run_still_writes(world):
+    # Within rank.max_drift of the batch rows, as the 18:00 head run left b20's random
+    # rows: team a moves by one URL and one indexed URL, the total by one indexed URL.
+    extra = [_row(100 + n, "delta", ["head"], f"https://a.com/p{n}", n < 100, 7)
+             for n in range(199)]
+    world.metric.rows[22] = list(ROWS) + extra
+    world.metric.is_ranked.update({r.id: None for r in extra})
+    head = STAT_DATE["head"]
+    world.metric.coverage["metric_headset_a"][head].update(total=201, indexed_num=102)
+    world.metric.coverage["metric_headset_total"][head].update(total=203, indexed_num=104)
+    world.tick(DUE)
+    assert world.record().status is Status.DONE
+
+
+def test_the_total_teams_total_must_be_exact(world):
+    extra = [_row(100 + n, "delta", ["head"], f"https://a.com/p{n}", True, 7)
+             for n in range(199)]
+    world.metric.rows[22] = list(ROWS) + extra
+    head = STAT_DATE["head"]
+    world.metric.coverage["metric_headset_a"][head].update(total=200, indexed_num=200)
+    world.metric.coverage["metric_headset_total"][head].update(total=204, indexed_num=202)
+    world.tick(DUE)
+    assert world.record().status is Status.REFUSED
+    assert "metric_headset_total" in world.record().reason
+
+
 def test_named_golden_day_runs_early_and_past_a_later_activation(world):
     _late_activation(world)
     early = DUE - timedelta(days=1)

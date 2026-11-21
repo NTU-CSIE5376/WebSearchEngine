@@ -358,8 +358,10 @@ def waiting(cfg: Config, now: datetime, record: RankRecord, scheduled: bool) -> 
 def refusals(cfg: Config, golden_day: date, ev: Evidence, check_activation: bool) -> list[str]:
     """Why G's coverage rows cannot take a rank; empty if they can.
 
-    The recomputed `total` and `indexed_num` must equal the row's: a mismatch means a
-    later measurement rewrote `is_indexed`, or the row is another measurement's.
+    The recomputed counts must match the row's: a mismatch means a later measurement
+    rewrote `is_indexed`, or the row is another measurement's. The total team's `total`
+    must be exact; the rest may drift by `rank.max_drift`, because the head measurement
+    rewrites the `is_indexed` and `shard_id` of rows it shares with random.
     """
     if ev.batch is None:
         return [f"no metric batch was created before {golden_day + timedelta(days=1)}"]
@@ -380,11 +382,17 @@ def refusals(cfg: Config, golden_day: date, ev: Evidence, check_activation: bool
             reasons.append(f"{table} has {len(rows)} rows dated {golden_day} or the day after")
             continue
         got, want = rows[0], counts[tag].teams[team]
-        if (got.total, got.indexed_num) != (want.total, want.indexed_num):
+        exact_total = team == cfg.rank.total_team
+        if not (_close(got.total, want.total, 0.0 if exact_total else cfg.rank.max_drift)
+                and _close(got.indexed_num, want.indexed_num, cfg.rank.max_drift)):
             reasons.append(f"{table} {got.stat_date}: total {got.total} and indexed_num "
                            f"{got.indexed_num}, batch {ev.batch.id} gives {want.total} "
                            f"and {want.indexed_num}")
     return reasons
+
+
+def _close(got: int | None, want: int, drift: float) -> bool:
+    return got is not None and abs(got - want) <= drift * max(got, 1)
 
 
 def fresh(ev: Evidence, since: datetime) -> bool:
