@@ -13,7 +13,7 @@ metric would count it ([Golden batch 20 as the official metric counts
 it](#golden-batch-20-as-the-official-metric-counts-it)). On 2026-11-07 the index was built
 on Host2 from the list's recrawl text, 52M docs, and the ranking was reworked for that size
 ([Golden batches 20 and 21 on 52M docs](#golden-batches-20-and-21-on-52m-docs)). The official
-metric does not read this index yet.
+metric does not search this index; [the rank job](#the-rank-job) writes its rank rate.
 
 ## Commands
 
@@ -21,6 +21,7 @@ metric does not read this index yet.
 |---|---|
 | `text-index-build [--text-root DIR]` | loads the newest text of each doc into a new index `isel-text-<utc id>`, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call |
 | `text-index-eval --batch N` | searches each golden keyword of batch N on the alias and reports Recall@10 against its golden URLs |
+| `rank --loop \| --once \| --dry-run [--golden-day G]` | the rank job below: at G+3, builds the index from the live list and writes G's rank rate into metricdb |
 
 Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d --build`.
 
@@ -85,6 +86,35 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   URLs, as the coverage tables do. Both have a 95 % interval that resamples keywords; in
   the distinct-URL one, a URL golden for c keywords weighs 1/c in each. `presence` is
   the share of golden pairs whose page is in the index, the ceiling of both.
+
+## The rank job
+
+`isel rank --loop` (the `rank` service) fills in `ranked_num` and `ranked_rate` for each
+golden day G. Metric creates the batch on G and measures Disc/Crawl/Index that day, with
+`ranked_num` left empty. At G+3 00:15 UTC (`[rank]`) the job builds the index from the
+recrawl text of the list that was live on G, searches each keyword of G's batch, and
+counts the golden URLs in the top 10. Three days let the recrawl fetch most of a new
+list: on run 3, 74.8 % of the 64M URLs after 72 h, 86.4 % after 14 days.
+
+- **What it writes.** Only `metric_url.is_ranked` of the batch and the ranked fields of
+  G's six coverage rows, in one transaction, as the metricdb role `isel_rank`. A row is
+  ranked if its URL, or its srsltid-free form, is in the top 10 and Metric counted it
+  indexed. Per tag and team it counts distinct canonical URLs, as Metric does.
+  Disc/Crawl/Index are never measured again: the crawler injects golden URLs after G.
+- **Which rows.** A coverage table has no batch id. G's row is the one dated G or G+1
+  (the head set often finishes after midnight). The batch is the newest one created
+  before G+1.
+- **Refusals.** The job writes nothing, and records why, if no batch or no rows of a
+  tag exist; if the live run was activated after G's freeze began; if a table has not
+  exactly one row dated G or G+1; or if that row's `total` or `indexed_num` differs from
+  the batch's rows, which means a later measurement rewrote them.
+- **State.** `work/rank/<G>.json` holds `pending`, `done`, `refused` or `failed` and the
+  counts; `<G>.ranked.parquet` holds each row's flags. The build is not recorded: the
+  alias's index counts as built if its build record names the live run and it started
+  after the due time. Every step can run again after a crash and gives the same values.
+- `--dry-run` prints what a tick would do and the counts on the current index, with every
+  refusal reason; it builds and writes nothing. `--golden-day G` runs G before its due
+  time and over a later activation.
 
 ## Decision rule (written before the NanoMIRACL runs, 2026-10-23 05:40 UTC)
 
@@ -791,7 +821,6 @@ Choices and limits:
 - **Still open** (`docs/RECRAWL.md` §13):
   - compact the text Parquet, before its first 30-day cycle ends;
   - fallback documents for docs without text;
-  - a `RankMeasure` for the metric;
   - one read of batch 22 (created 11-16), if it holds no `goto` URLs, with the node restarted.
 
 ## Reproduction
