@@ -73,6 +73,17 @@ def apply_found_urls(url_status_map, lookup_map, found) -> None:
                 status['shard_id'] = shard_id
 
 
+def coverage_upsert(model, row_data):
+    """Insert or update one coverage row without touching ranked_num / ranked_rate.
+
+    The rank job (IndexSelectionV2 `isel rank`) writes them three days after the
+    batch, so a re-run must not reset them: a new row starts with NULL, an
+    existing row keeps its rank.
+    """
+    stmt = insert(model).values({**row_data, "ranked_num": None, "ranked_rate": None})
+    return stmt.on_conflict_do_update(index_elements=['stat_date'], set_=row_data)
+
+
 class CrawlerAllMetricMeasure(Measure):
     def __init__(self, modelFactory: AppModelFactory, crawlerDB: Database, metricDB: Database, selectDB: Database, batch_id: int, tag: str):
         """
@@ -357,16 +368,9 @@ class CrawlerAllMetricMeasure(Measure):
                     "crawled_rate": d["crawl"] / total_count if total_count > 0 else 0.0,
                     "indexed_num": d["idx"],
                     "indexed_rate": d["idx"] / total_count if total_count > 0 else 0.0,
-                    "ranked_num": 0,
-                    "ranked_rate": 0.0
                 }
 
-                stmt = insert(ModelClass).values(row_data)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=['stat_date'],
-                    set_=row_data
-                )
-                session.execute(stmt)
+                session.execute(coverage_upsert(ModelClass, row_data))
             
             session.commit()
             print("✅ MetricDB Updated Successfully.")
