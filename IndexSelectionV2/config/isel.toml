@@ -397,7 +397,9 @@ crawlerdb_text_chunk = 2000              # URLs per crawlerdb lookup, one primar
 crawlerdb_anchor_chars = 200             # anchor text kept per doc
 crawlerdb_text_file_rows = 1000000       # docs per Parquet file of the dataset
 crawlerdb_text_max_minutes = 0.0         # stop the lookup after this long and keep what it
-                                         # found, best ranks first; 0 = no limit
+                                         # found, best ranks first, and send no lookup the
+                                         # read guard would hold past it; 0 = no limit.
+                                         # Host-specific (host2.toml)
 
 [rank]                                   # `isel rank --loop`: the rank rate of each
                                          # guard.month_days batch G, written into G's

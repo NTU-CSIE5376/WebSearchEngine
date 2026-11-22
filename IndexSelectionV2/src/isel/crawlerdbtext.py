@@ -20,16 +20,25 @@ import shutil
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
 
 from isel.config import Config
-from isel.io import TMP_SUFFIX, open_duckdb, write_parquet_atomic
-from isel.pg import ReadOnlySession
+from isel.io import TMP_SUFFIX, file_lock, open_duckdb, write_parquet_atomic
+from isel.pg import ReadOnlySession, next_allowed_start
 from isel.pull import _table_name
-from isel.textindex import TEXTLESS, TextIndexError, parquet_scan, pick_docs, resolve_prior
+from isel.textindex import (
+    TEXTLESS,
+    TextIndexError,
+    build_lock_path,
+    crawlerdb_text_old,
+    parquet_scan,
+    pick_docs,
+    resolve_prior,
+)
 from isel.urlnorm import ShardRouter
 
 log = logging.getLogger(__name__)
@@ -62,24 +71,55 @@ def _chunks(docs: Iterable[pa.RecordBatch], router: ShardRouter,
     yield from sorted(pending.items())
 
 
+def _window_wait(cfg: Config, session: ReadOnlySession, now: Callable[[], datetime]) -> float:
+    """Seconds the read guard would hold the next lookup for its read window; 0 unguarded."""
+    if session.guard is None:
+        return 0.0
+    current = now()
+    return (next_allowed_start(current, session.timeout_s or 0, cfg.guard)
+            - current).total_seconds()
+
+
 def _text(value: str | None, chars: int | None = None) -> str | None:
     return (value or "").strip()[:chars] or None
 
 
+def _replace_dataset(staging: Path, root: Path) -> None:
+    """Puts `staging` in the place of `root` by two renames, then deletes the old dataset.
+
+    Between the renames only `<root>.old` exists; a build then reads that one
+    (`textindex.crawlerdb_text_dir`), and the next pull moves it back first.
+    """
+    old = crawlerdb_text_old(root)
+    if root.exists():
+        os.replace(root, old)
+    os.replace(staging, root)
+    shutil.rmtree(old, ignore_errors=True)
+
+
 def pull_crawlerdb_text(cfg: Config, session: ReadOnlySession, router: ShardRouter,
                         text_root: Path,
-                        clock: Callable[[], float] = time.monotonic) -> dict[str, Any]:
+                        clock: Callable[[], float] = time.monotonic,
+                        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+                        ) -> dict[str, Any]:
     """Replaces the dataset under `crawlerdb_text_root` with what crawlerdb holds now.
 
     The docs asked for are the listed docs that `pick_docs` leaves without text, best list
     rank first. After `crawlerdb_text_max_minutes` of lookups no further one starts: the docs not
     asked yet stay out of the dataset, and the report says `stopped`.
 
+    With a limit, a lookup that the read guard would hold past it is not sent either: the
+    guard can wait out a closed read window for hours, all the while holding the work lock.
+
     The new files are written beside the dataset and take its place only at the end, so a
-    run that fails leaves the previous dataset as it was.
+    run that fails, or stops before its first lookup, leaves the previous dataset as it
+    was. The run holds the text index build lock, so a build never reads a dataset that is
+    being replaced, and two runs never share the staging folder.
 
     Raises:
-        TextIndexError: If `crawlerdb_text_root` or the list (`prior_file`) is not set.
+        TextIndexError: If `crawlerdb_text_root` or the list (`prior_file`) is not set, or
+            the read windows leave no lookup within the limit.
+        LockBusy: If a build or another run holds the build lock.
     """
     t = cfg.text_index
     if not t.crawlerdb_text_root:
@@ -88,6 +128,21 @@ def pull_crawlerdb_text(cfg: Config, session: ReadOnlySession, router: ShardRout
     if not prior_file:
         raise TextIndexError("the crawlerdb lookup needs the list: set text_index.prior_file")
     root = Path(t.crawlerdb_text_root)
+    with file_lock(build_lock_path(cfg)):
+        return _pull(cfg, session, router, text_root, prior_file, prior_run, root, clock, now)
+
+
+def _pull(cfg: Config, session: ReadOnlySession, router: ShardRouter, text_root: Path,
+          prior_file: str, prior_run: str | None, root: Path, clock: Callable[[], float],
+          now: Callable[[], datetime]) -> dict[str, Any]:
+    t = cfg.text_index
+    old = crawlerdb_text_old(root)
+    if old.exists():
+        # A run died between the two renames of `_replace_dataset`.
+        if root.exists():
+            shutil.rmtree(old)
+        else:
+            os.replace(old, root)
     staging = root.with_name(root.name + TMP_SUFFIX)
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
@@ -120,7 +175,7 @@ def pull_crawlerdb_text(cfg: Config, session: ReadOnlySession, router: ShardRout
         deadline = (lookups_started + 60 * t.crawlerdb_text_max_minutes
                     if t.crawlerdb_text_max_minutes else None)
         for shard, urls in _chunks(docs, router, t.crawlerdb_text_chunk):
-            if deadline is not None and clock() >= deadline:
+            if deadline is not None and clock() + _window_wait(cfg, session, now) >= deadline:
                 stopped = True
                 break
             queries += 1
@@ -143,10 +198,13 @@ def pull_crawlerdb_text(cfg: Config, session: ReadOnlySession, router: ShardRout
         lookup_seconds = clock() - lookups_started
     finally:
         con.close()
+    if stopped and not queries:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise TextIndexError("no crawlerdb lookup fits crawlerdb_text_max_minutes before the "
+                             "read windows close; the dataset is left as it was")
     if rows:
         flush()
-    shutil.rmtree(root, ignore_errors=True)
-    os.replace(staging, root)
+    _replace_dataset(staging, root)
     return {"crawlerdb_text_root": str(root), "prior_file": prior_file, "prior_run": prior_run,
             "docs_wanted": int(wanted), "docs_found": found, "with_title": titles,
             "with_anchor": anchors, "queries": queries, "files": files, "stopped": stopped,

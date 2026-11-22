@@ -500,10 +500,12 @@ such as `<G>.failed.json` stays as a record.
 observes and runs a step. Every command that reads or writes what refresh rebuilds, or
 uses `duckdb_tmp`, holds it shared: `pull-*`, `derive-*`, `validate-routing`,
 `build-dataset`, `backtest`, `train`, `forward-eval`, `select-sample`, `score-full`,
-`select-full`, `migrate-selectdb`, `publish`, `swap`, `rollback` and `recrawl-sync`.
+`select-full`, `migrate-selectdb`, `publish`, `swap`, `rollback`, `recrawl-sync` and
+`text-index-crawlerdb-text`, which reads `dims/split_hosts.parquet`.
 These commands still run beside each other. Beside a refresh step they exit with code 3,
 and refresh skips its ticks while they run. `check-config`, `report`, `verify-live`,
-`validate-manifest`, the recrawl loops and the text index commands never take the lock.
+`validate-manifest`, the recrawl loops, `text-index-build` and `text-index-eval` never
+take the lock.
 
 **Roll back by hand.**
 

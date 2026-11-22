@@ -272,6 +272,22 @@ def pick_docs(con: duckdb.DuckDBPyConnection, text_root: Path, prior_file: str =
     return int(texts), int(challenges), int(url_only), int(off_list), files
 
 
+def build_lock_path(cfg: Config) -> Path:
+    """The lock a build holds; a crawlerdb text pull holds it too (`isel.crawlerdbtext`)."""
+    return cfg.work_dir / "text_index" / "build.lock"
+
+
+def crawlerdb_text_old(root: Path) -> Path:
+    """Where a crawlerdb text pull moves the dataset it replaces, until its new one is in."""
+    return root.with_name(root.name + ".old")
+
+
+def crawlerdb_text_dir(root: Path) -> Path:
+    """The crawlerdb text dataset: `root`, or the old one if a pull died between renames."""
+    old = crawlerdb_text_old(root)
+    return old if not root.exists() and old.exists() else root
+
+
 def _take_crawlerdb_text(con: duckdb.DuckDBPyConnection, root: Path | None,
                          max_docs: int) -> int:
     """Fills the temp table `crawlerdb_text` for the docs of `TEXTLESS`; returns its rows.
@@ -282,6 +298,7 @@ def _take_crawlerdb_text(con: duckdb.DuckDBPyConnection, root: Path | None,
     such an anchor is a navigation link ("Menu"): crawlerdb keeps only the first anchor.
     """
     found = "(SELECT NULL::UBIGINT AS doc_id, NULL AS title, NULL AS anchor WHERE false)"
+    root = crawlerdb_text_dir(root) if root is not None else None
     if root is not None and next(root.glob("*.parquet"), None) is not None:
         found = parquet_scan(str(root / "*.parquet"))
     con.execute(f"""CREATE OR REPLACE TEMP TABLE crawlerdb_text AS
@@ -527,10 +544,6 @@ def _pin_dir(cfg: Config) -> Path:
     return cfg.work_dir / "text_index" / "pins"
 
 
-def _build_lock(cfg: Config) -> Path:
-    return cfg.work_dir / "text_index" / "build.lock"
-
-
 def pins(cfg: Config) -> dict[str, dict[str, Any]]:
     """Physical index -> its pin: the indices a build must not delete."""
     out = {}
@@ -547,7 +560,7 @@ def pin(cfg: Config, client: OpenSearch, index: str, holder: dict[str, Any]) -> 
     It takes the build lock, so a build cannot delete the index between the check and
     the pin.
     """
-    with file_lock(_build_lock(cfg)):
+    with file_lock(build_lock_path(cfg)):
         if index not in _builds(client, cfg.text_index.alias):
             return False
         atomic_write_json(_pin_dir(cfg) / f"{index}.json", holder)
@@ -604,7 +617,7 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
     built = cfg.work_dir / "text_index" / "build"
     started = time.monotonic()
     prior_file, prior_run = resolve_prior(cfg)
-    with file_lock(_build_lock(cfg)):
+    with file_lock(build_lock_path(cfg)):
         con = open_duckdb(cfg, cfg.work_dir / "text_index" / "tmp")
         try:
             texts, challenges, url_only, off_list, crawlerdb_texts, batches = latest_docs(

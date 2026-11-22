@@ -57,11 +57,20 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
     shard table. It goes through the read-only gate, the pacer (`pull.min_interval_s`)
     and the read guard, on one connection with the `[crawlerdb.session]` settings. A URL
     is asked in each of its candidate shards. Nothing is written to crawlerdb.
-  - A run writes its files beside the dataset and puts them in its place at the end.
-    A rerun replaces the dataset, and a failed run leaves the old one. After
-    `crawlerdb_text_max_minutes` of lookups no new one starts; the docs not asked yet stay
-    out, and the report says `stopped`. The limit starts at the first lookup, after the
-    local pick of the docs. The report counts the docs wanted and found, those with a
+  - A run writes its files beside the dataset and puts them in its place at the end, by
+    two renames: the dataset becomes `<root>.old`, the new files become `<root>`, and
+    `.old` is deleted. A build that finds only `.old`, after a run died between the two
+    renames, reads it; the next run moves it back first. A rerun replaces the dataset,
+    and a failed run leaves the old one. A run holds the build lock
+    (`text_index/build.lock`), so it never runs beside a build or another run: the later
+    one fails with `LockBusy`. It also holds the work lock shared, as it reads
+    `dims/split_hosts.parquet`, so refresh steps wait for it.
+  - After `crawlerdb_text_max_minutes` of lookups no new one starts; the docs not asked
+    yet stay out, and the report says `stopped`. The limit starts at the first lookup,
+    after the local pick of the docs. A lookup that the read guard would hold for a
+    closed window past the limit is not sent either, so a run never sleeps through a
+    golden day with the work lock held. A run stopped before its first lookup fails and
+    leaves the old dataset. `host2.toml` sets 150 minutes; 0 means no limit. The report counts the docs wanted and found, those with a
     title and with an anchor, the queries, the seconds of the lookups and of the run.
   - The build joins the dataset onto the docs without text and fills `title` and the
     field `anchor`. A doc with text of its own never takes crawlerdb text. A title or
@@ -957,8 +966,16 @@ Choices and limits:
   when search latency matters.
 - **Still open** (`docs/RECRAWL.md` §13):
   - compact the text Parquet, before its first 30-day cycle ends;
-  - the gain of crawlerdb's title and anchor text on a golden batch. The command and
-    the build are in the repo; neither has run on Host2. Runbook:
+  - the gain of crawlerdb's title and anchor text on a tuned query. One trial ran on Host2
+    on 2026-11-15, on a node of its own beside the live one, with the 11-02 list. The
+    lookup asked for 11,513,281 docs and found 10,761,962 in 5,891 queries and 4,245 s of
+    lookups, one 14-minute closed window included. The build indexed 63,999,416 docs, of
+    them 8,848,626 URL-only, 459,295 challenge docs and 10,326,671 with crawlerdb text,
+    in 4.3 h and 48.2 GB. Against the 11-07 index, with the same query, Recall@10 rose on
+    batch 20 from 0.0800 to 0.0916 (1,227 to 1,404 pairs) and on batch 21 without `goto`
+    from 0.0664 to 0.0783. H/F fell from 0.4348 to 0.3978. Of the 177 new pairs on batch
+    20, 118 are pages fetched after 11-07, which any rebuild gets; the `anchor` field adds
+    1 pair. Runbook:
     1. Deploy the code. `text-index-eval` then stops on the old index, which has no
        `anchor` field, until the rebuild. So deploy, look up and rebuild in one step.
     2. `docker compose ... run --rm text-index text-index-crawlerdb-text`. It needs
@@ -967,13 +984,9 @@ Choices and limits:
     3. `docker compose ... run --rm text-index text-index-build`, and check
        `crawlerdb_text_docs` in its report.
 
-    Expected load: an earlier script asked for 3.5M docs in chunks of 2,000 URLs on one
-    connection and rested as long as each query took. It ran 23 minutes; 81 % of the
-    docs had a title and 94 % an anchor. The command sends the same statement at most
-    once per `pull.min_interval_s` (0.5 s). The read guard also holds it during the
-    closed read windows, so a run can take longer. Its own run time is not measured.
-    Do not run it while a build runs: a build that reads the dataset during the swap
-    fails and leaves the old index;
+    Expected load: the command sends one statement at most once per
+    `pull.min_interval_s` (0.5 s), and the read guard holds it during the closed read
+    windows. The 11-15 trial above took 71 minutes of lookups;
   - the gain of the decoded URL words (`url_words`) on a golden batch. It is not
     measured yet. In batch 20, 888 of 15,328 pairs have a URL with a non-ASCII escape
     and 4 have an IDN host: these are the pairs that can gain, not the gain. The index

@@ -10,10 +10,10 @@ import pytest
 from conftest import replace, small_cfg
 
 from isel.crawlerdbtext import CRAWLERDB_TEXT_SCHEMA, pull_crawlerdb_text
-from isel.io import open_duckdb, write_parquet_atomic
+from isel.io import LockBusy, file_lock, open_duckdb, write_parquet_atomic
 from isel.pg import ReadOnlySession, assert_read_only_sql
 from isel.recrawl import TEXT_SCHEMA
-from isel.textindex import TextIndexError, latest_docs
+from isel.textindex import TextIndexError, build_lock_path, crawlerdb_text_old, latest_docs
 from isel.urlnorm import DomainKeyer, ShardRouter, md5_number_lower
 
 SHARDS = 4
@@ -94,8 +94,18 @@ def cfg(tmp_path):
                    crawlerdb_text_root=str(tmp_path / "crawlerdb_text"))
 
 
-def _pull(cfg, db: CrawlerDb, tmp_path: Path, **kw) -> dict:
-    return pull_crawlerdb_text(cfg, ReadOnlySession(db), _router(), tmp_path / "text", **kw)
+class _OpenGuard:
+    """A read guard that lets every statement through at once."""
+
+    def wait(self, timeout_s: float) -> None:
+        pass
+
+
+def _pull(cfg, db: CrawlerDb, tmp_path: Path, guarded: bool = False, **kw) -> dict:
+    session = ReadOnlySession(db, timeout_s=120)
+    if guarded:
+        session.guard = _OpenGuard()
+    return pull_crawlerdb_text(cfg, session, _router(), tmp_path / "text", **kw)
 
 
 def _dataset(cfg) -> dict[int, tuple[str | None, str | None]]:
@@ -229,3 +239,60 @@ def test_the_lookup_needs_a_list_and_a_root(cfg, tmp_path, option, message):
     with pytest.raises(TextIndexError, match=message):
         _pull(replace(cfg, "text_index", **{option: ""}), db, tmp_path)
     assert db.executed == []
+
+
+def test_a_build_or_another_run_holding_the_lock_stops_the_run(cfg, tmp_path):
+    _pull(cfg, _everything(*LISTED), tmp_path)
+    before = _dataset(cfg)
+    db = _everything(VINEGARY)
+    with file_lock(build_lock_path(cfg)), pytest.raises(LockBusy):
+        _pull(cfg, db, tmp_path)
+    assert db.executed == []
+    assert _dataset(cfg) == before
+
+
+def test_a_run_that_died_between_its_renames_loses_no_dataset(cfg, tmp_path):
+    _pull(cfg, _everything(*LISTED), tmp_path)
+    before = _dataset(cfg)
+    root = Path(cfg.text_index.crawlerdb_text_root)
+    root.rename(crawlerdb_text_old(root))
+    # A build in between reads the old dataset.
+    *counts, _ = latest_docs(open_duckdb(cfg, tmp_path / "tmp"), tmp_path / "text", 10,
+                             cfg.text_index.prior_file, [CHALLENGE_SHA1], root, 100)
+    assert counts[-1] == len(before)
+    # The next run puts it back first, so a run that then fails keeps it.
+
+    class Down(CrawlerDb):
+        def cursor(self):
+            raise ConnectionError("crawlerdb is down")
+
+    with pytest.raises(ConnectionError):
+        _pull(cfg, Down({}), tmp_path)
+    assert _dataset(cfg) == before
+    assert not crawlerdb_text_old(root).exists()
+
+
+GOLDEN_DAY = datetime(2026, 12, 1, 3, 0, tzinfo=UTC)   # month_window holds reads until 20:00
+OPEN_HOUR = datetime(2026, 12, 2, 3, 20, tzinfo=UTC)   # 38 min before the hourly window
+
+
+def test_a_lookup_the_guard_would_hold_past_the_limit_is_not_sent(cfg, tmp_path):
+    _pull(cfg, _everything(*LISTED), tmp_path)
+    before = _dataset(cfg)
+    db = _everything(VINEGARY)
+    timed = replace(cfg, "text_index", crawlerdb_text_max_minutes=60.0)
+    with pytest.raises(TextIndexError, match="read windows close"):
+        _pull(timed, db, tmp_path, guarded=True, now=lambda: GOLDEN_DAY)
+    assert db.executed == []
+    assert _dataset(cfg) == before
+    assert not list(Path(cfg.text_index.crawlerdb_text_root).parent.glob("crawlerdb_text.*"))
+
+
+def test_a_lookup_that_fits_the_window_and_the_limit_is_sent(cfg, tmp_path):
+    db = _everything(*LISTED)
+    timed = replace(cfg, "text_index", crawlerdb_text_max_minutes=60.0)
+    report = _pull(timed, db, tmp_path, guarded=True, now=lambda: OPEN_HOUR)
+    assert (report["stopped"], report["docs_found"]) == (False, 3)
+    # Unlimited, the guard is left to wait as long as it must.
+    assert not _pull(cfg, _everything(*LISTED), tmp_path, guarded=True,
+                     now=lambda: GOLDEN_DAY)["stopped"]
