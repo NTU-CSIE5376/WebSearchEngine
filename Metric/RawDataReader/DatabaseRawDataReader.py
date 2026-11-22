@@ -1,9 +1,9 @@
 from Metric.RawDataReader.RawDataReader import RawDataReader
+from Metric.Query.SerpApi import SerpApiError, serpapi_key
 from serpapi import GoogleSearch
 from datetime import datetime
 from sqlalchemy import desc
 import time
-import os
 from collections import defaultdict
 
 class DatabaseRawDataReader(RawDataReader):
@@ -46,7 +46,9 @@ class DatabaseRawDataReader(RawDataReader):
         with self.db.session() as session:
             # 假設 Batch 用於紀錄 trending 來源，我們可以透過 meta_geo_counts 判斷，
             # 或是未來可以在 Batch 加個 source 欄位。這裡先單純取最新的一筆。
+            # An empty batch (a failed fetch) is never reused.
             latest_batch = session.query(MetricBatch)\
+                .filter(MetricBatch.meta_total_queries > 0)\
                 .order_by(desc(MetricBatch.created_at))\
                 .first()
             
@@ -85,6 +87,7 @@ class DatabaseRawDataReader(RawDataReader):
     def _fetch_from_api_process_and_store(self) -> list:
         """
         從 API 獲取 -> 去重合併 -> 存入 DB -> 回傳
+        Any geo that fails raises before anything is saved, so a failed fetch leaves no batch.
         """
         # 1. 獲取原始資料
         all_data = []
@@ -183,13 +186,14 @@ class DatabaseRawDataReader(RawDataReader):
         """
         max_retries = 3
         retry_delay = 30 
+        api_key = serpapi_key()
 
         for attempt in range(max_retries + 1):
             try:
                 params = {
                     "engine": "google_trends_trending_now",
                     "geo": geo,
-                    "api_key": os.environ.get('SERPAPI_KEY'),
+                    "api_key": api_key,
                     "hours": 168
                 }
 
@@ -226,6 +230,4 @@ class DatabaseRawDataReader(RawDataReader):
                     print(f"Waiting {retry_delay} seconds before retrying...")
                     time.sleep(retry_delay)
                 else:
-                    print(f"All {max_retries + 1} attempts failed for {geo}. Giving up.")
-                    return []
-        return []
+                    raise SerpApiError(f"All {max_retries + 1} attempts failed for {geo}")

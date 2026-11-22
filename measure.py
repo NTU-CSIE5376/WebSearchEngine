@@ -17,6 +17,7 @@ from Database.CrawlerModels import Base as CrawlerBase
 from Database.MetricModels import Base as MetricBase
 from Database.ModelFactory.AppModelFactory import AppModelFactory
 from Database.utils import createAllMetricModel, createDB
+from Metric.Query.SerpApi import require_searches
 
 from argparse import ArgumentParser
 
@@ -28,6 +29,7 @@ def get_latest_batch_id(db, modelFactory) -> int:
     """
     獲取最新 MetricBatch 的 ID。
     回傳: int (若表為空則回傳 None)
+    Skips empty batches, the same rule DatabaseRawDataReader uses to pick the batch it reuses.
     """
     MetricBatch = modelFactory.create_metric_batches()
     
@@ -35,7 +37,8 @@ def get_latest_batch_id(db, modelFactory) -> int:
         # 1. 只選取 id 欄位 (Scalar Select) -> 節省記憶體與傳輸頻寬
         # 2. 根據 id 倒序排列 (利用 PK Index) -> 極速
         # 3. 取第一筆
-        stmt = select(MetricBatch.id).order_by(MetricBatch.id.desc()).limit(1)
+        stmt = select(MetricBatch.id).where(MetricBatch.meta_total_queries > 0)\
+            .order_by(MetricBatch.id.desc()).limit(1)
         
         # scalar() 會直接回傳數值 (int) 或 None
         latest_id = session.execute(stmt).scalar()
@@ -69,6 +72,9 @@ def createDataset(args, modelFactory: AppModelFactory, crawlerDB, metricDB):
     rawDataReader: RawDataReader = None
     if args.rawdatareader == "db":
         rawDataReader = DatabaseRawDataReader(metricDB, modelFactory, args.update)
+    # Check the key and quota first: a bad key must stop the run before any batch is written.
+    # Up to one search per golden keyword, plus one trending request per geo.
+    require_searches(args.keywordNums * len(args.strategy) + len(rawDataReader.countries))
     rawData = rawDataReader.readData()
     batch_id = get_latest_batch_id(metricDB, modelFactory)
 

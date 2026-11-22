@@ -21,3 +21,21 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+
+  # The metric cron jobs (Metric/deploy/crontab), run by supercronic.
+  metric:
+    build: .
+    image: metric:${METRIC_TAG:-latest}
+    platform: linux/amd64           # the supercronic binary in the Dockerfile is amd64
+    container_name: metric
+    network_mode: host
+    restart: unless-stopped
+    env_file: ./metric.env          # SERPAPI_KEY=...; chmod 600, not in git
+    environment:
+      - TZ=UTC
+    stop_grace_period: 30m          # SIGTERM lets a running job finish first
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

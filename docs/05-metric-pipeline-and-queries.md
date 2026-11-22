@@ -175,10 +175,10 @@ This ensures idempotent daily reruns.
 - Select DB URL template:
   - `postgresql+psycopg2://select:select@<select_db_url>/selectdb`
 
-Cron defaults in Dockerfile currently use:
+Cron defaults in `Metric/deploy/crontab` currently use:
 
 - `--metric_db_url 172.16.191.1:5433`
-- `--crawler_db_url 172.16.191.1:5432`
+- `--crawler_db_url 172.16.191.3:5433` (YugabyteDB)
 - `--select_db_url 172.16.191.1:5445` (IndexSelectionV2)
 
 ### 5.3 Migration target URL

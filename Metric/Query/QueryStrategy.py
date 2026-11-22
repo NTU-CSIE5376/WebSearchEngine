@@ -1,7 +1,7 @@
 from serpapi import GoogleSearch
 from Metric.Query.GoogleRedirect import resolve_golden_urls
+from Metric.Query.SerpApi import serpapi_key
 import time
-import os
 
 class QueryStrategy:
     def __init__(self, rawData: list, keywordNums: int):
@@ -17,13 +17,14 @@ class QueryStrategy:
             max_retries (int): 最大重試次數
             initial_delay (int): 初始等待秒數 (會隨著重試次數增加)
         """
+        api_key = serpapi_key()
         for attempt in range(max_retries):
             try:
                 params = {
                     "engine": "google",
                     "q": query,
                     "num": nums,
-                    "api_key": os.environ.get('SERPAPI_KEY')
+                    "api_key": api_key
                 }
 
                 search = GoogleSearch(params)

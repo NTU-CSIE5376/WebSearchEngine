@@ -1,17 +1,14 @@
-import requests
 import os
+import sys
 
-api_key = os.environ.get('SERPAPI_KEY')
-url = "https://serpapi.com/account.json"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-params = {
-    "api_key": api_key
-}
+from Metric.Query.SerpApi import SerpApiError, account
 
-resp = requests.get(url, params=params)
-resp.raise_for_status()
-
-data = resp.json()
+try:
+    data = account()
+except SerpApiError as e:
+    sys.exit(str(e))
 
 print("本月已用搜尋次數:", data.get("this_month_usage"))
 print("本月剩餘搜尋次數:", data.get("plan_searches_left"))
