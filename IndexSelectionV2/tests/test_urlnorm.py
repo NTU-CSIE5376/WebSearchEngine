@@ -112,6 +112,9 @@ def test_lookup_urls_add_only_the_srsltid_variant():
     # Not punycode: the label stays, and the rest is still decoded.
     ("https://xn--!!.example/%C3%A9", "https://xn--!!.example/\u00e9"),
     ("https://xn--99999999999999999999.example/", "https://xn--99999999999999999999.example/"),
+    # Not a whole A-label: decoding `xn--abc` alone would lose the word `abc`.
+    ("https://xn--abc_def.example/%C3%A9", "https://xn--abc_def.example/\u00e9"),
+    ("https://u@XN--wgv71a119e.jp/", "https://u@\u65e5\u672c\u8a9e.jp/"),
     # Punycode for a lone surrogate, which a bulk request could not encode.
     ("https://xn--ib9b.example/", "https://xn--ib9b.example/"),
     # Not UTF-8: one U+FFFD each, which no analyzer keeps as a word.

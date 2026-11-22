@@ -23,8 +23,9 @@ HOST_RE = r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/?#]*@)?([^:/?#]+)"
 # "@" (pchar) and "/", plus "?" in a query or fragment, plus "%" so escapes stay as they are.
 PATH_SAFE = "!$&'()*+,;=:@/%"
 QUERY_SAFE = PATH_SAFE + "?"
-# An IDNA A-label of a netloc: `xn--` at the start of a host label, then punycode.
-A_LABEL_RE = re.compile(r"(?<![^.@])xn--([a-z0-9-]+)", re.IGNORECASE)
+# An IDNA A-label of a netloc: a whole host label of `xn--` and punycode. A label with
+# any other character, such as `_`, is not one and stays as it is.
+A_LABEL_RE = re.compile(r"(?<![^.@])xn--([a-z0-9-]+)(?=[.:@]|$)", re.IGNORECASE)
 
 
 def canonicalize(url: str) -> str:
