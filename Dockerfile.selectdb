@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends cron libgomp1 build-essential cmake ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/WebSearchEngine
+
+COPY IndexSelection/requirements.txt /tmp/indexselection-requirements.txt
+
+RUN python3 -m venv /opt/venv && \
+    /opt/venv/bin/pip install --upgrade pip && \
+    /opt/venv/bin/pip install setuptools wheel && \
+    /opt/venv/bin/pip install -r /tmp/indexselection-requirements.txt
+
+COPY . /app/WebSearchEngine
+
+RUN /opt/venv/bin/python3 IndexSelection/build_native_extension.py
+
+RUN chmod +x /app/WebSearchEngine/IndexSelection/docker/entrypoint.sh && \
+    chmod +x /app/WebSearchEngine/IndexSelection/docker/run_refresh.sh && \
+    chmod +x /app/WebSearchEngine/IndexSelection/docker/run_reset.sh
+
+CMD ["/app/WebSearchEngine/IndexSelection/docker/entrypoint.sh"]
