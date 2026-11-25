@@ -123,3 +123,20 @@ def test_cycles_tile_time_without_gaps_or_overlaps(base_cfg):
         following = cycle_at(w.ends_at, base_cfg)
         assert following.start_at == w.ends_at and following.golden_day > w.golden_day
         now += timedelta(hours=7)
+
+
+def test_the_december_overlay_cycles_on_dec_1_and_15_only():
+    from conftest import BASE
+
+    from isel.config import load_config
+
+    cfg = load_config([BASE, BASE.parent / "december-2026.toml"])
+    dec1, dec15 = window(date(2026, 12, 1), cfg), window(date(2026, 12, 15), cfg)
+    assert (dec1.start_at, dec1.clear_by, dec1.swap_by) == (
+        _at(2026, 11, 27, 2, 15), _at(2026, 11, 27, 14, 15), _at(2026, 11, 30, 23, 30))
+    assert dec1.ends_at == dec15.start_at == _at(2026, 12, 11, 2, 15)
+    assert dec15.swap_by == _at(2026, 12, 14, 23, 30)
+    # Dec 8's head set is read under the Dec 1 list: no cycle and no swap around it.
+    assert cycle_at(_at(2026, 12, 8, 1), cfg).golden_day == date(2026, 12, 1)
+    with pytest.raises(ValueError, match=r"not a schedule\.swap_freeze_days day"):
+        window(date(2026, 12, 8), cfg)

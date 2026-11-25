@@ -206,10 +206,10 @@ class RefreshCfg:
 
 @dataclass(frozen=True)
 class RankCfg:
-    """`isel rank`: the rank rate of golden day G, written at G + delay_days."""
+    """`isel rank`: the index built on G-1 evening, G's rank rate on G (`guard.month_days`)."""
 
-    delay_days: int
-    start_time: str
+    build_start: str
+    build_latest: str
     poll_s: float
     max_attempts: int
     writer_dsn_env: str
@@ -693,17 +693,12 @@ def _validate_refresh(cfg: Config, need: Any) -> None:
 
 
 def _validate_rank(cfg: Config, need: Any) -> None:
-    # Imported here: isel.schedule imports this module for hhmm_minutes.
-    from isel.schedule import min_gap_days
-
     r = cfg.rank
-    need(r.delay_days >= 1, "rank.delay_days must be >= 1")
-    need(hhmm_minutes(r.start_time) < 24 * 60, "rank.start_time must be before 24:00")
-    # The live list must still be G's when the job runs: the next cycle may swap from
-    # its start on.
-    need(r.delay_days < min_gap_days(cfg.schedule.swap_freeze_days)
-         - cfg.refresh.start_days_before,
-         "rank.delay_days must end before the next refresh cycle starts")
+    need(hhmm_minutes(r.build_start) <= hhmm_minutes(r.build_latest) < 24 * 60,
+         "rank.build_start and rank.build_latest must be in order within G-1")
+    # The job ranks every batch day; a refresh cycle's golden day is one of them.
+    need(set(cfg.schedule.swap_freeze_days) <= set(cfg.guard.month_days),
+         "guard.month_days must hold every schedule.swap_freeze_days day")
     need(r.poll_s > 0, "rank.poll_s must be > 0")
     need(r.max_attempts >= 1, "rank.max_attempts must be >= 1")
     need(0 <= r.max_drift < 1, "rank.max_drift must be in [0, 1)")

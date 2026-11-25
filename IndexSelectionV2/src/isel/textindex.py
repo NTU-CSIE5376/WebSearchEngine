@@ -390,8 +390,18 @@ def _swap(client: OpenSearch, alias: str, index: str, previous: list[str]) -> No
         raise
 
 
+def _build_record(cfg: Config, name: str) -> dict[str, Any] | None:
+    """The build record of physical index `name`, with its `started_at` (the UTC id)."""
+    out = read_json(cfg.work_dir / "text_index" / "build" / f"{name}.json")
+    if out is None:
+        return None
+    started = datetime.strptime(name[len(cfg.text_index.alias) + 1:].upper(),
+                                "%Y%m%dT%H%M%S%fZ")
+    return {**out, "started_at": started.replace(tzinfo=UTC)}
+
+
 def alias_build(cfg: Config, client: OpenSearch) -> dict[str, Any] | None:
-    """The build record of the alias's only index, with its `started_at` (the UTC id).
+    """The build record of the alias's only index.
 
     None if the alias names no index or several, or the index has no build record.
     """
@@ -399,11 +409,17 @@ def alias_build(cfg: Config, client: OpenSearch) -> dict[str, Any] | None:
     names = _aliased(client, t.alias)
     if len(names) != 1 or not _physical(t.alias).fullmatch(names[0]):
         return None
-    out = read_json(cfg.work_dir / "text_index" / "build" / f"{names[0]}.json")
-    if out is None:
-        return None
-    started = datetime.strptime(names[0][len(t.alias) + 1:].upper(), "%Y%m%dT%H%M%S%fZ")
-    return {**out, "started_at": started.replace(tzinfo=UTC)}
+    return _build_record(cfg, names[0])
+
+
+def build_records(cfg: Config, client: OpenSearch) -> list[dict[str, Any]]:
+    """The build records of the alias's physical indices, oldest first.
+
+    `keep_prev` leaves the previous build next to the aliased one; an index without a
+    record (a killed build) is left out.
+    """
+    records = (_build_record(cfg, n) for n in _builds(client, cfg.text_index.alias))
+    return [r for r in records if r is not None]
 
 
 def resolve_prior(cfg: Config) -> tuple[str, str | None]:
@@ -585,10 +601,11 @@ def cap_hosts(hits: list[dict[str, Any]], cap: int, k: int) -> list[str]:
     return ids
 
 
-def search(client: OpenSearch, t: TextIndexCfg, text: str) -> tuple[list[str], float]:
-    """The ids of the top `t.k` hits and the server's `took` in ms."""
-    reply = client.call("POST", f"/{t.alias}/_search?{WHOLE}", query_body(t, text),
-                        resend=True)
+def search(client: OpenSearch, t: TextIndexCfg, text: str,
+           index: str | None = None) -> tuple[list[str], float]:
+    """The ids of the top `t.k` hits on `index` (default: the alias), and `took` in ms."""
+    reply = client.call("POST", f"/{index or t.alias}/_search?{WHOLE}",
+                        query_body(t, text), resend=True)
     hits = reply["hits"]["hits"]
     if t.prior_boost > 0:
         hits.sort(key=lambda h: (-h["_score"], int(h["_id"])))

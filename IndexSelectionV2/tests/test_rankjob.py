@@ -12,6 +12,7 @@ from opensearch_fakes import OpenSearchStub
 
 from isel import rankjob, textindex
 from isel.cli import main as cli_main
+from isel.config import load_config
 from isel.io import LockBusy, atomic_write_json, utc_id
 from isel.rankjob import (
     Batch,
@@ -24,12 +25,15 @@ from isel.rankjob import (
     count_ranks,
     dry_run,
     pick_golden_day,
+    shadow_counts,
     tick,
 )
 from isel.urlnorm import canonicalize, md5_number_lower
 
+DECEMBER = BASE.parent / "december-2026.toml"
 G = date(2026, 11, 16)
-DUE = datetime(2026, 11, 19, 0, 15, tzinfo=UTC)
+BUILD = datetime(2026, 11, 15, 17, 30, tzinfo=UTC)     # G-1 at rank.build_start
+MEASURE = datetime(2026, 11, 16, 20, 0, tzinfo=UTC)    # G's guard.month_window ends
 LIVE = LiveRun("run-1114", datetime(2026, 11, 14, 4, 0, tzinfo=UTC))
 TOKEN = "AfmBOoqfCkB7Gr36L8FzV4ncwpCatQZRYNOjavRk_Qp1ZbjcmArzMmZw"
 
@@ -51,6 +55,8 @@ ROWS = [
 ]
 INDEXED_URLS = ["https://a.com/x", "https://c.com/z", "https://d.com/w", "https://e.com/q",
                 "https://f.com/other"]
+# The live list as selectdb holds it: what Metric reads as indexed (row 4 is not on it).
+LISTED = {"https://a.com/x", "https://b.com/y", "https://c.com/z", "https://e.com/q"}
 TOP = {"alpha": ["https://f.com/other", "https://c.com/z", "https://a.com/x",
                  "https://d.com/w"],
        "beta": ["https://f.com/other"],
@@ -62,6 +68,10 @@ MEASURED = {("head", "total"): (4, 3), ("head", "a"): (1, 1), ("head", "b"): (2,
 STAT_DATE = {"head": G + timedelta(days=1), "random": G}
 RANKED = {("head", "total"): 2, ("head", "a"): 1, ("head", "b"): 1,
           ("random", "total"): 1, ("random", "a"): 1, ("random", "b"): 0}
+SHADOW = {"head": {"pairs_found": 3, "pairs_total": 5, "total": 4, "indexed_num": 3,
+                   "indexed_rate": 0.75, "ranked_num": 2, "ranked_rate": 0.5},
+          "random": {"pairs_found": 1, "pairs_total": 1, "total": 1, "indexed_num": 1,
+                     "indexed_rate": 1.0, "ranked_num": 1, "ranked_rate": 1.0}}
 
 
 def _doc_id(url):
@@ -80,7 +90,7 @@ class FakeMetricDb:
             table = f"metric_{tag}set_{team}"
             self.coverage[table] = {
                 date(2026, 11, 2): {"total": 9, "indexed_num": 1, "ranked_num": None},
-                # A manual re-measure on 11-12, outside [G, G+1].
+                # A manual re-measure on 11-12, before G.
                 date(2026, 11, 12): {"total": total, "indexed_num": 0, "ranked_num": None},
                 STAT_DATE[tag]: {"total": total, "indexed_num": indexed, "ranked_num": None,
                                  "ranked_rate": None},
@@ -142,15 +152,16 @@ class World:
         self.stub = stub
         self.metric = FakeMetricDb()
         self.live = LIVE
+        self.listed = set(LISTED)
         self.builds = []
         self.build_error = None
         self.client = textindex.OpenSearch(stub.url, 5.0, 0, 0.0)
 
-    def put_index(self, started_at, prior_run):
-        """An index on the alias, as `textindex.build` leaves it."""
+    def put_index(self, started_at, prior_run, urls=INDEXED_URLS):
+        """A build, as `textindex.build` leaves it: aliased, the older ones kept."""
         alias = self.cfg.text_index.alias
         name = f"{alias}-{utc_id(started_at).lower()}"
-        docs = {_doc_id(u): {"url": canonicalize(u)} for u in INDEXED_URLS}
+        docs = {_doc_id(u): {"url": canonicalize(u)} for u in urls}
         self.stub.indices[name] = {"docs": docs, "body": {}, "settings": {}}
         self.stub.aliases[alias] = {name}
         atomic_write_json(self.cfg.work_dir / "text_index" / "build" / f"{name}.json",
@@ -164,21 +175,25 @@ class World:
             self.builds.append(self.put_index(clock(), self.live and self.live.label))
 
         return Ports(metric=self.metric, live_run=lambda: self.live,
-                     index_build=lambda: rankjob.index_build(self.cfg, self.client),
+                     builds=lambda: rankjob.index_builds(self.cfg, self.client),
                      build=build,
-                     search=lambda kw: textindex.search(self.client, self.cfg.text_index,
-                                                        kw)[0])
+                     search=lambda index, kw: textindex.search(
+                         self.client, self.cfg.text_index, kw, index)[0],
+                     listed=lambda urls: {u for u in urls if u in self.listed})
 
     def tick(self, now, golden_day=None):
         clock = Clock(now)
         return tick(self.cfg, self.ports(clock), clock, golden_day)
 
-    def record(self):
-        return rankjob.read_record(self.cfg, G)
+    def record(self, golden_day=G):
+        return rankjob.read_record(self.cfg, golden_day)
 
     def ranked(self):
         return {(tag, team): self.metric.coverage[f"metric_{tag}set_{team}"][STAT_DATE[tag]]
                 ["ranked_num"] for tag, team in MEASURED}
+
+    def searched(self):
+        return [p.split("/")[1] for p in self.stub.paths("POST") if "_search" in p]
 
 
 @pytest.fixture
@@ -188,28 +203,68 @@ def world(base_cfg, tmp_path, stub):
     return World(cfg, stub)
 
 
-def test_golden_day_due_three_days_later_at_start_time(base_cfg):
-    assert rankjob.due_at(G, base_cfg.rank) == DUE
-    assert pick_golden_day(DUE - timedelta(minutes=1), base_cfg) == date(2026, 11, 1)
-    assert pick_golden_day(DUE, base_cfg) == G
-    assert pick_golden_day(datetime(2026, 12, 3, tzinfo=UTC), base_cfg) == G
+def test_g_is_picked_from_its_build_start_on(base_cfg):
+    assert rankjob.build_from(G, base_cfg.rank) == BUILD
+    assert rankjob.measure_from(G, base_cfg) == MEASURE
+    assert pick_golden_day(BUILD - timedelta(minutes=1), base_cfg) == date(2026, 11, 1)
+    assert pick_golden_day(BUILD, base_cfg) == G
+    assert pick_golden_day(datetime(2026, 11, 30, 17, 29, tzinfo=UTC), base_cfg) == G
 
 
-def test_g_starts_at_its_due_time_and_a_final_record_reads_nothing(world):
-    atomic_write_json(rankjob.record_path(world.cfg, date(2026, 11, 1)),
-                      RankRecord(date(2026, 11, 1), Status.DONE).to_json())
-    out = world.tick(DUE - timedelta(seconds=1))
-    assert (out["golden_day"], out["decision"]) == ("2026-11-01", "idle")
-    assert world.metric.reads == 0 and world.builds == []
-    assert world.tick(DUE)["golden_day"] == "2026-11-16"
-    assert world.record().status is Status.DONE
+def test_december_ranks_dec_8_without_a_refresh_cycle(base_cfg):
+    cfg = load_config([BASE, DECEMBER])
+    dec8 = date(2026, 12, 8)
+    assert pick_golden_day(datetime(2026, 12, 7, 17, 30, tzinfo=UTC), cfg) == dec8
+    assert pick_golden_day(datetime(2026, 12, 7, 17, 29, tzinfo=UTC), cfg) == date(2026, 12, 1)
+    assert rankjob.measure_from(dec8, cfg) == datetime(2026, 12, 8, 16, tzinfo=UTC)
+    assert rankjob.next_golden_day(date(2026, 12, 1), cfg) == dec8
+    assert rankjob.next_golden_day(date(2026, 12, 15), cfg) == date(2027, 1, 1)
 
 
-def test_due_tick_builds_then_writes_only_the_rank_fields(world):
-    world.put_index(DUE - timedelta(days=1), LIVE.label)   # the live list, but too early
-    out = world.tick(DUE + timedelta(minutes=1))
+def test_g_minus_1_builds_without_reading_metricdb(world):
+    out = world.tick(BUILD)
+    assert out["decision"] == "idle" and "is built" in out["why"]
+    assert len(world.builds) == 1 and world.metric.reads == 0
+    assert world.record().status is Status.PENDING
+    # Built: the next tick neither builds nor reads metricdb.
+    world.tick(BUILD + timedelta(minutes=10))
+    assert len(world.builds) == 1 and world.metric.reads == 0
+
+
+@pytest.mark.parametrize("index, builds", [
+    ("fresh", 0),          # the live list, built in G-1's window
+    ("other_run", 1),      # another list
+    ("before_window", 1),  # the live list, built before G-1's window (Dec 8 after Dec 1)
+    ("none", 1),
+])
+def test_builds_unless_the_newest_build_is_the_live_list_from_this_window(world, index, builds):
+    if index == "fresh":
+        world.put_index(BUILD + timedelta(minutes=5), LIVE.label)
+    elif index == "other_run":
+        world.put_index(BUILD + timedelta(minutes=5), "run-1030")
+    elif index == "before_window":
+        world.put_index(BUILD - timedelta(days=7), LIVE.label)
+    world.tick(BUILD + timedelta(minutes=20))
+    assert len(world.builds) == builds
+
+
+def test_no_build_starts_after_build_latest(world):
+    out = world.tick(datetime(2026, 11, 15, 19, 1, tzinfo=UTC))
+    assert out["decision"] == "idle" and "no build may start" in out["why"]
+    assert world.builds == []
+
+
+def test_g_waits_for_its_guard_window_without_reading_metricdb(world):
+    world.tick(BUILD)
+    out = world.tick(MEASURE - timedelta(minutes=1))
+    assert out["decision"] == "idle" and "measures from" in out["why"]
+    assert world.metric.reads == 0
+
+
+def test_g_shadows_then_writes_only_the_rank_fields(world):
+    world.tick(BUILD)
+    out = world.tick(MEASURE)
     assert out["decision"] == "measurewrite"
-    assert len(world.builds) == 1
     assert world.ranked() == RANKED
     head = world.metric.coverage["metric_headset_total"]
     assert head[STAT_DATE["head"]]["ranked_rate"] == pytest.approx(2 / 4)
@@ -223,49 +278,76 @@ def test_due_tick_builds_then_writes_only_the_rank_fields(world):
     assert record.status is Status.DONE and record.attempts == 0
     assert (record.batch_id, record.live_run, record.index) == (22, LIVE.label,
                                                                 world.builds[0])
+    assert record.shadow == SHADOW and record.shadow_at == MEASURE
     assert record.tags["head"]["pairs_found"] == 3
     assert record.tags["head"]["pairs_total"] == 5
     assert record.tags["head"]["teams"]["total"]["stat_date"] == "2026-11-17"
     audit = pq.read_table(world.cfg.work_dir / "rank" / "2026-11-16.ranked.parquet")
     assert dict(zip(audit["metric_url_id"].to_pylist(), audit["hit"].to_pylist(),
                     strict=True)) == {1: True, 2: False, 3: True, 4: True, 5: False, 6: True}
-    searches = [p for p in world.stub.paths("POST") if "_search" in p]
-    assert len(searches) == len(TOP)
+    # Each keyword once for the shadow and once for the write, on the pinned index.
+    assert world.searched() == [world.builds[0]] * (2 * len(TOP))
+
+
+def test_the_shadow_is_written_before_metric_measures(world):
+    saved = world.metric.coverage
+    world.metric.coverage = {t: {d: r for d, r in rows.items() if d < G}
+                             for t, rows in saved.items()}
+    world.tick(BUILD)
+    out = world.tick(MEASURE)
+    assert out["decision"] == "idle" and "waiting for Metric's coverage rows" in out["why"]
+    record = world.record()
+    assert record.status is Status.PENDING and record.shadow == SHADOW
+    assert world.metric.writes == 0
+    # Metric's rows appear later; a row dated before the next golden day is G's.
+    world.metric.coverage = saved
+    world.tick(MEASURE + timedelta(days=3))
+    assert world.record().status is Status.DONE and world.ranked() == RANKED
+    assert world.record().shadow_at == MEASURE
+
+
+def test_g_keeps_its_index_after_the_next_build(world):
+    # Built on G-1, then rebuilt from the same list after G; G still searches its own.
+    first = world.put_index(BUILD + timedelta(minutes=5), LIVE.label)
+    second = world.put_index(datetime(2026, 11, 20, tzinfo=UTC), LIVE.label)
+    out = world.tick(datetime(2026, 11, 30, 17, 0, tzinfo=UTC))
+    assert out["decision"] == "measurewrite"
+    assert world.record().index == first
+    assert set(world.searched()) == {first} and second != first
+
+
+def test_a_head_only_batch_ranks_head(world):
+    world.metric.rows[22] = [r for r in ROWS if "random" not in r.tags]
+    for team in ("total", "a", "b"):
+        world.metric.coverage[f"metric_randomset_{team}"].pop(G)
+    world.tick(BUILD)
+    world.tick(MEASURE)
+    record = world.record()
+    assert record.status is Status.DONE
+    assert set(record.tags) == set(record.shadow) == {"head"}
+    assert world.metric.coverage["metric_headset_total"][STAT_DATE["head"]]["ranked_num"] == 2
 
 
 def test_a_done_record_idles(world):
-    world.tick(DUE)
+    world.tick(BUILD)
+    world.tick(MEASURE)
     writes = world.metric.writes
-    out = world.tick(DUE + timedelta(hours=1))
+    out = world.tick(MEASURE + timedelta(hours=1))
     assert out["decision"] == "idle"
     assert world.metric.writes == writes
-
-
-@pytest.mark.parametrize("fresh, builds", [
-    ("fresh", 0),
-    ("other_run", 1),
-    ("before_due", 1),
-    ("none", 1),
-])
-def test_builds_only_without_a_fresh_index_of_the_live_list(world, fresh, builds):
-    if fresh == "fresh":
-        world.put_index(DUE + timedelta(minutes=5), LIVE.label)
-    elif fresh == "other_run":
-        world.put_index(DUE + timedelta(minutes=5), "run-1030")
-    elif fresh == "before_due":
-        world.put_index(DUE - timedelta(seconds=1), LIVE.label)
-    world.tick(DUE + timedelta(hours=1))
-    assert len(world.builds) == builds
-    assert world.record().status is Status.DONE
-    assert world.ranked() == RANKED
 
 
 def _no_batch(w):
     w.metric.batches = []
 
 
-def _no_random_rows(w):
-    w.metric.rows[22] = [r for r in ROWS if "random" not in r.tags]
+def _old_batch(w):
+    w.metric.batches = w.metric.batches[:1]
+    w.metric.rows[21] = list(ROWS)
+
+
+def _no_golden_rows(w):
+    w.metric.rows[22] = [dataclasses.replace(r, tags=("trending",)) for r in ROWS]
 
 
 def _late_activation(w):
@@ -273,11 +355,7 @@ def _late_activation(w):
 
 
 def _two_rows(w):
-    w.metric.coverage["metric_headset_a"][G] = {"total": 1, "indexed_num": 1}
-
-
-def _no_row(w):
-    del w.metric.coverage["metric_randomset_b"][G]
+    w.metric.coverage["metric_headset_a"][date(2026, 11, 20)] = {"total": 1, "indexed_num": 1}
 
 
 def _remeasured(w):
@@ -294,25 +372,36 @@ def _no_live(w):
     w.live = None
 
 
+def _no_index(w):
+    pass    # no build at all: a scheduled tick does not build on G
+
+
 @pytest.mark.parametrize("break_it, reason", [
     (_no_batch, "no metric batch was created before 2026-11-17"),
-    (_no_random_rows, "batch 22 has no random rows"),
+    (_old_batch, "the newest batch 21 was created on 2026-11-01, not on 2026-11-16"),
+    (_no_golden_rows, "batch 22 has no head or random rows"),
     (_late_activation, "it is not the list measured on G"),
-    (_two_rows, "metric_headset_a has 2 rows dated 2026-11-16"),
-    (_no_row, "metric_randomset_b has 0 rows"),
+    (_two_rows, "metric_headset_a has 2 rows dated 2026-11-16 or later"),
     (_remeasured, "metric_headset_total 2026-11-17: total 4 and indexed_num 3"),
     (_wrong_total, "metric_headset_b 2026-11-17: total 3"),
     (_no_live, "selectdb has no live run"),
+    (_no_index, "no index of run-1114 was built before 2026-11-16"),
 ])
 def test_refusals_write_nothing_and_stay_refused(world, break_it, reason):
+    if break_it is not _no_index:
+        world.put_index(BUILD + timedelta(minutes=5), LIVE.label)
     break_it(world)
-    out = world.tick(DUE)
+    out = world.tick(MEASURE)
     assert out["decision"] == "refuse"
     record = world.record()
     assert record.status is Status.REFUSED and reason in record.reason
     assert world.metric.writes == 0 and world.builds == []
     assert not (world.cfg.work_dir / "rank" / "2026-11-16.ranked.parquet").exists()
-    assert world.tick(DUE + timedelta(hours=1))["decision"] == "idle"
+    assert world.tick(MEASURE + timedelta(hours=1))["decision"] == "idle"
+
+
+def _built(world):
+    world.put_index(BUILD + timedelta(minutes=5), LIVE.label)
 
 
 def test_a_small_drift_from_the_head_run_still_writes(world):
@@ -325,7 +414,8 @@ def test_a_small_drift_from_the_head_run_still_writes(world):
     head = STAT_DATE["head"]
     world.metric.coverage["metric_headset_a"][head].update(total=201, indexed_num=102)
     world.metric.coverage["metric_headset_total"][head].update(total=203, indexed_num=104)
-    world.tick(DUE)
+    _built(world)
+    world.tick(MEASURE)
     assert world.record().status is Status.DONE
     # The row keeps its own denominator: 201, not the recomputed 200.
     row = world.metric.coverage["metric_headset_a"][head]
@@ -343,53 +433,59 @@ def test_the_total_team_may_drift_by_max_drift_only(world, total, status):
     head = STAT_DATE["head"]
     world.metric.coverage["metric_headset_a"][head].update(total=200, indexed_num=101)
     world.metric.coverage["metric_headset_total"][head].update(total=total, indexed_num=103)
-    world.tick(DUE)
+    _built(world)
+    world.tick(MEASURE)
     assert world.record().status is status
 
 
-def test_named_golden_day_runs_early_and_past_a_later_activation(world):
+def test_named_golden_day_builds_at_any_time_and_past_a_later_activation(world):
+    # A G whose build was missed: by hand, the job builds now and pins that build.
     _late_activation(world)
-    early = DUE - timedelta(days=1)
-    out = world.tick(early, golden_day=G)
+    out = world.tick(MEASURE + timedelta(days=2), golden_day=G)
     assert out["decision"] == "measurewrite"
     assert world.ranked() == RANKED
-    assert world.record().index == world.builds[0]
+    record = world.record()
+    assert record.index == world.builds[0] and record.shadow == SHADOW
 
 
 def test_named_golden_day_still_refuses_mismatched_rows(world):
     _remeasured(world)
-    world.tick(DUE, golden_day=G)
+    world.tick(MEASURE, golden_day=G)
     assert world.record().status is Status.REFUSED
-    assert world.metric.writes == 0
+    assert world.metric.writes == 0 and world.builds == []
 
 
 def test_dry_run_builds_and_writes_nothing(world):
-    world.put_index(DUE - timedelta(days=2), "run-1030")
+    index = world.put_index(BUILD + timedelta(minutes=5), LIVE.label)
     _late_activation(world)
-    out = dry_run(world.cfg, world.ports(Clock(DUE)), Clock(DUE))
+    out = dry_run(world.cfg, world.ports(Clock(MEASURE)), Clock(MEASURE))
     assert out["would"] == "refuse"
     assert any("not the list measured on G" in p for p in out["problems"])
-    assert out["index_fresh"] is False
+    assert (out["index"], out["index_fresh"], out["missing_rows"]) == (index, True, [])
     assert out["measured"]["random"]["teams"]["a"]["ranked_num"] == 1
+    assert out["shadow"] == SHADOW
     assert world.builds == [] and world.metric.writes == 0
     assert not (world.cfg.work_dir / "rank").exists()
 
 
 def test_dry_run_without_an_index_reports_instead_of_searching(world):
-    # Host2 before the first G+3: the alias names no index, so a search would 404.
-    out = dry_run(world.cfg, world.ports(Clock(DUE)), Clock(DUE))
+    # Before the first build the alias names no index, so a search would 404.
+    out = dry_run(world.cfg, world.ports(Clock(BUILD)), Clock(BUILD))
     assert (out["would"], out["index"], out["index_fresh"]) == ("build", None, False)
-    assert "measured" not in out
-    assert not [p for p in world.stub.paths("POST") if "_search" in p]
+    assert "measured" not in out and "shadow" not in out
+    out = dry_run(world.cfg, world.ports(Clock(MEASURE)), Clock(MEASURE))
+    assert out["would"] == "refuse"
+    assert not world.searched()
 
 
 def test_rerun_after_a_crash_past_commit_converges(world):
+    world.tick(BUILD)
     world.metric.crash_after_commit = True
-    first = world.tick(DUE)
+    first = world.tick(MEASURE)
     assert first["decision"] == "idle" and world.record().status is Status.PENDING
     assert world.record().attempts == 1
     assert world.ranked() == RANKED
-    world.tick(DUE + timedelta(minutes=10))
+    world.tick(MEASURE + timedelta(minutes=10))
     assert world.record().status is Status.DONE
     assert world.ranked() == RANKED
     assert len(world.builds) == 1
@@ -400,14 +496,15 @@ def test_attempts_end_in_failed(world):
     def down(*args):
         raise ConnectionError("metricdb down")
 
+    _built(world)
     world.metric.batch_before = down
     for n in range(world.cfg.rank.max_attempts):
-        world.tick(DUE + timedelta(minutes=10 * n))
+        world.tick(MEASURE + timedelta(minutes=10 * n))
     record = world.record()
     assert record.status is Status.FAILED
     assert record.attempts == world.cfg.rank.max_attempts
     assert "metricdb down" in record.reason
-    assert world.tick(DUE + timedelta(hours=2))["decision"] == "idle"
+    assert world.tick(MEASURE + timedelta(hours=2))["decision"] == "idle"
 
 
 @pytest.mark.parametrize("outage", [
@@ -422,21 +519,22 @@ def test_an_outage_defers_without_using_an_attempt(world, outage):
     def down(*args):
         raise outage
 
+    _built(world)
     world.metric.batch_before = down
     for n in range(world.cfg.rank.max_attempts + 1):
-        out = world.tick(DUE + timedelta(minutes=10 * n))
+        out = world.tick(MEASURE + timedelta(minutes=10 * n))
         assert out["decision"] == "idle" and out["why"].startswith("deferred")
     record = world.record()
     assert record.status is Status.PENDING and record.attempts == 0
     del world.metric.batch_before
-    world.tick(DUE + timedelta(hours=1))
+    world.tick(MEASURE + timedelta(hours=1))
     assert world.record().status is Status.DONE
     assert world.ranked() == RANKED
 
 
 def test_a_failed_build_check_uses_an_attempt(world):
     world.build_error = textindex.TextIndexError("isel-text-x holds 9 docs, expected 10")
-    world.tick(DUE)
+    world.tick(BUILD)
     assert world.record().attempts == 1
 
 
@@ -446,15 +544,19 @@ def test_an_http_error_reply_uses_an_attempt(world):
     error.__cause__ = urllib.error.HTTPError("http://127.0.0.1:9200", 403, "Forbidden",
                                              None, None)
     world.build_error = error
-    world.tick(DUE)
+    world.tick(BUILD)
     assert world.record().attempts == 1
 
 
-def test_rank_refuses_a_config_without_the_live_prior(tmp_path):
-    overlay = tmp_path / "overlay.toml"
-    overlay.write_text(f'[run]\nwork_dir = "{tmp_path / "work"}"\n')
-    with pytest.raises(SystemExit, match="prior_file"):
-        cli_main(["--config", str(BASE), "--config", str(overlay), "rank", "--once"])
+@pytest.mark.parametrize("overlay, match", [
+    ("", "prior_file"),
+    ('[text_index]\nprior_file = "live"\nkeep_prev = false\n', "keep_prev"),
+])
+def test_rank_refuses_a_config_it_cannot_pin_with(tmp_path, overlay, match):
+    path = tmp_path / "overlay.toml"
+    path.write_text(f'[run]\nwork_dir = "{tmp_path / "work"}"\n' + overlay)
+    with pytest.raises(SystemExit, match=match):
+        cli_main(["--config", str(BASE), "--config", str(path), "rank", "--once"])
 
 
 def test_ranked_urls_are_a_subset_of_indexed_ones(base_cfg):
@@ -466,7 +568,18 @@ def test_ranked_urls_are_a_subset_of_indexed_ones(base_cfg):
             assert c.ranked_num == c.indexed_num == MEASURED[(tag, team)][1]
 
 
+def test_the_shadow_reads_indexed_from_the_list_not_from_metric(base_cfg):
+    # Metric has not measured yet: every is_indexed is False, every shard -1.
+    unmeasured = [dataclasses.replace(r, is_indexed=False, shard_id=-1) for r in ROWS]
+    every = [_doc_id(r.url) for r in ROWS] + [_doc_id("https://c.com/z")]
+    out = shadow_counts(unmeasured, LISTED, lambda kw: every, ["head", "random"],
+                        base_cfg.rank)
+    assert (out["head"]["indexed_num"], out["head"]["ranked_num"]) == (3, 3)
+    assert out["random"]["indexed_rate"] == 1.0
+
+
 def test_record_round_trips(world):
-    world.tick(DUE)
+    world.tick(BUILD)
+    world.tick(MEASURE)
     record = world.record()
-    assert RankRecord.from_json(record.to_json()) == record
+    assert record.shadow and RankRecord.from_json(record.to_json()) == record

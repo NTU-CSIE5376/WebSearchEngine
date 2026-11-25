@@ -4,7 +4,7 @@ One cycle per golden day G (`isel.schedule.Window`). From `start_at` the cycle c
 the old export, pulls golden and dims, exports crawlerdb, derives, trains, scores,
 selects, publishes and swaps, all before `swap_by`. Once the live list is this
 cycle's, it verifies it, syncs the recrawl frontier and drops old selection runs, even
-after `swap_by`. The text index is the rank job's (`isel.rankjob`), at G+3.
+after `swap_by`. The text index is the rank job's (`isel.rankjob`), built on G-1.
 
 Shape: observe, plan, act.
 

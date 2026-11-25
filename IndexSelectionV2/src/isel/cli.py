@@ -357,8 +357,8 @@ def cmd_rank(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.textindex import LIVE_PRIOR
 
     golden_day = args.golden_day and date.fromisoformat(args.golden_day)
-    if golden_day and golden_day.day not in cfg.schedule.swap_freeze_days:
-        raise SystemExit(f"{golden_day} is not a schedule.swap_freeze_days day")
+    if golden_day and golden_day.day not in cfg.guard.month_days:
+        raise SystemExit(f"{golden_day} is not a guard.month_days day")
     if args.loop and golden_day:
         raise SystemExit("--golden-day runs once; it does not go with --loop")
     if not (args.loop or args.once or args.dry_run or golden_day):
@@ -368,6 +368,9 @@ def cmd_rank(cfg: Config, args: argparse.Namespace) -> Any:
     if cfg.text_index.prior_file != LIVE_PRIOR:
         raise SystemExit(f"rank needs text_index.prior_file = {LIVE_PRIOR!r} "
                          "(config/text_index/host2.toml)")
+    # G's pinned index must outlive the build for the next G.
+    if not cfg.text_index.keep_prev:
+        raise SystemExit("rank needs text_index.keep_prev = true")
 
     def once() -> dict[str, Any]:
         with rankjob.real_ports(cfg) as ports:
@@ -460,17 +463,17 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--status", action="store_true",
                       help="print the cycle, its outcome, the evidence and the next step; "
                            "change nothing")
-    p = sub.add_parser("rank", help="the rank rate of each golden day G, written at G+3")
+    p = sub.add_parser("rank", help="the index built on G-1, the rank rate of G written on G")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--loop", action="store_true", help="tick until stopped (the service)")
     mode.add_argument("--once", action="store_true", help="run one tick and print it")
     mode.add_argument("--dry-run", action="store_true",
-                      help="print what a tick would decide and, if the alias holds a "
-                           "build, its counts; build nothing, write nothing")
+                      help="print what a tick would decide and, if G has a pinned "
+                           "index, its counts; build nothing, write nothing")
     p.add_argument("--golden-day", metavar="YYYY-MM-DD",
-                   help="this golden day, before its due time too, and whoever activated "
-                        "the live run; a done, refused or failed record stays: delete "
-                        "work/rank/<G>.json to run it again")
+                   help="this golden day at any time and whoever activated the live run; "
+                        "builds if G has no index of the live list. A done, refused or "
+                        "failed record stays: delete work/rank/<G>.json to run it again")
     return parser
 
 

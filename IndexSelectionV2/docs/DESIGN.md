@@ -19,7 +19,7 @@
 **Non-goals**
 
 - No automatic rollback (§11). The text index is rebuilt automatically only by the
-  rank job, at G+3 (`docs/TEXT_INDEX.md`, "The rank job").
+  rank job, on the evening before each golden day (`docs/TEXT_INDEX.md`, "The rank job").
 - No writes to crawlerdb, the v1 selectdb (`:5444`) or `/data/ipc`. metricdb takes one
   write: the rank job sets the rank fields of each golden batch as the role `isel_rank`.
   The recrawl's results are deleted only through the crawler's API.
@@ -388,7 +388,7 @@ $J verify-live --batch <b>
 $J recrawl-sync                        # after a manual swap; refused in the freeze window
 $D run --rm text-index text-index-build   # after a manual sync: index the new list's docs
 $D run --rm rank rank --dry-run        # what the rank job would write; builds and writes nothing
-$D --profile rank up -d rank           # G's rank rate at G+3, every golden day
+$D --profile rank up -d rank           # index on G-1, G's rank rate on G, every golden day
 $J recrawl-plan --dry-run              # per-host capacity report; sends nothing
 $D --profile recrawl up -d recrawl-archive recrawl-plan
 $D --profile recrawl stop recrawl-plan # stops sending new jobs at once
@@ -452,8 +452,12 @@ when its `model_runs.cutoff_datetime` is at or after `start_at`.
   goes on until `swap_by`.
 - **The first swap** is followed by a cleanup that deletes every selection run but live
   and prev.
-- **The text index** is built by the `rank` service at G+3, which then writes G's rank
+- **The text index** is built by the `rank` service on G-1, which then writes G's rank
   rate (`docs/TEXT_INDEX.md`, "The rank job"). Refresh does not build it.
+- **December 2026** has batches on Dec 1, 8 and 15, and new lists only for Dec 1 and
+  15: `config/december-2026.toml` goes after the other configs. Apply it while no cycle
+  sits between its `start_at` and `clear_by` (after the Dec 1 cycle, before Dec 11
+  12:00 UTC), or the cycle ends `skipped_late`.
 
 `$J refresh --status` prints the cycle, its outcome, the evidence, each step's state and
 the next decision. It writes nothing and holds no lock; `work_lock` says who holds
