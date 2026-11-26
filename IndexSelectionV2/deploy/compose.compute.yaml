@@ -156,6 +156,7 @@ services:
   # live list on G-1, pins it from G on, then writes only the rank fields of G's coverage
   # rows as the metricdb role isel_rank. `run --rm rank rank --dry-run` writes nothing.
   #   docker compose ... --profile rank up -d rank
+  # In December 2026 add `-f deploy/compose.december-2026.yaml` (Dec 1, 8 and 15).
   rank:
     extends: {service: text-index}
     profiles: [rank]

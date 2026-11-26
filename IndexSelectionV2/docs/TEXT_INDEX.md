@@ -138,7 +138,11 @@ same day.
     (until then it waits);
   - every row's counts exactly equal to the coverage rows' `total` and `indexed_num`;
   - every row's `is_indexed` equal to the live list's answer for its lookup URLs, so
-    Metric measured this list;
+    Metric measured this list, but for at most `rank.max_indexed_mismatches` rows (5).
+    Metric spells URLs with w3lib 2.4.1, the crawler and isel with 2.5.0; 5 of 165,625
+    golden URLs differ, so Metric can miss a listed one. Another list differs in far
+    more rows: batch 21 had 0 against the list it was measured with and 175 of 15,008
+    against the one before. The snapshot file names the rows that differ;
   - the live run equal to the pinned index's `prior_run`.
 
   It then saves `work/rank/<G>.snapshot.json` (the batch rows, the coverage rows, the
@@ -172,10 +176,11 @@ same day.
 - **Which rows.** A coverage table has no batch id. G's row is the one dated from G to
   the day before the next golden day: Metric measures only the newest batch, so a row in
   that span is G's. The batch is the newest one created before G+1, and it must be
-  created on G. Only the tags it has rows of count (Dec 8 is head only). Measure each
-  batch once, after its last phase: the December runner's head phase reinserts the
+  created on G. Only the tags it has rows of count (Dec 8 is head only). Each batch is
+  measured once, after its last phase: the December runner's head phase reinserts the
   rows of keywords it shares with random, so random's row must be measured after it
-  too, or it waits.
+  too, or it waits. Metric's `measure_golden.py` (its course crontab) does this, both
+  tags together, before 16:00 UTC.
 - **Refusals.** The job writes nothing, and records why, if the batch is missing, older
   than G or has no golden rows; if the live run was activated after G's freeze start;
   if no index of the live list was built before G; if a table holds several rows in the
@@ -190,7 +195,13 @@ same day.
 - **Config.** `isel rank` stops at once unless `text_index.prior_file = "live"`, as
   `config/text_index/host2.toml` sets it. The job owns the alias: on each G-1 it
   replaces whatever index the alias holds, a manual experiment's included; build an
-  experiment under another `text_index.alias`.
+  experiment under another `text_index.alias`. December 2026
+  (`config/december-2026.toml`, batches on Dec 1, 8 and 15) comes through
+  `deploy/compose.december-2026.yaml`, which adds the overlay to the `rank` and
+  `refresh` entrypoints. Start `rank` with it before Nov 30 17:30 UTC, the Dec 1 build:
+  `docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml -f
+  deploy/compose.december-2026.yaml --profile rank up -d rank`. Recreate `refresh` with it
+  only after the Dec 1 cycle, as DESIGN §11 says.
 - **State.** `work/rank/<G>.json` holds `pending`, `done`, `refused` or `failed`, the
   shadow counts, the written counts and the snapshot's sha256; `<G>.snapshot.json` the
   snapshot; `<G>.ranked.parquet` each row's flags. Every step can run again after a

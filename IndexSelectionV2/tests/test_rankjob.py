@@ -700,6 +700,7 @@ def test_rows_inserted_after_the_measurement_wait(world):
 
 def test_rows_measured_against_another_list_refuse(world):
     # e.com/q is indexed in Metric, but the live list does not hold it.
+    world.cfg = replace(world.cfg, "rank", max_indexed_mismatches=0)
     world.tick(BUILD)
     world.listed.discard("https://e.com/q")
     world.tick(MEASURE)
@@ -707,6 +708,18 @@ def test_rows_measured_against_another_list_refuse(world):
     assert record.status is Status.REFUSED
     assert "1 rows' is_indexed disagree with the list of run-1114 (first id 6)" in record.reason
     assert world.metric.writes == 0
+
+
+def test_a_few_rows_spelled_otherwise_by_metric_still_rank(world):
+    # Metric's older w3lib can miss a listed URL: within the limit the rank is written
+    # with Metric's own flags, and the snapshot names the rows.
+    world.cfg = replace(world.cfg, "rank", max_indexed_mismatches=1)
+    world.tick(BUILD)
+    world.listed.discard("https://e.com/q")
+    world.tick(MEASURE)
+    assert world.record().status is Status.DONE and world.ranked() == RANKED
+    saved = rankjob.read_json(rankjob.snapshot_path(world.cfg, G))
+    assert saved["indexed_mismatch_ids"] == [6]
 
 
 def test_the_snapshot_is_what_was_ranked(world):
@@ -722,6 +735,7 @@ def test_the_snapshot_is_what_was_ranked(world):
 
 
 def test_dry_run_reports_rows_that_disagree_with_the_list(world):
+    world.cfg = replace(world.cfg, "rank", max_indexed_mismatches=0)
     world.put_index(BUILD + timedelta(minutes=5), LIVE.label)
     world.listed.discard("https://e.com/q")
     out = dry_run(world.cfg, world.ports(Clock(MEASURE)), Clock(MEASURE))

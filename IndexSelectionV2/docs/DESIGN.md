@@ -455,9 +455,14 @@ when its `model_runs.cutoff_datetime` is at or after `start_at`.
 - **The text index** is built by the `rank` service on G-1, which then writes G's rank
   rate (`docs/TEXT_INDEX.md`, "The rank job"). Refresh does not build it.
 - **December 2026** has batches on Dec 1, 8 and 15, and new lists only for Dec 1 and
-  15: `config/december-2026.toml` goes after the other configs. Apply it while no cycle
-  sits between its `start_at` and `clear_by` (after the Dec 1 cycle, before Dec 11
-  12:00 UTC), or the cycle ends `skipped_late`.
+  15: `config/december-2026.toml` goes after the other configs, through
+  `deploy/compose.december-2026.yaml`. Recreate `refresh` with it while no cycle sits
+  between its `start_at` and `clear_by` (after the Dec 1 cycle, before Dec 11 12:00
+  UTC), or the cycle ends `skipped_late`:
+  `docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml -f
+  deploy/compose.december-2026.yaml --profile refresh up -d refresh`. Without it the
+  cycle makes a Dec 16 list, which may swap on Dec 15 after Metric measured, and the
+  rank job refuses Dec 15. The `rank` service takes it from its first start.
 
 `$J refresh --status` prints the cycle, its outcome, the evidence, each step's state and
 the next decision. It writes nothing and holds no lock; `work_lock` says who holds
