@@ -7,20 +7,26 @@ Data shape:
 - `Counts` per (tag, team): distinct canonical golden URLs (`total`), the indexed and
   the ranked ones, counted as Metric's `CrawlerAllMetricMeasure` counts its coverage.
 - `RankRecord` at `work/rank/<G>.json`: the job's `Status` for G, what it used (batch,
-  live run, pinned index), the shadow counts and, per tag, the counts it wrote.
-  `work/rank/<G>.ranked.parquet` keeps each row's flags for audit.
+  live run, pinned index, snapshot hash), the shadow counts and, per tag, the counts
+  it wrote. `work/rank/<G>.ranked.parquet` keeps each row's flags for audit.
+- `Snapshot` at `work/rank/<G>.snapshot.json`: the batch rows and G's coverage rows as
+  the job first saw them measured and consistent.
 
 G is every `guard.month_days` day: a batch day, which may or may not get a new list.
 On G-1 from `rank.build_start` the job builds the text index of the live list, so the
-index is ready when the batch appears. G's index is pinned by rule, not by a record:
-the newest build of the live list that started before G. A rebuild for the next G
-leaves it (`text_index.keep_prev`), so G can still be written after it.
+index is ready when the batch appears. From G on it pins G's index: the newest build
+of the live list that started before G. The pin is a file under `text_index/pins`
+that every build keeps, so a rebuild for the next G leaves the index; it goes when G
+is done or refused. Every search of G goes to that physical index, never the alias.
 
 From the end of G's guard window (`guard.month_window`, the batch is complete) the job
 writes a shadow count into the record: indexed from selectdb as Metric reads it, ranked
-on the pinned index. Once Metric's coverage rows of G exist it writes only
-`metric_url.is_ranked` and the rows' `ranked_num` and `ranked_rate`, in one transaction.
-Disc/Crawl/Index stay as Metric measured them: the crawler injects golden URLs after G.
+on the pinned index. Once Metric has measured every row of the batch and its coverage
+rows match the rows and the live list exactly, the job saves the snapshot and ranks
+it. It writes only `metric_url.is_ranked` and the rows' `ranked_num` and `ranked_rate`,
+in one transaction that locks the rows and checks them against the snapshot first.
+A later read that differs from the snapshot refuses G. Disc/Crawl/Index stay as Metric
+measured them: the crawler injects golden URLs after G.
 
 Shape: observe, plan, act, as in `isel.refresh`. `plan` is pure. The build is evidence,
 not a flag. Every step is safe to rerun. A crash after the metricdb commit leaves the
@@ -32,12 +38,14 @@ from __future__ import annotations
 
 import enum
 import http.client
+import json
 import logging
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -61,7 +69,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-RANK_DIR = "rank"                  # under work_dir: `lock`, `<G>.json`, `<G>.ranked.parquet`
+RANK_DIR = "rank"   # under work_dir: `lock`, `<G>.json`, `<G>.snapshot.json`, `<G>.ranked.parquet`
 # A golden day number recurs within 62 days (see isel.schedule).
 _MAX_GAP_DAYS = 62
 _REASON_CHARS = 500
@@ -75,6 +83,14 @@ def utcnow() -> datetime:
 
 class RankError(RuntimeError):
     """Raised when a step cannot finish; the tick counts an attempt."""
+
+
+class SnapshotStale(RankError):
+    """The write found metricdb changed since the snapshot; nothing was written."""
+
+
+class PinMissing(RankError):
+    """G's pinned index answered 404: the tick defers, and the plan waits for it."""
 
 
 # ---------------------------------------------------------------- data shape
@@ -100,7 +116,9 @@ class GoldenRow:
     tags: tuple[str, ...]
     url: str
     is_indexed: bool
-    shard_id: int            # -1: Metric found no shard; such URLs count only in the total
+    # -1: Metric found no shard, so the URL counts only in the total. None: no
+    # measurement since the row was inserted (a strategy rerun deletes and inserts).
+    shard_id: int | None
 
 
 @dataclass(frozen=True)
@@ -142,6 +160,7 @@ class RankRecord:
     # tag -> {pairs_found, pairs_total, total, indexed_num, indexed_rate, ranked_num,
     # ranked_rate}: every URL, before Metric measures
     shadow: dict[str, Any] = field(default_factory=dict)
+    snapshot_sha256: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {"golden_day": self.golden_day.isoformat(), "status": self.status.value,
@@ -151,7 +170,7 @@ class RankRecord:
                 "written_at": self.written_at and self.written_at.isoformat(),
                 "tags": self.tags,
                 "shadow_at": self.shadow_at and self.shadow_at.isoformat(),
-                "shadow": self.shadow}
+                "shadow": self.shadow, "snapshot_sha256": self.snapshot_sha256}
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> RankRecord:
@@ -161,7 +180,7 @@ class RankRecord:
         return cls(date.fromisoformat(d["golden_day"]), Status(d["status"]), d.get("reason"),
                    int(d.get("attempts", 0)), d.get("batch_id"), d.get("live_run"),
                    d.get("index"), at("measured_at"), at("written_at"), d.get("tags") or {},
-                   at("shadow_at"), d.get("shadow") or {})
+                   at("shadow_at"), d.get("shadow") or {}, d.get("snapshot_sha256"))
 
 
 # ---------------------------------------------------------------- counting
@@ -195,7 +214,7 @@ def tally(rows: Sequence[GoldenRow], hits: Mapping[int, bool], ranked: Mapping[i
             key = canonicalize(row.url)
             indexed, rk, shard = urls.get(key, (False, False, -1))
             urls[key] = (indexed or row.is_indexed, rk or ranked.get(row.id, False),
-                         max(shard, row.shard_id))
+                         max(shard, -1 if row.shard_id is None else row.shard_id))
         acc = {team: [0, 0, 0] for team in _team_names(r)}
         for indexed, rk, shard in urls.values():
             for team in _teams_of(shard, r):
@@ -281,6 +300,44 @@ class IndexBuild:
     started_at: datetime     # the build's start, its UTC id
 
 
+@dataclass(frozen=True)
+class Snapshot:
+    """Metric's measurement of G as the job ranks it: the batch rows and G's coverage rows.
+
+    Metric keeps no measurement id: a strategy rerun deletes and inserts a keyword's
+    rows, and a re-measure rewrites the flags in place. So the job saves this once,
+    when Metric has measured every row and the counts match, and every later read and
+    the write itself must find exactly the same rows.
+    """
+
+    batch_id: int
+    rows: tuple[GoldenRow, ...]
+    coverage: Mapping[str, tuple[CoverageRow, ...]]   # table -> its rows in [first, last]
+    first: date
+    last: date
+
+    def to_json(self) -> dict[str, Any]:
+        return {"batch_id": self.batch_id, "first": self.first.isoformat(),
+                "last": self.last.isoformat(),
+                "rows": [[r.id, r.query_id, r.keyword, list(r.tags), r.url, r.is_indexed,
+                          r.shard_id] for r in self.rows],
+                "coverage": {t: [[c.stat_date.isoformat(), c.total, c.indexed_num]
+                                 for c in rows] for t, rows in sorted(self.coverage.items())}}
+
+    @classmethod
+    def from_json(cls, d: Mapping[str, Any]) -> Snapshot:
+        return cls(int(d["batch_id"]),
+                   tuple(GoldenRow(i, q, kw, tuple(tags), url, indexed, shard)
+                         for i, q, kw, tags, url, indexed, shard in d["rows"]),
+                   {t: tuple(CoverageRow(date.fromisoformat(sd), total, indexed)
+                             for sd, total, indexed in rows)
+                    for t, rows in d["coverage"].items()},
+                   date.fromisoformat(d["first"]), date.fromisoformat(d["last"]))
+
+    def sha256(self) -> str:
+        return sha256(json.dumps(self.to_json(), sort_keys=True).encode()).hexdigest()
+
+
 class MetricDb(Protocol):
     """The metricdb reads and the one write of the rank job."""
 
@@ -293,8 +350,13 @@ class MetricDb(Protocol):
     def coverage_rows(self, table: str, first: date, last: date) -> list[CoverageRow]:
         """The rows of a coverage table with `first <= stat_date <= last`."""
 
-    def write(self, ranked: Mapping[int, bool], rows: Sequence[CoverageWrite]) -> None:
-        """Sets `is_ranked` and the coverage rows' ranked fields in one transaction."""
+    def write(self, snapshot: Snapshot, ranked: Mapping[int, bool],
+              rows: Sequence[CoverageWrite]) -> None:
+        """Sets `is_ranked` and the coverage rows' ranked fields in one transaction.
+
+        It first locks the batch rows and the coverage rows and raises `SnapshotStale`
+        unless they are exactly `snapshot`'s.
+        """
 
 
 @dataclass(frozen=True)
@@ -305,6 +367,8 @@ class Ports:
     build: Callable[[], Any]
     search: Callable[[str, str], list[str]]          # (physical index, keyword) -> top k
     listed: Callable[[Sequence[str]], set[str]]      # URLs the live list holds
+    # (physical index, holder) -> False if the index is gone; see `textindex.pin`
+    pin: Callable[[str, dict[str, Any]], bool]
 
 
 @dataclass(frozen=True)
@@ -315,6 +379,9 @@ class Evidence:
     coverage: Mapping[tuple[str, str], tuple[CoverageRow, ...]]
     live: LiveRun | None
     builds: tuple[IndexBuild, ...]
+    pin: str | None = None                   # G's pinned index, if G has one
+    listed: frozenset[str] | None = None     # the rows' lookup URLs on the live list
+    snapshot: Snapshot | None = None         # saved by an earlier tick of G
 
 
 def _midnight(day: date) -> datetime:
@@ -348,18 +415,43 @@ def coverage_table(r: RankCfg, tag: str, team: str) -> str:
     return r.coverage_table_fmt.format(tag=tag, team=team)
 
 
+def _last_day(golden_day: date, cfg: Config) -> date:
+    """The last stat_date of G's coverage rows: the day before the next G."""
+    return next_golden_day(golden_day, cfg) - timedelta(days=1)
+
+
+def snapshot_path(cfg: Config, golden_day: date) -> Path:
+    return rank_dir(cfg) / f"{golden_day.isoformat()}.snapshot.json"
+
+
+def read_snapshot(cfg: Config, golden_day: date) -> Snapshot | None:
+    data = read_json(snapshot_path(cfg, golden_day))
+    return None if data is None else Snapshot.from_json(data["snapshot"])
+
+
+def pin_of(cfg: Config, golden_day: date) -> str | None:
+    """G's pinned physical index: the pin file whose holder is G."""
+    from isel.textindex import pins
+
+    mine = [i for i, h in pins(cfg).items() if h.get("golden_day") == golden_day.isoformat()]
+    return mine[-1] if mine else None
+
+
 def observe(cfg: Config, golden_day: date, ports: Ports, *, metric: bool = True) -> Evidence:
     """What the job sees for G; with `metric` False it reads no metricdb (before G)."""
     live, builds = ports.live_run(), tuple(ports.builds())
+    pin = pin_of(cfg, golden_day)
     if not metric:
-        return Evidence(None, (), {}, live, builds)
+        return Evidence(None, (), {}, live, builds, pin)
     batch = ports.metric.batch_before(_midnight(golden_day + timedelta(days=1)))
     rows = tuple(ports.metric.batch_rows(batch.id)) if batch else ()
-    last = next_golden_day(golden_day, cfg) - timedelta(days=1)
+    last = _last_day(golden_day, cfg)
     coverage = {(tag, team): tuple(ports.metric.coverage_rows(
                     coverage_table(cfg.rank, tag, team), golden_day, last))
                 for tag in cfg.golden.tags for team in _team_names(cfg.rank)}
-    return Evidence(batch, rows, coverage, live, builds)
+    listed = frozenset(ports.listed(_lookup_spellings(rows))) if rows else frozenset()
+    return Evidence(batch, rows, coverage, live, builds, pin, listed,
+                    read_snapshot(cfg, golden_day))
 
 
 # ---------------------------------------------------------------- plan
@@ -381,6 +473,11 @@ class Build:
 
 
 @dataclass(frozen=True)
+class Pin:
+    pass
+
+
+@dataclass(frozen=True)
 class Shadow:
     pass
 
@@ -390,7 +487,7 @@ class MeasureWrite:
     pass
 
 
-Decision = Idle | Refuse | Build | Shadow | MeasureWrite
+Decision = Idle | Refuse | Build | Pin | Shadow | MeasureWrite
 
 
 def pick_golden_day(now: datetime, cfg: Config) -> date:
@@ -421,15 +518,18 @@ def batch_tags(cfg: Config, ev: Evidence) -> list[str]:
     return [t for t in cfg.golden.tags if any(t in row.tags for row in ev.rows)]
 
 
+def _golden_rows(cfg: Config, ev: Evidence) -> list[GoldenRow]:
+    """The rows Metric measures: those of a golden tag."""
+    tags = set(batch_tags(cfg, ev))
+    return [row for row in ev.rows if tags & set(row.tags)]
+
+
 def refusals(cfg: Config, golden_day: date, ev: Evidence, check_activation: bool) -> list[str]:
-    """Why G cannot take a rank; empty if it can.
+    """Why G cannot take a rank whatever Metric measures next; empty if it can.
 
     The batch must be created on G and have rows of a tag. Each of its tags' coverage
-    tables may hold no row yet (Metric has not measured) but not several. A row's counts
-    must match the batch rows: a mismatch means a later measurement rewrote `is_indexed`,
-    or the row is another measurement's. They may drift by `rank.max_drift`: the head
-    measurement replaces the URLs of the keywords it shares with random (about 50 per
-    batch) and rewrites their `is_indexed` and `shard_id`.
+    tables may hold no row yet (Metric has not measured) but not several. The list
+    measured on G must be the live run, active since before G's freeze start.
     """
     if ev.batch is None:
         return [f"no metric batch was created before {golden_day + timedelta(days=1)}"]
@@ -449,27 +549,73 @@ def refusals(cfg: Config, golden_day: date, ev: Evidence, check_activation: bool
         reasons.append(f"live run {ev.live.label} was activated at "
                        f"{ev.live.activated_at}, not before {freeze_start.isoformat()}: "
                        "it is not the list measured on G")
-    counts = tally(ev.rows, {}, {}, tags, cfg.rank)
     for tag in tags:
         for team in _team_names(cfg.rank):
             table, rows = coverage_table(cfg.rank, tag, team), ev.coverage[(tag, team)]
             if len(rows) > 1:
                 reasons.append(f"{table} has {len(rows)} rows dated {golden_day} or later, "
                                "before the next golden day")
-                continue
-            if not rows:
-                continue
-            got, want = rows[0], counts[tag].teams[team]
-            if not (_close(got.total, want.total, cfg.rank.max_drift)
-                    and _close(got.indexed_num, want.indexed_num, cfg.rank.max_drift)):
-                reasons.append(f"{table} {got.stat_date}: total {got.total} and indexed_num "
-                               f"{got.indexed_num}, batch {ev.batch.id} gives {want.total} "
-                               f"and {want.indexed_num}")
     return reasons
 
 
-def _close(got: int | None, want: int, drift: float) -> bool:
-    return got is not None and abs(got - want) <= drift * max(got, 1)
+def count_mismatches(cfg: Config, ev: Evidence) -> list[str]:
+    """Coverage rows whose counts are not exactly those of the batch rows.
+
+    Metric counts a row from the rows it measured, so a difference means the rows
+    changed after the row was written: a rerun replaced URLs, or a re-measure rewrote
+    the flags of a row another run had written.
+    """
+    tags = batch_tags(cfg, ev)
+    counts = tally(ev.rows, {}, {}, tags, cfg.rank)
+    reasons = []
+    for tag in tags:
+        for team in _team_names(cfg.rank):
+            table, rows = coverage_table(cfg.rank, tag, team), ev.coverage[(tag, team)]
+            if len(rows) != 1:
+                continue
+            got, want = rows[0], counts[tag].teams[team]
+            if (got.total, got.indexed_num) != (want.total, want.indexed_num):
+                reasons.append(f"{table} {got.stat_date}: total {got.total} and indexed_num "
+                               f"{got.indexed_num}, batch {ev.batch and ev.batch.id} gives "
+                               f"{want.total} and {want.indexed_num}")
+    return reasons
+
+
+def unmeasured(cfg: Config, ev: Evidence) -> list[int]:
+    """Golden rows inserted after Metric's last measurement: no shard yet."""
+    return [row.id for row in _golden_rows(cfg, ev) if row.shard_id is None]
+
+
+def indexed_mismatches(cfg: Config, ev: Evidence) -> list[int]:
+    """Golden rows whose `is_indexed` is not what the live list says.
+
+    Metric sets `is_indexed` from `selected_urls_current`, so every row agrees with the
+    list it measured; a disagreement means it measured another list.
+    """
+    listed = ev.listed or frozenset()
+    return [row.id for row in _golden_rows(cfg, ev)
+            if row.is_indexed != any(u in listed for u in lookup_urls(canonicalize(row.url)))]
+
+
+def snapshot_of(cfg: Config, golden_day: date, ev: Evidence) -> Snapshot:
+    assert ev.batch is not None, "a snapshot needs the batch"
+    return Snapshot(ev.batch.id, ev.rows,
+                    {coverage_table(cfg.rank, tag, team): tuple(ev.coverage[(tag, team)])
+                     for tag in batch_tags(cfg, ev) for team in _team_names(cfg.rank)},
+                    golden_day, _last_day(golden_day, cfg))
+
+
+def snapshot_changes(saved: Snapshot, now: Snapshot) -> list[str]:
+    """What differs between the saved snapshot and the rows read now."""
+    out = []
+    if saved.batch_id != now.batch_id:
+        out.append(f"batch {saved.batch_id} became {now.batch_id}")
+    was, got = set(saved.rows), set(now.rows)
+    if was != got:
+        out.append(f"{len(was - got)} rows changed or went, {len(got - was)} rows are new")
+    out += [f"{t} changed" for t in sorted(set(saved.coverage) | set(now.coverage))
+            if saved.coverage.get(t) != now.coverage.get(t)]
+    return out
 
 
 def fresh(ev: Evidence, since: datetime) -> bool:
@@ -478,8 +624,8 @@ def fresh(ev: Evidence, since: datetime) -> bool:
             and ev.builds[-1].prior_run == ev.live.label and ev.builds[-1].started_at >= since)
 
 
-def pinned(ev: Evidence, golden_day: date, scheduled: bool) -> IndexBuild | None:
-    """G's index: the newest build of the live list that started before G.
+def pin_candidate(ev: Evidence, golden_day: date, scheduled: bool) -> IndexBuild | None:
+    """The index G should pin: the newest build of the live list that started before G.
 
     A tick for a named golden day falls back to the newest build of the live list, so a
     G whose build was missed can be built and written by hand.
@@ -493,6 +639,11 @@ def pinned(ev: Evidence, golden_day: date, scheduled: bool) -> IndexBuild | None
     return None if scheduled or not mine else mine[-1]
 
 
+def pinned(ev: Evidence) -> IndexBuild | None:
+    """G's pinned build, if it still exists."""
+    return next((b for b in ev.builds if b.index == ev.pin), None)
+
+
 def missing_rows(cfg: Config, ev: Evidence) -> list[str]:
     """The coverage tables of the batch's tags that hold no row of G yet."""
     return [coverage_table(cfg.rank, tag, team) for tag in batch_tags(cfg, ev)
@@ -504,10 +655,13 @@ def plan(cfg: Config, now: datetime, record: RankRecord, ev: Evidence, *,
     """The next step for `record`.
 
     A scheduled tick builds on G-1 between `rank.build_start` and `rank.build_latest`
-    unless the newest build already holds the live list from that window, then waits for
-    `measure_from`. From there it refuses, writes the shadow counts once, and writes
-    the rank once Metric's coverage rows of G exist. A tick for a named golden day skips
-    the clock and the activation check, and builds if G has no index of the live list.
+    unless the newest build already holds the live list from that window. From G's
+    midnight it pins G's index and waits for `measure_from`. From there it refuses,
+    writes the shadow counts once, and waits until Metric has measured every row of
+    the batch. Once Metric has measured, the rows, the coverage rows, the live list and
+    any saved snapshot must agree before it builds, pins or writes. A tick for a named
+    golden day skips the clock and the activation check, and builds if G has no index
+    of the live list.
     """
     idle = waiting(cfg, now, record, scheduled)
     if idle is not None:
@@ -522,18 +676,47 @@ def plan(cfg: Config, now: datetime, record: RankRecord, ev: Evidence, *,
         if now > build_until(g, cfg.rank):
             return Idle(f"no build may start after {build_until(g, cfg.rank).isoformat()}")
         return Build()
+    pin = pinned(ev)
+    if ev.pin is not None and pin is None:
+        return Idle(f"the pinned index {ev.pin} is missing")
     if scheduled and now < measure_from(g, cfg):
+        if ev.pin is None and pin_candidate(ev, g, scheduled) is not None:
+            return Pin()
         return Idle(f"measures from {measure_from(g, cfg).isoformat()}")
     reasons = refusals(cfg, g, ev, check_activation=scheduled)
     if reasons:
         return Refuse("; ".join(reasons))
-    if pinned(ev, g, scheduled) is None:
+    assert ev.live is not None, "refusals refuse without a live run"
+    missing = missing_rows(cfg, ev)
+    # Metric has measured: the rows must be what it counted, before any build or search.
+    if not missing:
+        if ev.snapshot is not None:
+            changes = snapshot_changes(ev.snapshot, snapshot_of(cfg, g, ev))
+            if changes:
+                return Refuse("metricdb changed since the snapshot: " + "; ".join(changes))
+        pending = unmeasured(cfg, ev)
+        if pending:
+            return Idle(f"waiting for Metric to measure {len(pending)} rows inserted after "
+                        f"its last measurement (first id {pending[0]})")
+        reasons = count_mismatches(cfg, ev)
+        if reasons:
+            return Refuse("; ".join(reasons))
+        wrong = indexed_mismatches(cfg, ev)
+        if wrong:
+            return Refuse(f"{len(wrong)} rows' is_indexed disagree with the list of "
+                          f"{ev.live.label} (first id {wrong[0]}): Metric measured another "
+                          "list")
+    if pin is None:
+        if pin_candidate(ev, g, scheduled) is not None:
+            return Pin()
         if not scheduled:
             return Build()
-        return Refuse(f"no index of {ev.live and ev.live.label} was built before {g}")
+        return Refuse(f"no index of {ev.live.label} was built before {g}")
+    if pin.prior_run != ev.live.label:
+        return Refuse(f"the live run is {ev.live.label}, but the pinned index {pin.index} "
+                      f"holds the list of {pin.prior_run}")
     if record.shadow_at is None:
         return Shadow()
-    missing = missing_rows(cfg, ev)
     if missing:
         return Idle(f"waiting for Metric's coverage rows: {', '.join(missing)}")
     return MeasureWrite()
@@ -600,7 +783,18 @@ def _audit(cfg: Config, golden_day: date, rows: Sequence[GoldenRow], ranking: Ra
 
 
 def _search_on(ports: Ports, index: str) -> Callable[[str], list[str]]:
-    return lambda keyword: ports.search(index, keyword)
+    """Searches the physical `index` only; a 404 means it is gone, not that a doc is."""
+    from isel.textindex import TextIndexError
+
+    def search(keyword: str) -> list[str]:
+        try:
+            return ports.search(index, keyword)
+        except TextIndexError as exc:
+            if exc.status == 404:
+                raise PinMissing(f"the pinned index {index} answered 404") from exc
+            raise
+
+    return search
 
 
 def _lookup_spellings(rows: Sequence[GoldenRow]) -> list[str]:
@@ -609,37 +803,49 @@ def _lookup_spellings(rows: Sequence[GoldenRow]) -> list[str]:
 
 def _shadow(cfg: Config, record: RankRecord, ev: Evidence, ports: Ports,
             pin: IndexBuild, clock: Clock) -> RankRecord:
-    listed = ports.listed(_lookup_spellings(ev.rows))
-    shadow = shadow_counts(ev.rows, listed, _search_on(ports, pin.index),
+    assert ev.listed is not None, "the shadow reads the list with the rows"
+    shadow = shadow_counts(ev.rows, set(ev.listed), _search_on(ports, pin.index),
                            batch_tags(cfg, ev), cfg.rank)
     return replace(record, shadow_at=clock(), shadow=shadow)
 
 
+def _save_snapshot(cfg: Config, snapshot: Snapshot, ev: Evidence, pin: IndexBuild,
+                   clock: Clock) -> None:
+    atomic_write_json(snapshot_path(cfg, snapshot.first), {
+        "taken_at": clock().isoformat(), "live_run": ev.live and ev.live.label,
+        "index": pin.index, "sha256": snapshot.sha256(), "snapshot": snapshot.to_json()})
+
+
 def _measure_write(cfg: Config, record: RankRecord, ev: Evidence, ports: Ports,
                    pin: IndexBuild, clock: Clock) -> RankRecord:
-    ranking = count_ranks(ev.rows, _search_on(ports, pin.index), batch_tags(cfg, ev),
-                          cfg.rank)
+    snapshot = ev.snapshot or snapshot_of(cfg, record.golden_day, ev)
+    if ev.snapshot is None:
+        # Saved before the searches: a change during them refuses the next tick.
+        _save_snapshot(cfg, snapshot, ev, pin, clock)
+    rows = snapshot.rows
+    ranking = count_ranks(rows, _search_on(ports, pin.index), batch_tags(cfg, ev), cfg.rank)
     tags = tag_results(ranking, ev)
     measured_at = clock()
-    _audit(cfg, record.golden_day, ev.rows, ranking)
+    _audit(cfg, record.golden_day, rows, ranking)
     writes = [CoverageWrite(coverage_table(cfg.rank, tag, team),
                             date.fromisoformat(t["stat_date"]), t["ranked_num"], t["ranked_rate"])
               for tag, entry in tags.items() for team, t in entry["teams"].items()]
-    ports.metric.write(ranking.ranked, writes)
+    ports.metric.write(snapshot, ranking.ranked, writes)
     return replace(record, status=Status.DONE, reason=None, measured_at=measured_at,
-                   written_at=clock(), tags=tags)
+                   written_at=clock(), tags=tags, snapshot_sha256=snapshot.sha256())
 
 
 def transient(exc: BaseException) -> bool:
     """True for an outage a later tick may get past; it must not use up an attempt.
 
     A dropped or unreachable database server, an OpenSearch node that did not answer,
-    and a manual `text-index-build` that holds the build lock.
+    a manual `text-index-build` that holds the build lock, and a pinned index that
+    answered 404: the plan then waits for it instead of searching another.
     """
     from isel.pg import connection_lost
     from isel.textindex import TextIndexError
 
-    if isinstance(exc, LockBusy) or connection_lost(exc):
+    if isinstance(exc, LockBusy | PinMissing) or connection_lost(exc):
         return True
     # An HTTP reply carries a status; urllib's HTTPError is an OSError too, and a
     # reply a retry repeats (400, 403, 500) must use up attempts.
@@ -647,32 +853,51 @@ def transient(exc: BaseException) -> bool:
             and isinstance(exc.__cause__, OSError | http.client.HTTPException))
 
 
+def _seen(record: RankRecord, ev: Evidence) -> RankRecord:
+    return replace(record, batch_id=ev.batch and ev.batch.id,
+                   live_run=ev.live and ev.live.label, index=ev.pin)
+
+
 def _step(cfg: Config, now: datetime, record: RankRecord, ports: Ports, clock: Clock,
           scheduled: bool) -> tuple[Decision, RankRecord]:
+    from isel.textindex import unpin
+
     g = record.golden_day
-    before_g = scheduled and utc(now) < _midnight(g)
     # metricdb is closed until G's guard window ends, and the batch is not complete.
     ev = observe(cfg, g, ports, metric=not (scheduled and utc(now) < measure_from(g, cfg)))
-    decision = plan(cfg, now, record, ev, scheduled=scheduled)
-    if isinstance(decision, Build):
-        ports.build()
-        ev = replace(ev, builds=tuple(ports.builds()))
-        if isinstance(after := plan(cfg, now, record, ev, scheduled=scheduled), Build):
-            raise RankError("the build left no index of the live run's list")
-        decision = after
-    pin = None if before_g else pinned(ev, g, scheduled)
-    record = replace(record, batch_id=ev.batch and ev.batch.id,
-                     live_run=ev.live and ev.live.label, index=pin and pin.index)
-    if isinstance(decision, Refuse):
-        return decision, replace(record, status=Status.REFUSED, reason=decision.reason)
-    if isinstance(decision, Shadow):
-        assert pin is not None, "plan shadows only with a pinned index"
-        record = _shadow(cfg, record, ev, ports, pin, clock)
+    built = False
+    while True:
+        record = _seen(record, ev)
         decision = plan(cfg, now, record, ev, scheduled=scheduled)
-    if isinstance(decision, MeasureWrite):
-        assert pin is not None, "plan writes only with a pinned index"
-        return decision, _measure_write(cfg, record, ev, ports, pin, clock)
-    return decision, record
+        if isinstance(decision, Build):
+            if built:
+                raise RankError("the build left no index of the live run's list")
+            ports.build()
+            built = True
+            ev = replace(ev, builds=tuple(ports.builds()))
+        elif isinstance(decision, Pin):
+            candidate = pin_candidate(ev, g, scheduled)
+            assert candidate is not None, "plan pins only a candidate"
+            if not ports.pin(candidate.index, {"golden_day": g.isoformat(),
+                                               "pinned_at": clock().isoformat()}):
+                raise RankError(f"{candidate.index} was deleted before it could be pinned")
+            ev = replace(ev, pin=candidate.index)
+        elif isinstance(decision, Shadow):
+            pin = pinned(ev)
+            assert pin is not None, "plan shadows only with a pinned index"
+            record = _shadow(cfg, record, ev, ports, pin, clock)
+        elif isinstance(decision, MeasureWrite):
+            pin = pinned(ev)
+            assert pin is not None, "plan writes only with a pinned index"
+            record = _measure_write(cfg, record, ev, ports, pin, clock)
+            unpin(cfg, pin.index)
+            return decision, record
+        elif isinstance(decision, Refuse):
+            if ev.pin is not None:
+                unpin(cfg, ev.pin)
+            return decision, replace(record, status=Status.REFUSED, reason=decision.reason)
+        else:
+            return decision, record
 
 
 def tick(cfg: Config, ports: Ports, clock: Clock = utcnow,
@@ -721,31 +946,39 @@ def dry_run(cfg: Config, ports: Ports, clock: Clock = utcnow,
             golden_day: date | None = None) -> dict[str, Any]:
     """What a tick would decide, and the counts on G's pinned index; writes nothing.
 
-    It neither builds nor writes a file or a row. Refusal reasons, the live run's
-    activation included, come back as `problems`. With rows and a pinned index it also
-    counts: `measured` with Metric's `is_indexed`, `shadow` with selectdb's list.
+    It neither builds, pins nor writes a file or a row. Refusal reasons, the live
+    run's activation, count mismatches and rows that disagree with the list included,
+    come back as `problems`. With rows and an index (G's pin, or the one it would pin)
+    it also counts: `measured` with Metric's `is_indexed`, `shadow` with selectdb's list.
     """
     now = clock()
     g = pick_golden_day(now, cfg) if golden_day is None else golden_day
     record = read_record(cfg, g)
     ev = observe(cfg, g, ports)
-    pin = pinned(ev, g, scheduled=False)
+    pin = pinned(ev) if ev.pin is not None else pin_candidate(ev, g, scheduled=False)
+    wrong = indexed_mismatches(cfg, ev)
+    problems = refusals(cfg, g, ev, check_activation=True) + count_mismatches(cfg, ev)
+    if ev.snapshot is not None and ev.batch is not None:
+        problems += snapshot_changes(ev.snapshot, snapshot_of(cfg, g, ev))
+    if wrong:
+        problems.append(f"{len(wrong)} rows' is_indexed disagree with the live list")
     out: dict[str, Any] = {
         "golden_day": g.isoformat(), "build_from": build_from(g, cfg.rank).isoformat(),
         "measure_from": measure_from(g, cfg).isoformat(),
         "would": type(plan(cfg, now, record, ev, scheduled=golden_day is None)).__name__.lower(),
         "record": record.to_json(),
-        "problems": refusals(cfg, g, ev, check_activation=True),
+        "problems": problems,
         "missing_rows": missing_rows(cfg, ev),
+        "unmeasured_rows": len(unmeasured(cfg, ev)),
+        "indexed_mismatch_ids": wrong[:20],
         "batch_id": ev.batch and ev.batch.id, "live_run": ev.live and ev.live.label,
-        "index": pin and pin.index,
+        "pinned": ev.pin, "index": pin and pin.index,
         "index_fresh": fresh(ev, build_from(g, cfg.rank)),
     }
     if ev.rows and pin is not None:
         search, tags = _search_on(ports, pin.index), batch_tags(cfg, ev)
         out["measured"] = tag_results(count_ranks(ev.rows, search, tags, cfg.rank), ev)
-        out["shadow"] = shadow_counts(ev.rows, ports.listed(_lookup_spellings(ev.rows)),
-                                      search, tags, cfg.rank)
+        out["shadow"] = shadow_counts(ev.rows, set(ev.listed or ()), search, tags, cfg.rank)
     return out
 
 
@@ -757,8 +990,16 @@ _BATCH_SQL = ("SELECT id, created_at FROM metric_batches WHERE created_at < %s "
 _ROWS_SQL = ("SELECT u.id, u.query_id, q.keyword, q.tags, u.url, u.is_indexed, u.shard_id "
              "FROM metric_url u JOIN metric_queries q ON q.id = u.query_id "
              "WHERE q.batch_id = %s AND u.url IS NOT NULL ORDER BY u.id")
+# The write locks the batch rows: a strategy rerun deletes them and must wait.
+_LOCK_ROWS_SQL = _ROWS_SQL + " FOR UPDATE OF u"
 _RANKED_SQL = ("UPDATE metric_url AS m SET is_ranked = u.r "
                "FROM unnest(%s::bigint[], %s::boolean[]) AS u(id, r) WHERE m.id = u.id")
+
+
+def _golden_row(t: Sequence[Any]) -> GoldenRow:
+    i, q, kw, tags, url, indexed, shard = t
+    return GoldenRow(int(i), int(q), kw, tuple(tags or ()), url, bool(indexed),
+                     None if shard is None else int(shard))
 
 
 class PgMetricDb:
@@ -788,10 +1029,7 @@ class PgMetricDb:
         return None if row is None else Batch(int(row[0]), row[1].replace(tzinfo=UTC))
 
     def batch_rows(self, batch_id: int) -> list[GoldenRow]:
-        return [GoldenRow(int(i), int(q), kw, tuple(tags or ()), url, bool(indexed),
-                          -1 if shard is None else int(shard))
-                for i, q, kw, tags, url, indexed, shard
-                in self._read().fetchall(_ROWS_SQL, (batch_id,))]
+        return [_golden_row(t) for t in self._read().fetchall(_ROWS_SQL, (batch_id,))]
 
     def coverage_rows(self, table: str, first: date, last: date) -> list[CoverageRow]:
         from psycopg import sql
@@ -801,7 +1039,8 @@ class PgMetricDb:
                         ).format(sql.Identifier(table))
         return [CoverageRow(*r) for r in self._read().fetchall(query, (first, last))]
 
-    def write(self, ranked: Mapping[int, bool], rows: Sequence[CoverageWrite]) -> None:
+    def write(self, snapshot: Snapshot, ranked: Mapping[int, bool],
+              rows: Sequence[CoverageWrite]) -> None:
         from psycopg import sql
 
         from isel.pg import next_allowed_start, open_metricdb_writer
@@ -816,6 +1055,21 @@ class PgMetricDb:
         conn = open_metricdb_writer(self._cfg)
         try:
             with conn.transaction(), conn.cursor() as cur:
+                cur.execute(_LOCK_ROWS_SQL, (snapshot.batch_id,))
+                locked = tuple(_golden_row(t) for t in cur.fetchall())
+                coverage = {}
+                for table in snapshot.coverage:
+                    cur.execute(sql.SQL("SELECT stat_date, total, indexed_num FROM {} "
+                                        "WHERE stat_date BETWEEN %s AND %s "
+                                        "ORDER BY stat_date FOR UPDATE"
+                                        ).format(sql.Identifier(table)),
+                                (snapshot.first, snapshot.last))
+                    coverage[table] = tuple(CoverageRow(*r) for r in cur.fetchall())
+                changes = snapshot_changes(snapshot, Snapshot(
+                    snapshot.batch_id, locked, coverage, snapshot.first, snapshot.last))
+                if changes:
+                    raise SnapshotStale("metricdb changed since the snapshot: "
+                                        + "; ".join(changes))
                 cur.execute(_RANKED_SQL, (ids, [ranked[i] for i in ids]))
                 if cur.rowcount != len(ids):
                     raise RankError(f"is_ranked: updated {cur.rowcount} of {len(ids)} rows")
@@ -880,6 +1134,7 @@ def real_ports(cfg: Config) -> Iterator[Ports]:
                     builds=lambda: index_builds(cfg, client),
                     build=lambda: textindex.build(cfg, client, Path(cfg.recrawl.text_root)),
                     search=lambda index, kw: textindex.search(client, t, kw, index)[0],
-                    listed=lambda urls: read_listed(cfg, urls))
+                    listed=lambda urls: read_listed(cfg, urls),
+                    pin=lambda index, holder: textindex.pin(cfg, client, index, holder))
     finally:
         metric.close()

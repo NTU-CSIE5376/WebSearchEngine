@@ -76,6 +76,8 @@ class OpenSearchStub:
             return 200, {"took": 1, "_shards": {"failed": self.failed_shards},
                          "hits": {"hits": []}}
         names = self.aliases.get(target, {target})
+        if not all(name in self.indices for name in names):
+            return 404, {"error": {"type": "index_not_found_exception"}, "status": 404}
         docs = {i: d for name in names for i, d in self.indices[name]["docs"].items()}
         query = body["query"]
         if "ids" in query:

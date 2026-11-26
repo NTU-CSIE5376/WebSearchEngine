@@ -455,6 +455,41 @@ def build_records(cfg: Config, client: OpenSearch) -> list[dict[str, Any]]:
     return [r for r in records if r is not None]
 
 
+def _pin_dir(cfg: Config) -> Path:
+    return cfg.work_dir / "text_index" / "pins"
+
+
+def _build_lock(cfg: Config) -> Path:
+    return cfg.work_dir / "text_index" / "build.lock"
+
+
+def pins(cfg: Config) -> dict[str, dict[str, Any]]:
+    """Physical index -> its pin: the indices a build must not delete."""
+    out = {}
+    for path in sorted(_pin_dir(cfg).glob("*.json")):
+        data = read_json(path)
+        if data is not None:
+            out[path.stem] = data
+    return out
+
+
+def pin(cfg: Config, client: OpenSearch, index: str, holder: dict[str, Any]) -> bool:
+    """Keeps `index` through later builds; False if it is already gone.
+
+    It takes the build lock, so a build cannot delete the index between the check and
+    the pin.
+    """
+    with file_lock(_build_lock(cfg)):
+        if index not in _builds(client, cfg.text_index.alias):
+            return False
+        atomic_write_json(_pin_dir(cfg) / f"{index}.json", holder)
+    return True
+
+
+def unpin(cfg: Config, index: str) -> None:
+    (_pin_dir(cfg) / f"{index}.json").unlink(missing_ok=True)
+
+
 def resolve_prior(cfg: Config) -> tuple[str, str | None]:
     """The prior's Parquet glob and its run label; `"live"` reads the live run's manifest.
 
@@ -501,7 +536,7 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
     built = cfg.work_dir / "text_index" / "build"
     started = time.monotonic()
     prior_file, prior_run = resolve_prior(cfg)
-    with file_lock(cfg.work_dir / "text_index" / "build.lock"):
+    with file_lock(_build_lock(cfg)):
         con = open_duckdb(cfg, cfg.work_dir / "text_index" / "tmp")
         try:
             texts, challenges, url_only, off_list, batches = latest_docs(
@@ -549,8 +584,10 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
             _swap(client, t.alias, index, previous)
         finally:
             con.close()
-        # Only older builds: a newer one may still be loading.
-        keep = {index, *previous} if t.keep_prev else {index}
+        # Only older builds: a newer one may still be loading. A rank job's pin keeps G's
+        # index until G is written.
+        pinned = sorted(pins(cfg))
+        keep = {index, *pinned, *(previous if t.keep_prev else ())}
         deleted = [n for n in _builds(client, t.alias) if n < index and n not in keep]
         for name in deleted:
             client.call("DELETE", f"/{name}")
@@ -570,7 +607,7 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
             "segments": stats["segments"]["count"], "recovery_source_pruned": pruned,
             "load_s": round(load_s, 3), "total_s": round(total_s, 3),
             "docs_per_s_load": round(rows / load_s, 1) if load_s else None,
-            "previous": previous, "deleted": deleted, "strays": strays,
+            "previous": previous, "deleted": deleted, "pinned": pinned, "strays": strays,
             "prior_file": prior_file, "prior_run": prior_run,
             "prior_docs": rows if prior_file else 0, "fallback_docs": url_only,
             "challenge_docs": challenges, "docs_off_list": off_list,

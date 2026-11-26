@@ -368,9 +368,6 @@ def cmd_rank(cfg: Config, args: argparse.Namespace) -> Any:
     if cfg.text_index.prior_file != LIVE_PRIOR:
         raise SystemExit(f"rank needs text_index.prior_file = {LIVE_PRIOR!r} "
                          "(config/text_index/host2.toml)")
-    # G's pinned index must outlive the build for the next G.
-    if not cfg.text_index.keep_prev:
-        raise SystemExit("rank needs text_index.keep_prev = true")
 
     def once() -> dict[str, Any]:
         with rankjob.real_ports(cfg) as ports:

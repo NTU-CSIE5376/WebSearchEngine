@@ -152,9 +152,9 @@ services:
     memswap_limit: 24g
     cpus: 4
 
-  # The rank rate of each golden day G, written at G+3 (docs/TEXT_INDEX.md): builds the
-  # text index from the live list, then writes only the rank fields of G's coverage rows
-  # as the metricdb role isel_rank. `run --rm rank rank --dry-run` writes nothing.
+  # The rank rate of each golden day G (docs/TEXT_INDEX.md): builds the text index of the
+  # live list on G-1, pins it from G on, then writes only the rank fields of G's coverage
+  # rows as the metricdb role isel_rank. `run --rm rank rank --dry-run` writes nothing.
   #   docker compose ... --profile rank up -d rank
   rank:
     extends: {service: text-index}

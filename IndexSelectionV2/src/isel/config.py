@@ -216,7 +216,6 @@ class RankCfg:
     coverage_table_fmt: str
     total_team: str
     teams: dict[str, list[int]]
-    max_drift: float
     session: dict[str, str]
 
 
@@ -701,7 +700,6 @@ def _validate_rank(cfg: Config, need: Any) -> None:
          "guard.month_days must hold every schedule.swap_freeze_days day")
     need(r.poll_s > 0, "rank.poll_s must be > 0")
     need(r.max_attempts >= 1, "rank.max_attempts must be >= 1")
-    need(0 <= r.max_drift < 1, "rank.max_drift must be in [0, 1)")
     need(all(f"{{{k}}}" in r.coverage_table_fmt for k in ("tag", "team")),
          "rank.coverage_table_fmt must hold {tag} and {team}")
     need(bool(r.teams) and r.total_team not in r.teams,

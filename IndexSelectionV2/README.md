@@ -91,9 +91,9 @@ the golden keywords. `textindex.py` indexes it in OpenSearch with ICU analysis:
 
 | Command | Does |
 |---|---|
-| `text-index-build` | loads the newest text of each doc into a new index, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call; refuses to start or to merge if the disk would pass the flood stage; keeps the previous index for rollback if `keep_prev` is set |
+| `text-index-build` | loads the newest text of each doc into a new index, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call; refuses to start or to merge if the disk would pass the flood stage; keeps the previous index for rollback if `keep_prev` is set, and every index a rank job pinned (`work/text_index/pins`) |
 | `text-index-eval --batch N` | searches each golden keyword of batch N and reports Recall@10 over (keyword, golden URL) pairs, as the metric's old rank code counted, and over distinct URLs |
-| `rank --loop` | for each golden day G: builds the index from the live list on G-1, then on G writes G's `ranked_num` and `ranked_rate` into metricdb ([docs/TEXT_INDEX.md](docs/TEXT_INDEX.md#the-rank-job)) |
+| `rank --loop` | for each golden day G: builds the index from the live list on G-1 and pins it on G; once Metric's rows of G match a snapshot of them, writes G's `ranked_num` and `ranked_rate` into metricdb ([docs/TEXT_INDEX.md](docs/TEXT_INDEX.md#the-rank-job)) |
 
 `deploy/compose.opensearch.yaml` runs a local node; `pytest -m opensearch` starts a node
 from its image. On Host2, `deploy/compose.compute.yaml` runs the node (profile `search`)

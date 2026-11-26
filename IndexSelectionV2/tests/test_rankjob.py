@@ -99,6 +99,7 @@ class FakeMetricDb:
         self.reads = 0
         self.writes = 0
         self.crash_after_commit = False
+        self.write_error = None
 
     def batch_before(self, until):
         self.reads += 1
@@ -114,7 +115,18 @@ class FakeMetricDb:
         return [CoverageRow(d, r["total"], r["indexed_num"])
                 for d, r in sorted(self.coverage[table].items()) if first <= d <= last]
 
-    def write(self, ranked, rows):
+    def write(self, snapshot, ranked, rows):
+        if self.write_error is not None:
+            error, self.write_error = self.write_error, None
+            raise error
+        locked = rankjob.Snapshot(
+            snapshot.batch_id, tuple(sorted(self.rows.get(snapshot.batch_id, []),
+                                            key=lambda r: r.id)),
+            {t: tuple(self.coverage_rows(t, snapshot.first, snapshot.last))
+             for t in snapshot.coverage}, snapshot.first, snapshot.last)
+        changes = rankjob.snapshot_changes(snapshot, locked)
+        if changes:
+            raise rankjob.SnapshotStale("; ".join(changes))
         assert set(ranked) <= set(self.is_ranked)
         for w in rows:
             assert w.stat_date in self.coverage[w.table]
@@ -155,6 +167,8 @@ class World:
         self.listed = set(LISTED)
         self.builds = []
         self.build_error = None
+        self.on_search = None      # called with the number of searches so far
+        self.search_count = 0
         self.client = textindex.OpenSearch(stub.url, 5.0, 0, 0.0)
 
     def put_index(self, started_at, prior_run, urls=INDEXED_URLS):
@@ -174,12 +188,19 @@ class World:
                 raise self.build_error
             self.builds.append(self.put_index(clock(), self.live and self.live.label))
 
+        def search(index, kw):
+            self.search_count += 1
+            if self.on_search is not None:
+                self.on_search(self.search_count)
+            return textindex.search(self.client, self.cfg.text_index, kw, index)[0]
+
         return Ports(metric=self.metric, live_run=lambda: self.live,
                      builds=lambda: rankjob.index_builds(self.cfg, self.client),
                      build=build,
-                     search=lambda index, kw: textindex.search(
-                         self.client, self.cfg.text_index, kw, index)[0],
-                     listed=lambda urls: {u for u in urls if u in self.listed})
+                     search=search,
+                     listed=lambda urls: {u for u in urls if u in self.listed},
+                     pin=lambda index, holder: textindex.pin(self.cfg, self.client, index,
+                                                             holder))
 
     def tick(self, now, golden_day=None):
         clock = Clock(now)
@@ -194,6 +215,9 @@ class World:
 
     def searched(self):
         return [p.split("/")[1] for p in self.stub.paths("POST") if "_search" in p]
+
+    def pins(self):
+        return textindex.pins(self.cfg)
 
 
 @pytest.fixture
@@ -395,7 +419,7 @@ def test_refusals_write_nothing_and_stay_refused(world, break_it, reason):
     assert out["decision"] == "refuse"
     record = world.record()
     assert record.status is Status.REFUSED and reason in record.reason
-    assert world.metric.writes == 0 and world.builds == []
+    assert world.metric.writes == 0 and world.builds == [] and world.pins() == {}
     assert not (world.cfg.work_dir / "rank" / "2026-11-16.ranked.parquet").exists()
     assert world.tick(MEASURE + timedelta(hours=1))["decision"] == "idle"
 
@@ -404,38 +428,15 @@ def _built(world):
     world.put_index(BUILD + timedelta(minutes=5), LIVE.label)
 
 
-def test_a_small_drift_from_the_head_run_still_writes(world):
-    # Within rank.max_drift of the batch rows, as the 18:00 head run left b20's random
-    # rows: team a moves by one URL and one indexed URL, the total by one indexed URL.
-    extra = [_row(100 + n, "delta", ["head"], f"https://a.com/p{n}", n < 100, 7)
-             for n in range(199)]
-    world.metric.rows[22] = list(ROWS) + extra
-    world.metric.is_ranked.update({r.id: None for r in extra})
-    head = STAT_DATE["head"]
-    world.metric.coverage["metric_headset_a"][head].update(total=201, indexed_num=102)
-    world.metric.coverage["metric_headset_total"][head].update(total=203, indexed_num=104)
+@pytest.mark.parametrize("off_by", [1, -1])
+def test_a_count_off_by_one_refuses(world, off_by):
+    # Metric counts the rows it measured: any difference means the rows changed after.
     _built(world)
+    world.metric.coverage["metric_headset_a"][STAT_DATE["head"]]["total"] += off_by
     world.tick(MEASURE)
-    assert world.record().status is Status.DONE
-    # The row keeps its own denominator: 201, not the recomputed 200.
-    row = world.metric.coverage["metric_headset_a"][head]
-    assert row["ranked_rate"] == pytest.approx(row["ranked_num"] / 201)
-
-
-@pytest.mark.parametrize(("total", "status"), [(205, Status.DONE), (206, Status.REFUSED)])
-def test_the_total_team_may_drift_by_max_drift_only(world, total, status):
-    # The head run replaces the URLs of keywords it shares with random, so even the
-    # total moves. The batch gives 203: 2 of 205 is within 1 %, 3 of 206 is not.
-    extra = [_row(100 + n, "delta", ["head"], f"https://a.com/p{n}", n < 100, 7)
-             for n in range(199)]
-    world.metric.rows[22] = list(ROWS) + extra
-    world.metric.is_ranked.update({r.id: None for r in extra})
-    head = STAT_DATE["head"]
-    world.metric.coverage["metric_headset_a"][head].update(total=200, indexed_num=101)
-    world.metric.coverage["metric_headset_total"][head].update(total=total, indexed_num=103)
-    _built(world)
-    world.tick(MEASURE)
-    assert world.record().status is status
+    record = world.record()
+    assert record.status is Status.REFUSED and "metric_headset_a" in record.reason
+    assert world.metric.writes == 0
 
 
 def test_named_golden_day_builds_at_any_time_and_past_a_later_activation(world):
@@ -548,14 +549,10 @@ def test_an_http_error_reply_uses_an_attempt(world):
     assert world.record().attempts == 1
 
 
-@pytest.mark.parametrize("overlay, match", [
-    ("", "prior_file"),
-    ('[text_index]\nprior_file = "live"\nkeep_prev = false\n', "keep_prev"),
-])
-def test_rank_refuses_a_config_it_cannot_pin_with(tmp_path, overlay, match):
+def test_rank_refuses_a_config_without_the_live_prior(tmp_path):
     path = tmp_path / "overlay.toml"
-    path.write_text(f'[run]\nwork_dir = "{tmp_path / "work"}"\n' + overlay)
-    with pytest.raises(SystemExit, match=match):
+    path.write_text(f'[run]\nwork_dir = "{tmp_path / "work"}"\n')
+    with pytest.raises(SystemExit, match="prior_file"):
         cli_main(["--config", str(BASE), "--config", str(path), "rank", "--once"])
 
 
@@ -583,3 +580,151 @@ def test_record_round_trips(world):
     world.tick(MEASURE)
     record = world.record()
     assert record.shadow and RankRecord.from_json(record.to_json()) == record
+
+
+def _replace_url(w, row_id, url):
+    w.metric.rows[22] = [dataclasses.replace(r, url=url) if r.id == row_id else r
+                         for r in w.metric.rows[22]]
+
+
+def test_g_is_pinned_from_midnight_without_reading_metricdb(world):
+    world.tick(BUILD)
+    out = world.tick(datetime(2026, 11, 16, 0, 10, tzinfo=UTC))
+    assert out["decision"] == "idle" and "measures from" in out["why"]
+    assert set(world.pins()) == {world.builds[0]} and world.metric.reads == 0
+    assert world.pins()[world.builds[0]]["golden_day"] == G.isoformat()
+    assert world.record().index == world.builds[0]
+    # Done: the pin goes, so the next G's build may delete the index.
+    world.tick(MEASURE)
+    assert world.record().status is Status.DONE and world.pins() == {}
+
+
+def test_a_refusal_drops_the_pin(world):
+    world.tick(BUILD)
+    world.tick(datetime(2026, 11, 16, 0, 10, tzinfo=UTC))
+    _wrong_total(world)
+    world.tick(MEASURE)
+    assert world.record().status is Status.REFUSED and world.pins() == {}
+
+
+def test_an_alias_switch_mid_run_leaves_every_search_on_the_pin(world):
+    # A manual text-index-build moves the alias while G counts: G keeps its index.
+    world.tick(BUILD)
+    first = world.builds[0]
+    later = []
+
+    def switch(n):
+        if n == 1:
+            later.append(world.put_index(MEASURE + timedelta(seconds=1), LIVE.label))
+
+    world.on_search = switch
+    world.tick(MEASURE)
+    assert world.stub.aliases["isel-text"] == {later[0]}
+    assert set(world.searched()) == {first}
+    record = world.record()
+    assert record.status is Status.DONE and record.index == first
+    assert world.ranked() == RANKED
+
+
+def test_a_pinned_index_that_goes_defers_and_never_falls_back(world):
+    # An older build of the same list exists; G must not quietly rank on it.
+    world.put_index(BUILD - timedelta(days=7), LIVE.label)
+    world.tick(BUILD)
+    pin = world.builds[0]
+
+    def drop(n):
+        if n == 1:
+            world.stub.indices.pop(pin)
+
+    world.on_search = drop
+    out = world.tick(MEASURE)
+    assert out["decision"] == "idle" and out["why"].startswith("deferred")
+    assert "answered 404" in out["why"]
+    record = world.record()
+    assert record.status is Status.PENDING and record.attempts == 0
+    out = world.tick(MEASURE + timedelta(minutes=10))
+    assert out["decision"] == "idle" and f"pinned index {pin} is missing" in out["why"]
+    assert set(world.searched()) == {pin} and world.metric.writes == 0
+    assert world.record().attempts == 0
+
+
+def test_a_url_replaced_after_the_snapshot_refuses(world):
+    # The first write is lost after the snapshot; then a rerun replaces b.com/y with a
+    # listed URL of the same team: the counts stay, the rows do not.
+    world.tick(BUILD)
+    world.metric.write_error = RuntimeError("write lost")
+    world.tick(MEASURE)
+    record = world.record()
+    assert record.status is Status.PENDING and record.attempts == 1
+    assert rankjob.snapshot_path(world.cfg, G).exists()
+    world.listed.add("https://b.com/y2")
+    _replace_url(world, 2, "https://b.com/y2")
+    world.tick(MEASURE + timedelta(minutes=10))
+    record = world.record()
+    assert record.status is Status.REFUSED
+    assert "metricdb changed since the snapshot: 1 rows changed" in record.reason
+    assert world.metric.writes == 0
+
+
+def test_a_url_replaced_during_the_searches_is_caught_by_the_write(world):
+    # The shadow searches 3 keywords, then the write's searches begin: a rerun lands.
+    world.tick(BUILD)
+    world.listed.add("https://b.com/y2")
+
+    def rerun(n):
+        if n == len(TOP) + 1:
+            _replace_url(world, 2, "https://b.com/y2")
+
+    world.on_search = rerun
+    world.tick(MEASURE)
+    record = world.record()
+    assert record.status is Status.PENDING and record.attempts == 1
+    assert "SnapshotStale" in record.reason and world.metric.writes == 0
+    world.on_search = None
+    world.tick(MEASURE + timedelta(minutes=10))
+    assert world.record().status is Status.REFUSED and world.metric.writes == 0
+
+
+def test_rows_inserted_after_the_measurement_wait(world):
+    # A rerun inserted row 6 again; Metric has not measured it yet.
+    world.tick(BUILD)
+    world.metric.rows[22] = [dataclasses.replace(r, is_indexed=False, shard_id=None)
+                             if r.id == 6 else r for r in ROWS]
+    out = world.tick(MEASURE)
+    assert out["decision"] == "idle" and "waiting for Metric to measure 1 rows" in out["why"]
+    assert world.record().status is Status.PENDING and world.metric.writes == 0
+    world.metric.rows[22] = list(ROWS)
+    world.tick(MEASURE + timedelta(minutes=10))
+    assert world.record().status is Status.DONE and world.ranked() == RANKED
+
+
+def test_rows_measured_against_another_list_refuse(world):
+    # e.com/q is indexed in Metric, but the live list does not hold it.
+    world.tick(BUILD)
+    world.listed.discard("https://e.com/q")
+    world.tick(MEASURE)
+    record = world.record()
+    assert record.status is Status.REFUSED
+    assert "1 rows' is_indexed disagree with the list of run-1114 (first id 6)" in record.reason
+    assert world.metric.writes == 0
+
+
+def test_the_snapshot_is_what_was_ranked(world):
+    world.tick(BUILD)
+    world.tick(MEASURE)
+    record = world.record()
+    saved = rankjob.read_snapshot(world.cfg, G)
+    assert saved.rows == tuple(ROWS) and saved.batch_id == 22
+    assert saved.coverage["metric_headset_total"] == (
+        CoverageRow(STAT_DATE["head"], 4, 3),)
+    assert record.snapshot_sha256 == saved.sha256()
+    assert rankjob.Snapshot.from_json(saved.to_json()) == saved
+
+
+def test_dry_run_reports_rows_that_disagree_with_the_list(world):
+    world.put_index(BUILD + timedelta(minutes=5), LIVE.label)
+    world.listed.discard("https://e.com/q")
+    out = dry_run(world.cfg, world.ports(Clock(MEASURE)), Clock(MEASURE))
+    assert out["would"] == "refuse" and out["indexed_mismatch_ids"] == [6]
+    assert any("disagree with the live list" in p for p in out["problems"])
+    assert world.pins() == {} and world.metric.writes == 0

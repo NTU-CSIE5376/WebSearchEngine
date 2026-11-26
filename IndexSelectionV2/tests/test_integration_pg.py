@@ -1758,3 +1758,86 @@ status_poll_s = 0
         assert not stub.jobs()
     finally:
         admin.close()
+
+
+# docs/TEXT_INDEX.md, "The rank job": the grants of the metricdb role isel_rank.
+RANK_GRANTS = """
+GRANT USAGE ON SCHEMA public TO isel_rank;
+GRANT SELECT (id, query_id, url, is_indexed, shard_id), UPDATE (is_ranked)
+    ON metric_url TO isel_rank;
+GRANT SELECT (id, batch_id, keyword, tags) ON metric_queries TO isel_rank;
+GRANT SELECT (stat_date, total, indexed_num), UPDATE (ranked_num, ranked_rate)
+    ON metric_headset_total TO isel_rank;
+"""
+
+
+@pytest.fixture
+def rankdb(cfg, dsn, monkeypatch):
+    """A metricdb with Metric's rank columns and the isel_rank role."""
+    name = f"rank_{uuid.uuid4().hex[:8]}"
+    password = uuid.uuid4().hex
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"CREATE DATABASE {name}")
+        if not conn.execute("SELECT 1 FROM pg_roles WHERE rolname = 'isel_rank'").fetchone():
+            conn.execute(f"CREATE ROLE isel_rank LOGIN PASSWORD '{password}'")
+        else:
+            conn.execute(f"ALTER ROLE isel_rank PASSWORD '{password}'")
+    admin = dsn.rsplit("/", 1)[0] + f"/{name}"
+    with psycopg.connect(admin, autocommit=True) as conn:
+        conn.execute("CREATE TABLE metric_queries (id bigint PRIMARY KEY, batch_id bigint, "
+                     "keyword text, tags text[])")
+        conn.execute("CREATE TABLE metric_url (id bigserial PRIMARY KEY, query_id bigint, "
+                     "url text, rank integer, is_indexed boolean DEFAULT false, "
+                     "is_ranked boolean DEFAULT false, shard_id integer)")
+        conn.execute("CREATE TABLE metric_headset_total (stat_date date PRIMARY KEY, "
+                     "total integer, indexed_num integer, ranked_num integer, "
+                     "ranked_rate double precision)")
+        conn.execute("INSERT INTO metric_queries VALUES (1, 22, 'alpha', '{head}')")
+        conn.execute("INSERT INTO metric_url (query_id, url, rank, is_indexed, shard_id) "
+                     "VALUES (1, 'https://a.com/x', 1, true, 5), "
+                     "(1, 'https://b.com/y', 2, false, 200)")
+        conn.execute("INSERT INTO metric_headset_total VALUES ('2026-12-01', 2, 1, NULL, NULL)")
+        conn.execute(RANK_GRANTS)
+    writer = psycopg.conninfo.make_conninfo(admin, user="isel_rank", password=password)
+    monkeypatch.setenv(cfg.rank.writer_dsn_env, writer)
+    return admin
+
+
+def _rank_snapshot(admin):
+    from isel import rankjob
+
+    with psycopg.connect(admin) as conn:
+        rows = tuple(rankjob._golden_row(t) for t in conn.execute(rankjob._ROWS_SQL, (22,)))
+        cov = tuple(rankjob.CoverageRow(*r) for r in conn.execute(
+            "SELECT stat_date, total, indexed_num FROM metric_headset_total"))
+    first = datetime(2026, 12, 1).date()
+    return rankjob.Snapshot(22, rows, {"metric_headset_total": cov}, first,
+                            first + timedelta(days=6))
+
+
+def test_the_rank_write_checks_the_snapshot_under_lock_as_isel_rank(cfg, rankdb,
+                                                                    monkeypatch):
+    from isel import rankjob
+
+    monkeypatch.setattr(rankjob, "utcnow", lambda: ALLOWED)
+    snapshot = _rank_snapshot(rankdb)
+    ids = [r.id for r in snapshot.rows]
+    write = [rankjob.CoverageWrite("metric_headset_total", snapshot.first, 1, 0.5)]
+    # A rerun replaced b.com/y in place: nothing is written.
+    with psycopg.connect(rankdb, autocommit=True) as conn:
+        conn.execute("UPDATE metric_url SET url = 'https://b.com/y2' WHERE id = %s", (ids[1],))
+    with pytest.raises(rankjob.SnapshotStale, match="1 rows changed or went, 1 rows are new"):
+        rankjob.PgMetricDb(cfg).write(snapshot, {ids[0]: True, ids[1]: False}, write)
+    with psycopg.connect(rankdb, autocommit=True) as conn:
+        assert conn.execute("SELECT count(*) FROM metric_url WHERE is_ranked").fetchone() == (0,)
+        conn.execute("UPDATE metric_url SET url = 'https://b.com/y' WHERE id = %s", (ids[1],))
+    rankjob.PgMetricDb(cfg).write(snapshot, {ids[0]: True, ids[1]: False}, write)
+    with psycopg.connect(rankdb) as conn:
+        assert conn.execute("SELECT id, is_ranked FROM metric_url ORDER BY id").fetchall() == [
+            (ids[0], True), (ids[1], False)]
+        assert conn.execute("SELECT ranked_num, ranked_rate FROM metric_headset_total"
+                            ).fetchone() == (1, 0.5)
+    # The role writes the rank fields only.
+    with psycopg.connect(os.environ[cfg.rank.writer_dsn_env]) as conn, \
+            pytest.raises(psycopg.errors.InsufficientPrivilege):
+        conn.execute("UPDATE metric_url SET is_indexed = true")
