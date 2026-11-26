@@ -27,7 +27,9 @@ class CrawlerStatusMeasure(Measure):
                 
                 stmt = select(
                     func.count(), # discovered
-                    func.count().filter(UrlState.last_fetch_ok.is_not(None)) # crawled
+                    # COUNT(column) counts the same non-NULL timestamps as
+                    # COUNT(*) FILTER, while allowing YSQL to aggregate in DocDB.
+                    func.count(UrlState.last_fetch_ok) # crawled
                 )
                 
                 result = session.execute(stmt).one()

@@ -19,7 +19,7 @@ metric does not search this index; [the rank job](#the-rank-job) writes its rank
 
 | Command | Does |
 |---|---|
-| `text-index-build [--text-root DIR]` | loads the newest text of each doc into a new index `isel-text-<utc id>`, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call |
+| `text-index-build [--text-root DIR]` | loads the newest text of each doc, and the URL of each listed doc without text, into a new index `isel-text-<utc id>`, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call |
 | `text-index-eval --batch N` | searches each golden keyword of batch N on the alias and reports Recall@10 against its golden URLs |
 | `rank --loop \| --once \| --dry-run [--golden-day G]` | the rank job below: on G-1 builds the index from the live list; on G writes a shadow count, then G's rank rate into metricdb |
 
@@ -32,14 +32,26 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   never sorted; a second pass reads only the winners. A row with text beats any row
   without it: about 620,000 rows hold an empty WAF page from before revision `0004`. Such
   a doc stays in the index, where the words of its URL can find it.
+- **Challenge pages.** A row whose `payload_sha1` is in `[recrawl] challenge_sha1` is a
+  shared bot-challenge page: one text under many URLs. On Host2 on 2026-11-08, 453,326
+  fetched docs on 7,595 hosts held the same "Client Challenge" page. Such a row counts
+  as a row without text, so an older real page of the same doc wins. A doc whose winner
+  is a challenge row is still indexed, with its URL and its prior but no `lang`, `title`,
+  `description` or `body`. The build reports these docs as `challenge_docs`. They are
+  not part of `fallback_docs`: `docs` minus both is the docs indexed from a text row of
+  their own. Only the hash decides. A short real page keeps its text, and so does a new
+  challenge page whose hash is not in the list yet. An empty list turns the rule off.
+  The effect on the golden hit rate is not measured yet.
 - **Document.** `_id` is the doc id in decimal. `url` and `lang` are stored; `title`,
   `description` and `body` are full text, and `body` is left out of `_source`. The body
   is indexed without positions (`index_options: freqs`): BM25 needs only term counts,
   and positions were 45 % of the index. The URL's words are searchable as `url.text`.
   `doc_id` holds the same id as doc values only, for sorting. `sel_prior` is a
   `rank_feature`, `prior_scale / (rank + 1)`, from the doc's rank in the selection manifest
-  (`prior_file`). With a prior, only the docs on that list are indexed, and a build with
-  none of them fails. `prior_file = "live"` reads the live run's label from selectdb and
+  (`prior_file`). With a prior, only the docs on that list are indexed. A listed doc with
+  no text row gets a document of its list URL and rank alone, so `url.text` and the prior
+  can still find it (`fallback_docs` in the build report). A build fails when no doc with
+  text is on the list. `prior_file = "live"` reads the live run's label from selectdb and
   checks its manifest (`validate_run`), so a swap needs only a rebuild. The `refresh`
   service does not rebuild the index: once its `recrawl-sync` is done (`refresh --status`),
   run `text-index-build` by hand.
@@ -85,7 +97,8 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   code did, with never-crawled URLs in the denominator; `recall_unique` counts distinct
   URLs, as the coverage tables do. Both have a 95 % interval that resamples keywords; in
   the distinct-URL one, a URL golden for c keywords weighs 1/c in each. `presence` is
-  the share of golden pairs whose page is in the index, the ceiling of both.
+  the share of golden pairs whose page is in the index, the ceiling of both. With a
+  prior, every listed page is in the index, with text or by its URL alone.
 
 ## The rank job
 
@@ -849,7 +862,7 @@ Choices and limits:
   when search latency matters.
 - **Still open** (`docs/RECRAWL.md` §13):
   - compact the text Parquet, before its first 30-day cycle ends;
-  - fallback documents for docs without text;
+  - crawlerdb's title and anchor text for docs without text;
   - one read of batch 22 (created 11-16), if it holds no `goto` URLs, with the node restarted.
 
 ## Reproduction

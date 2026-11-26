@@ -11,7 +11,11 @@ are only ever read from it, so they never pass through a float. A hit is matched
 golden URL by `_id` alone: the list URL defines the doc, as in the indexed rate. With a
 prior, only the docs on that list are indexed (`docs/RECRAWL.md` §13): a doc that left
 the list leaves the index at the next build, and one that comes back on a later list
-returns with the text fetched before. `prior_file = "live"` takes the manifest of the
+returns with the text fetched before. A listed doc with no text row, such as one on a
+host that refuses every crawler, is indexed by its list URL alone, so the words of its
+URL and its rank can still find it. So is a doc whose only page is a shared bot-challenge
+page (`[recrawl] challenge_sha1`): the page's text says nothing about the doc.
+`prior_file = "live"` takes the manifest of the
 live selection run, so a build after a swap uses the new list. The same number is also
 an `unsigned_long` doc-values field that breaks score ties: Lucene otherwise orders equal
 scores by load order, so two builds of the same text could return different top-k sets.
@@ -31,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -188,43 +192,72 @@ def bulk_payloads(batches: Iterable[pa.RecordBatch], max_bytes: int,
 
 
 def latest_docs(con: duckdb.DuckDBPyConnection, text_root: Path, batch_rows: int,
-                prior_file: str = "") -> tuple[int, int, pa.RecordBatchReader]:
-    """The newest row of each doc_id under `text_root`, as (rows, docs off the list, batches).
+                prior_file: str = "", challenge_sha1: Sequence[str] = (),
+                ) -> tuple[int, int, int, int, pa.RecordBatchReader]:
+    """One row per doc to index.
 
-    The first pass picks each doc's winner without the page bodies, so they are never
-    sorted; the second pass reads the winners. A row with text beats any row without it,
-    such as an empty WAF page, which older archives stored; a doc with no text still
-    gets a document, as its URL's words can find it. A tie on `fetched_at` goes to the
-    larger file name. `*.parquet` skips `.parquet.tmp` files.
+    Returns (docs with a text row, the challenge docs among them, URL-only docs, docs off
+    the list, batches).
 
-    `prior_file` is a Parquet glob of the list's `doc_id` and `rank`. With it, only docs on
-    the list are kept; the docs off it are counted. A doc can be on the list twice, under
-    two URLs with one canonical form, so it takes its best rank and the join adds no rows.
+    A text doc is the newest row of its doc_id under `text_root`. The first pass picks
+    each doc's winner without the page bodies, so they are never sorted; the second pass
+    reads the winners. A row with text beats any row without it, such as an empty WAF
+    page, which older archives stored; a doc with no text still gets a document, as its
+    URL's words can find it. A tie on `fetched_at` goes to the larger file name.
+    `*.parquet` skips `.parquet.tmp` files.
+
+    A row whose `payload_sha1` is in `challenge_sha1` is a shared bot-challenge page: the
+    same text under many URLs. It counts as a row without text, and a doc whose winner it
+    is keeps its URL and rank but none of the page's text, like a URL-only doc.
+
+    `prior_file` is a Parquet glob of the list's `doc_id`, `rank` and `url`. With it, only
+    docs on the list are kept; the docs off it are counted. A listed doc with no text row
+    gets a URL-only row: its list URL and rank, every text field null. A doc can be on the
+    list twice, under two URLs with one canonical form, so it takes its best rank, the URL
+    listed at that rank, and one row.
     """
     if next(text_root.glob("**/*.parquet"), None) is None:
         raise TextIndexError(f"no text Parquet under {text_root}")
     files = (f"read_parquet({sql_str(str(text_root / '**' / '*.parquet'))}, "
              "filename=true, hive_partitioning=false)")
-    winners = f"""SELECT doc_id, max({{'text': coalesce(text_len, 0) > 0 OR title IS NOT NULL
-                                               OR description IS NOT NULL,
-                                       't': fetched_at, 'f': filename}}) AS win FROM {files}
-                  GROUP BY doc_id"""
+    challenge = "false"
+    if challenge_sha1:
+        hashes = ", ".join(sql_str(h) for h in challenge_sha1)
+        challenge = f"coalesce(payload_sha1 IN ({hashes}), false)"
+    # `c` comes last, so it never decides the winner.
+    winners = f"""SELECT doc_id, max({{'text': NOT {challenge} AND (coalesce(text_len, 0) > 0
+                                               OR title IS NOT NULL OR description IS NOT NULL),
+                                       't': fetched_at, 'f': filename, 'c': {challenge}}}) AS win
+                  FROM {files} GROUP BY doc_id"""
+    listed = f"read_parquet({sql_str(prior_file)}, hive_partitioning=false)"
     if prior_file:
-        ranks = (f"SELECT doc_id, min(rank) AS prior_rank FROM read_parquet("
-                 f"{sql_str(prior_file)}, hive_partitioning=false) GROUP BY doc_id")
+        ranks = f"SELECT doc_id, min(rank) AS prior_rank FROM {listed} GROUP BY doc_id"
         source = f"""SELECT w.doc_id, w.win, r.prior_rank FROM ({winners}) w
                      LEFT JOIN ({ranks}) r ON w.doc_id = r.doc_id"""
     else:
         source = f"SELECT doc_id, win, NULL::BIGINT AS prior_rank FROM ({winners})"
     con.execute(f"CREATE OR REPLACE TEMP TABLE winner AS {source}")
     rows, ranked = con.execute("SELECT count(*), count(prior_rank) FROM winner").fetchone()
+    url_only, url_only_rows = 0, ""
     if prior_file:
         con.execute("DELETE FROM winner WHERE prior_rank IS NULL")
-    reader = con.execute(f"""SELECT s.doc_id, {', '.join(f's.{f}' for f in DOC_FIELDS)},
-               w.prior_rank
+        # Only the docs without text keep their URL, so the list's 64M URLs are never
+        # all held in memory.
+        con.execute(f"""CREATE OR REPLACE TEMP TABLE url_only AS
+            SELECT p.doc_id, arg_min(p.url, p.rank) AS url, min(p.rank) AS prior_rank
+            FROM {listed} p ANTI JOIN winner w ON p.doc_id = w.doc_id GROUP BY p.doc_id""")
+        (url_only,) = con.execute("SELECT count(*) FROM url_only").fetchone()
+        fields = ", ".join(f if f == "url" else f"NULL AS {f}" for f in DOC_FIELDS)
+        url_only_rows = f"UNION ALL SELECT doc_id, {fields}, prior_rank FROM url_only"
+    (challenges,) = con.execute("SELECT count(*) FROM winner WHERE win.c").fetchone()
+    fields = ", ".join("s.url" if f == "url" else f"CASE WHEN NOT w.win.c THEN s.{f} END AS {f}"
+                       for f in DOC_FIELDS)
+    reader = con.execute(f"""SELECT s.doc_id, {fields}, w.prior_rank
         FROM {files} s JOIN winner w ON s.doc_id = w.doc_id
-         AND s.fetched_at = w.win.t AND s.filename = w.win.f""").to_arrow_reader(batch_rows)
-    return (int(ranked), int(rows - ranked), reader) if prior_file else (int(rows), 0, reader)
+         AND s.fetched_at = w.win.t AND s.filename = w.win.f
+        {url_only_rows}""").to_arrow_reader(batch_rows)
+    texts, off_list = (ranked, rows - ranked) if prior_file else (rows, 0)
+    return int(texts), int(challenges), int(url_only), int(off_list), reader
 
 
 def _text_bytes(batch: pa.RecordBatch) -> int:
@@ -471,10 +504,11 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
     with file_lock(cfg.work_dir / "text_index" / "build.lock"):
         con = open_duckdb(cfg, cfg.work_dir / "text_index" / "tmp")
         try:
-            rows, off_list, batches = latest_docs(con, text_root, t.read_batch_rows,
-                                                  prior_file)
-            if prior_file and not rows:
+            texts, challenges, url_only, off_list, batches = latest_docs(
+                con, text_root, t.read_batch_rows, prior_file, cfg.recrawl.challenge_sha1)
+            if prior_file and not texts:
                 raise TextIndexError(f"no doc of {text_root} is on the list of {prior_file}")
+            rows = texts + url_only
             # A build killed before it could delete its index left it unaliased and
             # without a manifest; it would add to this build's disk peak.
             aliased = set(_aliased(client, t.alias))
@@ -538,7 +572,8 @@ def build(cfg: Config, client: OpenSearch, text_root: Path,
             "docs_per_s_load": round(rows / load_s, 1) if load_s else None,
             "previous": previous, "deleted": deleted, "strays": strays,
             "prior_file": prior_file, "prior_run": prior_run,
-            "prior_docs": rows if prior_file else 0, "docs_off_list": off_list,
+            "prior_docs": rows if prior_file else 0, "fallback_docs": url_only,
+            "challenge_docs": challenges, "docs_off_list": off_list,
             "settings_sha256": sha256(spec_bytes).hexdigest(), "config_sha256": cfg.sha256(),
             "code_version": code_version(),
         }

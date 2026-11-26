@@ -891,7 +891,8 @@ def test_recrawl_sync_keeps_fetched_docs_across_runs(selectdb, tmp_path, stub):
 
 
 def test_text_index_follows_the_live_list_across_a_swap(selectdb, tmp_path, stub):
-    """Fetched text kept by sync is indexed under the new list's rank; a doc off it leaves."""
+    """Fetched text kept by sync is indexed under the new list's rank; a doc off it leaves,
+    and a new doc not yet fetched is indexed by its list URL."""
     cfg = _recrawl_cfg(selectdb, tmp_path, stub, revisit=False)
     _setup(cfg)
     admin = _admin(cfg)
@@ -904,21 +905,25 @@ def test_text_index_follows_the_live_list_across_a_swap(selectdb, tmp_path, stub
                       backoff_s=0.0, settings_file=str(ROOT / "config/text_index/icu.json"))
         client = OpenSearch(node.url, 5.0, 2, 0.0, sleep=lambda s: None)
         text_root = Path(cfg.recrawl.text_root)
-        ids = {u: str(pg_doc_id(u) % (1 << 64)) for u in (A1, A2, B1)}
+        ids = {u: str(pg_doc_id(u) % (1 << 64)) for u in (A1, A2, B1, C1)}
 
         first = build(cfg, client, text_root, T0 + timedelta(hours=1))
-        assert (first["prior_run"], first["prior_docs"], first["docs_off_list"]) == ("r1", 3, 0)
+        assert (first["prior_run"], first["prior_docs"], first["fallback_docs"],
+                first["docs_off_list"]) == ("r1", 3, 0, 0)
         before = node.indices[first["index"]]["docs"]
-        assert set(before) == set(ids.values())
+        assert set(before) == {ids[A1], ids[A2], ids[B1]}
 
-        # The next list drops A2, puts B1 first and A1 last; nothing is fetched again.
+        # The next list drops A2, adds C1, puts B1 first and A1 last; nothing is fetched.
         _go_live(cfg, admin, tmp_path, "r2", [B1, C1, A1])
         sync(cfg, admin, now=lambda: OPEN)
         second = build(cfg, client, text_root, T0 + timedelta(hours=2))
-        assert (second["prior_run"], second["prior_docs"], second["docs_off_list"]) == ("r2", 2, 1)
+        assert (second["prior_run"], second["prior_docs"], second["fallback_docs"],
+                second["docs_off_list"]) == ("r2", 3, 1, 1)
         assert second["prior_file"].endswith("run=r2/manifest/*.parquet")
         after = node.indices[second["index"]]["docs"]
-        assert set(after) == {ids[A1], ids[B1]}
+        assert set(after) == {ids[A1], ids[B1], ids[C1]}
+        assert set(after[ids[C1]]) == {"doc_id", "url", PRIOR_FIELD}
+        assert after[ids[C1]]["url"] == C1
         assert after[ids[A1]]["title"] == before[ids[A1]]["title"] == "颱風假"
         assert after[ids[A1]][PRIOR_FIELD] < before[ids[A1]][PRIOR_FIELD]
         assert after[ids[B1]][PRIOR_FIELD] > before[ids[B1]][PRIOR_FIELD]
