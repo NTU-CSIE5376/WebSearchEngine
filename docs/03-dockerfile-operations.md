@@ -22,12 +22,12 @@ Project layout in container:
 
 - The image holds no secret. `SERPAPI_KEY` comes from `metric.env` at run time (`env_file` in `docker-compose.yml`). The file is `chmod 600` and kept out of git and the build context.
 - supercronic does not clear the environment, so every job sees `SERPAPI_KEY`. Classic cron did: it gave jobs only `/etc/environment`, which held the Dockerfile's placeholder key, and batch 22 (2026-11-16) came out empty.
-- `Metric/Query/SerpApi.py` is the only code that reads the key.
+- `Metric/Query/SerpApi.py` reads the key, and so does the course runner's quota check (section 8).
 - `TZ=UTC`: the schedules below are UTC.
 
 ## 3. Scheduled Jobs
 
-Configured in `Metric/deploy/crontab`:
+`METRIC_CRONTAB` picks the file in `/etc/supercronic/`. The default, `Metric/deploy/crontab`, holds the jobs below; `crontab.course-202612` replaces its golden jobs with the course runner (section 8).
 
 - Hourly at minute 0:
   - `measure.py --test --measure status`
@@ -74,7 +74,7 @@ flowchart TD
 
 ## 7. Deploy and Rollback (Host1)
 
-Run from the WebSearchEngine clone on Host1. Avoid minute :00 of any hour, and 12:00–20:00 UTC on the 1st and 16th.
+Run from the WebSearchEngine clone on Host1. Avoid minute :00 of any hour, and 12:00–20:00 UTC on the 1st and 16th. While the course schedule runs (section 8), avoid 00:00–12:00 UTC on Dec 1, 8 and 15 instead, and follow section 8 first.
 
 1. `git pull` to the commit to deploy.
 2. Write the key once: `metric.env` with one line `SERPAPI_KEY=<key>`, then `chmod 600 metric.env`.
@@ -89,10 +89,39 @@ Run from the WebSearchEngine clone on Host1. Avoid minute :00 of any hour, and 1
    docker stop metric && docker rename metric metric-prev
    METRIC_TAG=$(git rev-parse --short HEAD) docker compose up -d metric
    ```
-5. Check: after the next full hour, `docker logs metric` shows the status job with `job succeeded`, and no `level=error` line.
+5. Check: after the next full hour, `docker logs metric` shows the status job with `job succeeded`, and no `level=error` line. Before step 4, `docker compose run --rm metric sh /root/WebSearchEngine/Metric/deploy/check-cron.sh` checks the schedule the new container will run; it spends no search.
 6. Do not run `measure.py --create` to test a deploy. It writes a batch, and the next golden day reuses any non-empty batch under 14 days old instead of fetching a new one.
 7. Rollback:
    ```bash
    docker compose stop metric && docker compose rm -f metric
    docker rename metric-prev metric && docker start metric
    ```
+
+## 8. Course schedule (December 2026)
+
+The course replaces the 1st/16th golden jobs with three batches, in Taiwan time:
+
+| Day | Phases |
+|---|---|
+| Dec 1 and Dec 15 | seed 08:05, Random 09:00 (1,000 keywords), Head 15:00 (1,000) |
+| Dec 8 | seed 08:05, Head 09:00 (950, shrinks to keep 2,010 credits for Dec 15) |
+
+`Metric/deploy/course/run_golden.py` runs them. `Metric/deploy/crontab.course-202612` calls it every few minutes from 00:00 to 11:45 UTC on those days, and has no default `--create` job, so the default batches cannot run twice. The runner records each phase in `GOLDEN_COURSE_STATE` (`/data/metric-course` on the host, `/var/lib/golden-course` in the container). A replaced container therefore resumes where the old one stopped, and never repeats a phase that is `done`, `running` or `failed`.
+
+To switch to it:
+
+1. Create the state directory: `sudo mkdir -p /data/metric-course && sudo chmod 700 /data/metric-course`.
+2. If the old container already ran the course runner from `/root/golden-course-202612`, copy its state first: `docker cp metric:/root/golden-course-202612/. /tmp/course && sudo cp /tmp/course/*.json /data/metric-course/ 2>/dev/null; rm -rf /tmp/course`. Without a `<date>.json` file the runner starts that day from seed.
+3. Put `METRIC_CRONTAB=crontab.course-202612` in the `.env` file next to `docker-compose.yml`, so every later `docker compose` command keeps it.
+4. Build, then check without spending a search. The check fails unless the runner is the only golden job, the state directory is writable, and the runner prints the three days above:
+   ```bash
+   METRIC_TAG=$(git rev-parse --short HEAD) docker compose build metric
+   METRIC_TAG=$(git rev-parse --short HEAD) docker compose run --rm metric \
+     sh /root/WebSearchEngine/Metric/deploy/check-cron.sh
+   ```
+5. Replace the container as in section 7, steps 4–5. `docker logs metric` lists the jobs supercronic loaded.
+
+To return to the default schedule after Dec 15, remove the `METRIC_CRONTAB` line, run the check (it then expects the two default golden jobs), and replace the container. Keep `/data/metric-course` as the record of the course batches.
+
+The runner does not run `--measure crawler_all`. Measure each batch once after its last phase, both tags together: `measure.py --test --measure crawler_all --strategy random head` on Dec 1 and 15, `--strategy head` on Dec 8. The Head phase reinserts the rows of keywords it shares with Random, so measuring Random before Head leaves Random's rows unmeasured.
+

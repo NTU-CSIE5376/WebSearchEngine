@@ -32,7 +32,8 @@ RUN /root/system-venv/bin/pip install --upgrade pip && \
 
 # 6. 排程: SERPAPI_KEY is not set here. It comes from the env at run time (metric.env in
 # docker-compose.yml), so the image holds no secret. A bad crontab fails the build.
-COPY Metric/deploy/crontab /etc/supercronic/crontab
-RUN supercronic -test /etc/supercronic/crontab
+# METRIC_CRONTAB picks the schedule: `crontab` (1st and 16th) or a course override.
+COPY Metric/deploy/crontab Metric/deploy/crontab.course-202612 /etc/supercronic/
+RUN for f in /etc/supercronic/*; do supercronic -test "$f" || exit 1; done
 
-CMD ["supercronic", "-split-logs", "/etc/supercronic/crontab"]
+CMD ["sh", "-c", "exec supercronic -split-logs /etc/supercronic/${METRIC_CRONTAB:-crontab}"]

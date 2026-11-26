@@ -33,6 +33,12 @@ services:
     env_file: ./metric.env          # SERPAPI_KEY=...; chmod 600, not in git
     environment:
       - TZ=UTC
+      # crontab, or crontab.course-202612 while the course schedule runs
+      - METRIC_CRONTAB=${METRIC_CRONTAB:-crontab}
+      - GOLDEN_COURSE_STATE=/var/lib/golden-course
+    volumes:
+      # The course runner's phase state; it must outlive the container.
+      - /data/metric-course:/var/lib/golden-course
     stop_grace_period: 30m          # SIGTERM lets a running job finish first
     logging:
       driver: json-file
