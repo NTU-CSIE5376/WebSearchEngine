@@ -389,13 +389,6 @@ build_start = "17:30"                    # G-1: the index of the live list is bu
 build_latest = "19:00"                   # here; a 64M build takes ~4.3 h, done before G
 poll_s = 600.0                           # seconds between ticks
 max_attempts = 3                         # failed ticks of one G before its record is `failed`
-max_indexed_mismatches = 5               # batch rows whose is_indexed may disagree with the
-                                         # live list. Metric spells URLs with w3lib 2.4.1, the
-                                         # crawler and isel with 2.5.0: 11 of 165,625 golden URLs,
-                                         # at most 2 per batch, differ, so Metric can miss a listed
-                                         # one (#52 pins 2.5.0, then this goes). Another list
-                                         # disagrees far more: b21 had 0 rows against its list
-                                         # and 175 of 15,008 against the one before (2026-11-26)
 writer_dsn_env = "ISEL_METRICDB_RANK_DSN"   # metricdb role isel_rank: UPDATE on
                                          # metric_url.is_ranked and the coverage ranked_*
                                          # only, SELECT on what the write's lock compares

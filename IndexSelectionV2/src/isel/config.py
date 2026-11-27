@@ -212,7 +212,6 @@ class RankCfg:
     build_latest: str
     poll_s: float
     max_attempts: int
-    max_indexed_mismatches: int
     writer_dsn_env: str
     coverage_table_fmt: str
     total_team: str
@@ -701,7 +700,6 @@ def _validate_rank(cfg: Config, need: Any) -> None:
          "guard.month_days must hold every schedule.swap_freeze_days day")
     need(r.poll_s > 0, "rank.poll_s must be > 0")
     need(r.max_attempts >= 1, "rank.max_attempts must be >= 1")
-    need(r.max_indexed_mismatches >= 0, "rank.max_indexed_mismatches must be >= 0")
     need(all(f"{{{k}}}" in r.coverage_table_fmt for k in ("tag", "team")),
          "rank.coverage_table_fmt must hold {tag} and {team}")
     need(bool(r.teams) and r.total_team not in r.teams,

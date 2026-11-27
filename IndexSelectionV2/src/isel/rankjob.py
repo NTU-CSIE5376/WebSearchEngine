@@ -22,10 +22,9 @@ is done or refused. Every search of G goes to that physical index, never the ali
 From the end of G's guard window (`guard.month_window`, the batch is complete) the job
 writes a shadow count into the record: indexed from selectdb as Metric reads it, ranked
 on the pinned index. Once Metric has measured every row of the batch and its coverage
-rows match the rows exactly, and the rows' `is_indexed` the live list but for at most
-`rank.max_indexed_mismatches` rows, the job saves the snapshot and ranks it. It writes
-only `metric_url.is_ranked` and the rows' `ranked_num` and `ranked_rate`, in one
-transaction that locks the rows and checks them against the snapshot first.
+rows match the rows and the live list exactly, the job saves the snapshot and ranks
+it. It writes only `metric_url.is_ranked` and the rows' `ranked_num` and `ranked_rate`,
+in one transaction that locks the rows and checks them against the snapshot first.
 A later read that differs from the snapshot refuses G. Disc/Crawl/Index stay as Metric
 measured them: the crawler injects golden URLs after G.
 
@@ -590,9 +589,9 @@ def unmeasured(cfg: Config, ev: Evidence) -> list[int]:
 def indexed_mismatches(cfg: Config, ev: Evidence) -> list[int]:
     """Golden rows whose `is_indexed` is not what the live list says.
 
-    Metric sets `is_indexed` from `selected_urls_current`, so the rows agree with the
-    list it measured, but for the few URLs its older w3lib spells otherwise. More than
-    `rank.max_indexed_mismatches` means it measured another list.
+    Metric sets `is_indexed` from `selected_urls_current` with the same w3lib as isel
+    (both pin it, #52), so every row agrees with the list it measured; a disagreement
+    means it measured another list.
     """
     listed = ev.listed or frozenset()
     return [row.id for row in _golden_rows(cfg, ev)
@@ -704,10 +703,10 @@ def plan(cfg: Config, now: datetime, record: RankRecord, ev: Evidence, *,
         if reasons:
             return Refuse("; ".join(reasons))
         wrong = indexed_mismatches(cfg, ev)
-        if len(wrong) > cfg.rank.max_indexed_mismatches:
+        if wrong:
             return Refuse(f"{len(wrong)} rows' is_indexed disagree with the list of "
-                          f"{ev.live.label} (first id {wrong[0]}), more than "
-                          f"rank.max_indexed_mismatches: Metric measured another list")
+                          f"{ev.live.label} (first id {wrong[0]}): Metric measured another "
+                          "list")
     if pin is None:
         if pin_candidate(ev, g, scheduled) is not None:
             return Pin()
@@ -815,8 +814,7 @@ def _save_snapshot(cfg: Config, snapshot: Snapshot, ev: Evidence, pin: IndexBuil
                    clock: Clock) -> None:
     atomic_write_json(snapshot_path(cfg, snapshot.first), {
         "taken_at": clock().isoformat(), "live_run": ev.live and ev.live.label,
-        "index": pin.index, "indexed_mismatch_ids": indexed_mismatches(cfg, ev),
-        "sha256": snapshot.sha256(), "snapshot": snapshot.to_json()})
+        "index": pin.index, "sha256": snapshot.sha256(), "snapshot": snapshot.to_json()})
 
 
 def _measure_write(cfg: Config, record: RankRecord, ev: Evidence, ports: Ports,
@@ -963,9 +961,8 @@ def dry_run(cfg: Config, ports: Ports, clock: Clock = utcnow,
     problems = refusals(cfg, g, ev, check_activation=True) + count_mismatches(cfg, ev)
     if ev.snapshot is not None and ev.batch is not None:
         problems += snapshot_changes(ev.snapshot, snapshot_of(cfg, g, ev))
-    if len(wrong) > cfg.rank.max_indexed_mismatches:
-        problems.append(f"{len(wrong)} rows' is_indexed disagree with the live list, more "
-                        "than rank.max_indexed_mismatches")
+    if wrong:
+        problems.append(f"{len(wrong)} rows' is_indexed disagree with the live list")
     out: dict[str, Any] = {
         "golden_day": g.isoformat(), "build_from": build_from(g, cfg.rank).isoformat(),
         "measure_from": measure_from(g, cfg).isoformat(),

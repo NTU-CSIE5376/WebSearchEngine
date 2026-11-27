@@ -84,7 +84,6 @@ def test_base_config_loads(base_cfg):
     ("[rank]\nteams = { a = [0, 128], b = [128, 255] }\n", "must not overlap"),
     ("[rank]\nteams = { a = [0, 256] }\n", "shard ranges"),
     ("[rank.session]\nstatement_timeout = '1000s'\n", "rank.session.statement_timeout"),
-    ("[rank]\nmax_indexed_mismatches = -1\n", "max_indexed_mismatches must be >= 0"),
     # Feb 16 to Mar 1 is 13 days: a cycle that starts 13 days early overlaps the last one.
     ("[refresh]\nstart_days_before = 13\n", "start_days_before is too large"),
     ("[schedule]\nswap_freeze_days = [1, 2]\n", "start_days_before is too large"),

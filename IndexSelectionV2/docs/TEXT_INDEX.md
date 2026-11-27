@@ -138,12 +138,8 @@ same day.
     (until then it waits);
   - every row's counts exactly equal to the coverage rows' `total` and `indexed_num`;
   - every row's `is_indexed` equal to the live list's answer for its lookup URLs, so
-    Metric measured this list, but for at most `rank.max_indexed_mismatches` rows (5).
-    Metric spells URLs with w3lib 2.4.1, the crawler and isel with 2.5.0; 11 of 165,625
-    golden URLs, at most 2 per batch, differ, so Metric can miss a listed one (#52
-    pins 2.5.0 everywhere; the tolerance goes after that). Another list differs in far
-    more rows: batch 21 had 0 against the list it was measured with and 175 of 15,008
-    against the one before. The snapshot file names the rows that differ;
+    Metric measured this list. Metric and isel pin the same w3lib (#52), so they
+    spell each golden URL alike;
   - the live run equal to the pinned index's `prior_run`.
 
   It then saves `work/rank/<G>.snapshot.json` (the batch rows, the coverage rows, the
