@@ -922,7 +922,7 @@ def test_text_index_follows_the_live_list_across_a_swap(selectdb, tmp_path, stub
         assert second["prior_file"].endswith("run=r2/manifest/*.parquet")
         after = node.indices[second["index"]]["docs"]
         assert set(after) == {ids[A1], ids[B1], ids[C1]}
-        assert set(after[ids[C1]]) == {"doc_id", "url", PRIOR_FIELD}
+        assert set(after[ids[C1]]) == {"doc_id", "url", "url_words", PRIOR_FIELD}
         assert after[ids[C1]]["url"] == C1
         assert after[ids[A1]]["title"] == before[ids[A1]]["title"] == "颱風假"
         assert after[ids[A1]][PRIOR_FIELD] < before[ids[A1]][PRIOR_FIELD]

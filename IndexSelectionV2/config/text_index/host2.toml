@@ -8,6 +8,9 @@ keep_prev = false                        # a second index does not fit beside th
 # The live selection run's manifest, read from selectdb at each build: a swap needs only
 # a rebuild, which drops the docs off the new list.
 prior_file = "live"
+crawlerdb_text_root = "/work/text_index/crawlerdb_text"   # the work mount every job has
+crawlerdb_text_max_minutes = 150.0       # twice the 11-15 trial's 71 minutes of lookups; it
+                                         # holds the work lock shared, so refresh waits
 
 [duckdb]                                 # a build only streams rows to the bulk client
 threads = 4

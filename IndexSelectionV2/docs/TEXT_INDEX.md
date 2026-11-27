@@ -20,6 +20,7 @@ metric does not search this index; [the rank job](#the-rank-job) writes its rank
 | Command | Does |
 |---|---|
 | `text-index-build [--text-root DIR]` | loads the newest text of each doc, and the URL of each listed doc without text, into a new index `isel-text-<utc id>`, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call |
+| `text-index-crawlerdb-text [--text-root DIR]` | reads crawlerdb's title and anchor text of the listed docs without text into `crawlerdb_text_root`, for the next build; read-only on crawlerdb |
 | `text-index-eval --batch N` | searches each golden keyword of batch N on the alias and reports Recall@10 against its golden URLs |
 | `rank --loop \| --once \| --dry-run [--golden-day G]` | the rank job below: on G-1 builds the index from the live list; on G writes a shadow count, then G's rank rate into metricdb |
 
@@ -42,14 +43,61 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   their own. Only the hash decides. A short real page keeps its text, and so does a new
   challenge page whose hash is not in the list yet. An empty list turns the rule off.
   The effect on the golden hit rate is not measured yet.
+- **Crawlerdb text.** A listed doc can have no text of its own: it was never fetched, the
+  host refused us, or its only page is a challenge page. Its document then has no
+  `title`, `description` or `body`. The normal crawler often read such a page before,
+  and crawlerdb keeps its title and the first anchor text that linked to it.
+  `text-index-crawlerdb-text` picks these docs with the build's own rule (`pick_docs`)
+  and needs a list (`prior_file`). It asks crawlerdb for the list URL of each doc, best
+  rank first, and writes `doc_id`, `title` and `anchor` to Parquet under
+  `crawlerdb_text_root`. One row per doc that has a title or an anchor; the anchor is cut
+  to `crawlerdb_anchor_chars`.
+  - Every statement is `SELECT url, title, anchor_text FROM url_state_current_NNN WHERE
+    url = ANY(%s)` with at most `crawlerdb_text_chunk` URLs: one primary-key read of one
+    shard table. It goes through the read-only gate, the pacer (`pull.min_interval_s`)
+    and the read guard, on one connection with the `[crawlerdb.session]` settings. A URL
+    is asked in each of its candidate shards. Nothing is written to crawlerdb.
+  - A run writes its files beside the dataset and puts them in its place at the end, by
+    two renames: the dataset becomes `<root>.old`, the new files become `<root>`, and
+    `.old` is deleted. A build that finds only `.old`, after a run died between the two
+    renames, reads it; the next run moves it back first. A rerun replaces the dataset,
+    and a failed run leaves the old one. A run holds the build lock
+    (`text_index/build.lock`), so it never runs beside a build or another run: the later
+    one fails with `LockBusy`. It also holds the work lock shared, as it reads
+    `dims/split_hosts.parquet`, so refresh steps wait for it.
+  - After `crawlerdb_text_max_minutes` of lookups no new one starts; the docs not asked
+    yet stay out, and the report says `stopped`. The limit starts at the first lookup,
+    after the local pick of the docs. A lookup that the read guard would hold for a
+    closed window past the limit is not sent either, so a run never sleeps through a
+    golden day with the work lock held. A run stopped before its first lookup fails and
+    leaves the old dataset. `host2.toml` sets 150 minutes; 0 means no limit. The report counts the docs wanted and found, those with a
+    title and with an anchor, the queries, the seconds of the lookups and of the run.
+  - The build joins the dataset onto the docs without text and fills `title` and the
+    field `anchor`. A doc with text of its own never takes crawlerdb text. A title or
+    an anchor on more than `crawlerdb_text_max_docs` of these docs is dropped, each on its
+    own. Such a title is a challenge or error page the crawler stored, such as "Just a
+    moment...". Such an anchor is a navigation link, such as "Menu": crawlerdb keeps only
+    the first anchor of a page. The build reports `crawlerdb_text_docs`, the docs that took a title or an
+    anchor. They are still counted in `fallback_docs`, `challenge_docs` or the text
+    docs, as before. With `crawlerdb_text_root` unset or empty the build is as before
+    and the count is 0.
+  - `anchor` uses the `text` analyzer and is left out of `_source`: nothing reads it
+    back. The query searches it with weight 1. The weight and the title limit of 100 are
+    not tuned, and the gain on a golden batch is not measured.
 - **Document.** `_id` is the doc id in decimal. `url` and `lang` are stored; `title`,
   `description` and `body` are full text, and `body` is left out of `_source`. The body
   is indexed without positions (`index_options: freqs`): BM25 needs only term counts,
-  and positions were 45 % of the index. The URL's words are searchable as `url.text`.
+  and positions were 45 % of the index. The URL's words are searchable as `url_words`.
+  The build fills it with `url_words(url)` (`urlnorm.py`): the stored URL with its
+  percent escapes decoded as UTF-8 and its `xn--` host labels decoded to Unicode. So
+  `/wiki/%E6%9D%B1%E4%BA%AC` gives the word `東京`. `url` itself is unchanged, and
+  `url_words` is left out of `_source`. Until 2026-11-15 the field was `url.text`, a
+  sub-field of the stored URL: escapes gave no words, and an IDN host gave punycode.
+  The numbers below that name `url.text` were measured on that field.
   `doc_id` holds the same id as doc values only, for sorting. `sel_prior` is a
   `rank_feature`, `prior_scale / (rank + 1)`, from the doc's rank in the selection manifest
   (`prior_file`). With a prior, only the docs on that list are indexed. A listed doc with
-  no text row gets a document of its list URL and rank alone, so `url.text` and the prior
+  no text row gets a document of its list URL and rank alone, so `url_words` and the prior
   can still find it (`fallback_docs` in the build report). A build fails when no doc with
   text is on the list. `prior_file = "live"` reads the live run's label from selectdb and
   checks its manifest (`validate_run`), so a swap needs only a rebuild. The `refresh`
@@ -59,9 +107,11 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
 - **Analysis.** One analyzer for every text field and language: `icu_tokenizer` (Unicode
   word breaks with dictionaries for CJK and Thai) and `icu_folding` (case, accents,
   width). A keyword's language is unknown, so per-language analyzers would need routing;
-  the trial measures what they would add. `url.text` uses the same two steps after a
-  character filter turns each run of punctuation and percent escapes into one space.
-- **Query.** `best_fields` over `title^2`, `description`, `body` and `url.text^2`: a doc
+  the trial measures what they would add. `url_words` uses the same two steps after a
+  character filter turns each run of characters that are not letters, digits or marks
+  into one space.
+- **Query.** `best_fields` over `title^2`, `description`, `body`, `url_words^2` and
+  `anchor`: a doc
   scores by its best-matching field. The type and weights were chosen on half of golden
   batch 20's keywords and confirmed on the other half ([Tuning on batch
   20](#tuning-on-batch-20)); the URL weight came later, on 51M docs. The keyword is never
@@ -846,11 +896,13 @@ exists. Batch 22 is read once: the ranking stays if the 95 % interval of its gai
   10 s. The create-index block was still set 90 s after the watermarks were reset and
   gone at the next check, less than a minute later.
 - OpenSearch has `combined_fields` since 3.2; it needs one analyzer across the fields
-  and field weights of at least 1. So it cannot search `url.text`, whose analyzer
+  and field weights of at least 1. So it cannot search `url_words`, whose analyzer
   differs.
 - In a `pattern_replace` filter, `%[0-9A-F]{2}|[^\p{L}\p{N}]+` leaves hex fragments:
   after a `/`, the second branch also takes the `%` of the next escape, so `/%E0` keeps
-  `E0`. The filter now repeats one group of both, with `%` out of the second branch.
+  `E0`. The filter no longer handles escapes: the build decodes them before the
+  analyzer sees the URL. A query is not decoded, so a keyword that holds an escape
+  gives hex fragments. Golden batches 7 to 20 hold no such keyword.
 - A force merge commits shard by shard, but each shard's old segments stay on disk until
   a refresh, and the build refreshed only when the whole task had ended. So a rebuild
   held three indices, not two. OpenSearch also merges several shards at once (the
@@ -914,7 +966,33 @@ Choices and limits:
   when search latency matters.
 - **Still open** (`docs/RECRAWL.md` §13):
   - compact the text Parquet, before its first 30-day cycle ends;
-  - crawlerdb's title and anchor text for docs without text;
+  - the gain of crawlerdb's title and anchor text on a tuned query. One trial ran on Host2
+    on 2026-11-15, on a node of its own beside the live one, with the 11-02 list. The
+    lookup asked for 11,513,281 docs and found 10,761,962 in 5,891 queries and 4,245 s of
+    lookups, one 14-minute closed window included. The build indexed 63,999,416 docs, of
+    them 8,848,626 URL-only, 459,295 challenge docs and 10,326,671 with crawlerdb text,
+    in 4.3 h and 48.2 GB. Against the 11-07 index, with the same query, Recall@10 rose on
+    batch 20 from 0.0800 to 0.0916 (1,227 to 1,404 pairs) and on batch 21 without `goto`
+    from 0.0664 to 0.0783. H/F fell from 0.4348 to 0.3978. Of the 177 new pairs on batch
+    20, 118 are pages fetched after 11-07, which any rebuild gets; the `anchor` field adds
+    1 pair. Runbook:
+    1. Deploy the code. `text-index-eval` then stops on the old index, which has no
+       `anchor` field, until the rebuild. So deploy, look up and rebuild in one step.
+    2. `docker compose ... run --rm text-index text-index-crawlerdb-text`. It needs
+       `dims/split_hosts.parquet` (`pull-dims`) and the crawlerdb DSN. `host2.toml`
+       puts the dataset in `/work/text_index/crawlerdb_text`.
+    3. `docker compose ... run --rm text-index text-index-build`, and check
+       `crawlerdb_text_docs` in its report.
+
+    Expected load: the command sends one statement at most once per
+    `pull.min_interval_s` (0.5 s), and the read guard holds it during the closed read
+    windows. The 11-15 trial above took 71 minutes of lookups;
+  - the gain of the decoded URL words (`url_words`) on a golden batch. It is not
+    measured yet. In batch 20, 888 of 15,328 pairs have a URL with a non-ASCII escape
+    and 4 have an IDN host: these are the pairs that can gain, not the gain. The index
+    size with the new field is not measured either. Both need a rebuild. Deploy the
+    code and rebuild in one step: a search on an older index skips `url_words`, so it
+    loses the URL's words until the rebuild;
   - one read of batch 22 (created 11-16), if it holds no `goto` URLs, with the node restarted.
 
 ## Reproduction

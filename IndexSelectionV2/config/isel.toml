@@ -339,8 +339,9 @@ alias = "isel-text"                      # searches go through the alias; each b
 settings_file = "config/text_index/icu.json"   # index settings and mappings
 shards = 1                               # primary shards of a new index; host-specific
 query_type = "best_fields"               # the best field's BM25; or most_fields, combined_fields
-fields = ["title^2", "description", "body", "url.text^2"]   # tuned on golden batch 20, the
-                                         # URL weight on 51M docs; combined_fields needs one
+fields = ["title^2", "description", "body", "url_words^2", "anchor"]  # tuned on golden batch
+                                         # 20, the URL weight on 51M docs; the anchor weight
+                                         # is not tuned yet. combined_fields needs one
                                          # analyzer and weights >= 1
 k = 10                                   # hits per query: the metric's top 10
 fetch_k = 200                            # hits read per query, so a host cap can refill the top k
@@ -380,7 +381,25 @@ flood_free_ratio = 0.05                  # free share the node's flood stage kee
                                          # the default); a build that would cross it stops
 expected_bytes_per_doc = 1003            # icu.json on 44k crawled pages; a build needs
                                          # twice this per doc free before it loads
-progress_every = 1000                    # _bulk requests between progress log lines
+progress_every = 1000                    # _bulk requests, or crawlerdb lookups, between
+                                         # progress log lines
+crawlerdb_text_root = ""                 # crawlerdb's title and anchor text of the listed docs
+                                         # without text, part-*.parquet of doc_id, title and
+                                         # anchor. text-index-crawlerdb-text writes it and a
+                                         # build reads it; "" or no file leaves those docs
+                                         # with their URL alone. Host-specific (host2.toml)
+crawlerdb_text_max_docs = 100            # the build drops a crawlerdb title or anchor on more
+                                         # docs than this: a challenge page's title ("Just a
+                                         # moment...") or a navigation link ("Menu"). In a
+                                         # 1.86M-doc trial it dropped 46 titles (16,400 docs)
+                                         # and 513 anchors (413,832 docs). Not tuned yet
+crawlerdb_text_chunk = 2000              # URLs per crawlerdb lookup, one primary-key read
+crawlerdb_anchor_chars = 200             # anchor text kept per doc
+crawlerdb_text_file_rows = 1000000       # docs per Parquet file of the dataset
+crawlerdb_text_max_minutes = 0.0         # stop the lookup after this long and keep what it
+                                         # found, best ranks first, and send no lookup the
+                                         # read guard would hold past it; 0 = no limit.
+                                         # Host-specific (host2.toml)
 
 [rank]                                   # `isel rank --loop`: the rank rate of each
                                          # guard.month_days batch G, written into G's

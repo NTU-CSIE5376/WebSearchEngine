@@ -55,6 +55,8 @@ def test_base_config_loads(base_cfg):
     ("[schedule]\nswap_freeze_window = ['20:00', '11:30']\n", "swap_freeze_window"),
     ("[text_index]\nurl = 'http://127.0.0.1:9200/'\n", "without a trailing slash"),
     ("[text_index]\nalias = 'Isel-Text'\n", "alias must be lowercase"),
+    ("[text_index]\ncrawlerdb_text_chunk = 0\n", "crawlerdb sizes and counts must be > 0"),
+    ("[text_index]\ncrawlerdb_text_max_minutes = -1.0\n", "max_minutes must be >= 0"),
     ("[text_index]\nquery_type = 'query_string'\n", "query_type must be one of"),
     ("[text_index]\nfields = ['title^x']\n", "weight > 0"),
     ("[text_index]\nfields = []\n", "must be non-empty"),

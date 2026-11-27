@@ -11,6 +11,7 @@ from __future__ import annotations
 import subprocess
 import time
 import uuid
+from datetime import UTC, datetime
 
 import psycopg
 import pyarrow as pa
@@ -19,8 +20,12 @@ import pytest
 from conftest import replace
 from test_integration_pg import ALLOWED, SHARDS, _free_port, _load, _urls
 
+from isel.crawlerdbtext import CRAWLERDB_TEXT_SCHEMA, lookup_sql, pull_crawlerdb_text
+from isel.io import write_parquet_atomic
 from isel.pg import ReadGuard, ReadOnlyViolation, open_crawlerdb
 from isel.pull import CRAWL_COLUMNS, FULL_SCHEMA, estimate_full, full_sql, pull_dims, pull_full
+from isel.recrawl import TEXT_SCHEMA
+from isel.urlnorm import DomainKeyer, ShardRouter, md5_number_lower
 
 pytestmark = pytest.mark.yugabyte
 
@@ -142,3 +147,68 @@ def test_the_full_export_reads_every_crawled_row_once_as_psycopg_decodes_it(cfg,
     decoded = pa.Table.from_pylist(rows, schema=FULL_SCHEMA).sort_by("url")
     assert exported.equals(decoded)
     assert sum("\n" in u for u in exported.column("url").to_pylist()) == 9
+
+
+def test_crawlerdb_text_reads_the_title_and_anchor_of_the_docs_without_text(cfg, tmp_path, yb_dsn):
+    router = ShardRouter(DomainKeyer(["news.split.com"], offline=True), SHARDS, {})
+    vinegary = "https://www.merriam-webster.com/dictionary/vinegary"     # never fetched
+    waiting = "https://news.split.com/not-migrated"        # still in its eTLD+1 shard
+    tokyo = "https://ja.example.org/wiki/%E6%9D%B1%E4%BA%AC"
+    missing = "https://nowhere.example.net/"               # crawlerdb never saw it
+    real = "https://real.example.org/page"                 # has a page of its own
+    first, second = router.candidate_shards(waiting)
+    stored = {vinegary: (router.candidate_shards(vinegary)[0],
+                         "VINEGARY Definition & Meaning - Merriam-Webster", "vinegary " * 100),
+              waiting: (second, "Not migrated yet", None),
+              tokyo: (router.candidate_shards(tokyo)[0], None, "\u6771\u4eac"),
+              real: (router.candidate_shards(real)[0], "crawlerdb's title", "an anchor")}
+    # The live column types. The other tests' tables hold `text`.
+    cfg = replace(cfg, "crawlerdb", url_table_fmt="crawlerdb_text_{:03d}")
+    with psycopg.connect(yb_dsn, autocommit=True) as conn:
+        for shard in range(SHARDS):
+            conn.execute(f"CREATE TABLE crawlerdb_text_{shard:03d} (url varchar PRIMARY KEY, "
+                         "title varchar, anchor_text varchar, last_fetch_ok timestamptz)")
+        for url, (shard, title, anchor) in stored.items():
+            conn.execute(f"INSERT INTO crawlerdb_text_{shard:03d} VALUES (%s, %s, %s, now())",
+                         (url, title, anchor))
+    time.sleep(FOLLOWER_STALENESS_S + 5)
+
+    listed = [real, vinegary, waiting, tokyo, missing]
+    doc_id = {u: md5_number_lower(u) for u in listed}
+    body = "A page with text of its own."
+    write_parquet_atomic(pa.Table.from_pylist([{
+        "doc_id": doc_id[real], "batch_id": 1, "url": real, "final_url": None,
+        "fetched_at": datetime(2026, 10, 20, tzinfo=UTC), "http_status": 200, "lang": "en",
+        "title": "Its own title", "description": None, "body": body, "text_len": len(body),
+        "payload_sha1": "x"}], schema=TEXT_SCHEMA), tmp_path / "text" / "job-1.parquet")
+    write_parquet_atomic(pa.table({"doc_id": pa.array(list(doc_id.values()), pa.uint64()),
+                                   "rank": pa.array(range(len(listed)), pa.int64()),
+                                   "url": listed}), tmp_path / "list" / "run.parquet")
+    cfg = replace(cfg, "text_index", prior_file=str(tmp_path / "list" / "run.parquet"),
+                  crawlerdb_text_root=str(tmp_path / "crawlerdb_text"), crawlerdb_text_chunk=2)
+    session = _session(cfg)
+    try:
+        report = pull_crawlerdb_text(cfg, session, router, tmp_path / "text")
+        again = pull_crawlerdb_text(cfg, session, router, tmp_path / "text")
+        plan = "\n".join(row[0] for row in session.fetchall(
+            f"EXPLAIN {lookup_sql(cfg, first)}", ([vinegary, waiting],)))
+        with psycopg.connect(yb_dsn) as conn:
+            kept = sum(conn.execute(f"SELECT count(*) FROM crawlerdb_text_{shard:03d}"
+                                    ).fetchone()[0] for shard in range(SHARDS))
+    finally:
+        session.close()
+    table = pa.concat_tables([pq.read_table(f)
+                              for f in sorted((tmp_path / "crawlerdb_text").glob("*.parquet"))])
+    assert table.schema.equals(CRAWLERDB_TEXT_SCHEMA)
+    assert {r["doc_id"]: (r["title"], r["anchor"]) for r in table.to_pylist()} == {
+        doc_id[vinegary]: ("VINEGARY Definition & Meaning - Merriam-Webster",
+                           ("vinegary " * 100)[:cfg.text_index.crawlerdb_anchor_chars]),
+        doc_id[waiting]: ("Not migrated yet", None),
+        doc_id[tokyo]: (None, "\u6771\u4eac")}
+    assert {k: report[k] for k in ("docs_wanted", "docs_found", "with_title", "with_anchor",
+                                   "stopped")} == {
+        "docs_wanted": 4, "docs_found": 3, "with_title": 2, "with_anchor": 2, "stopped": False}
+    timings = {"seconds": 0, "lookup_seconds": 0}
+    assert {**again, **timings} == {**report, **timings}
+    assert kept == len(stored)
+    assert "Index Scan" in plan and "crawlerdb_text_" in plan and "Seq Scan" not in plan, plan

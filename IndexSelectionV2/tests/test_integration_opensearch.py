@@ -16,11 +16,12 @@ import pyarrow as pa
 import pytest
 from conftest import ROOT, replace, small_cfg
 
+from isel.crawlerdbtext import CRAWLERDB_TEXT_SCHEMA
 from isel.golden import GOLDEN_SCHEMA, golden_path
 from isel.io import write_parquet_atomic
 from isel.recrawl import TEXT_SCHEMA
 from isel.textindex import OpenSearch, build, evaluate_golden, query_body, search
-from isel.urlnorm import canonicalize, md5_number_lower
+from isel.urlnorm import canonicalize, md5_number_lower, url_words
 
 pytestmark = pytest.mark.opensearch
 
@@ -118,9 +119,9 @@ def test_build_search_and_eval(node, tmp_path):
     # "प्रधान" is indexed as "परधान", the same on the query side.
     assert _tokens(client, index, "प्रधान") == ["परधान"]
     assert _tokens(client, index, "Müller") == ["muller"]
-    # Percent escapes vanish whole, so an encoded path leaves no hex fragments.
-    assert _tokens(client, index, "https://ja.example.org/wiki/%E6%9D%B1%E4%BA%AC_2020-Games",
-                   "url") == ["https", "ja", "example", "org", "wiki", "2020", "games"]
+    slug = url_words("https://ja.example.org/wiki/%E6%9D%B1%E4%BA%AC_2020-Games")
+    assert _tokens(client, index, slug, "url") == [
+        "https", "ja", "example", "org", "wiki", "\u6771\u4eac", "2020", "games"]
 
     t = cfg.text_index
     for url, _, title, _, _ in DOCS:
@@ -275,3 +276,122 @@ def test_a_shared_challenge_page_is_found_by_its_url_not_by_its_text(node, tmp_p
     assert build(plain, client, root, datetime(2026, 10, 27, tzinfo=UTC))["challenge_docs"] == 0
     found, _ = search(client, plain.text_index, "enable JavaScript to proceed")
     assert set(found) == {ids[d[0]] for d in blocked}
+
+
+def test_the_words_of_an_encoded_url_find_its_doc(node, tmp_path):
+    slugs = [f"https://shop.example.com/bills-vs-rams/{n}" for n in range(3)]
+    urls = {"cjk": "https://ja.example.org/wiki/%E6%9D%B1%E4%BA%AC",
+            "idn": "https://xn--wgv71a119e.example/",
+            "other": "https://www.other.example/bills-vs-rams"}
+    doc_id = {name: str(md5_number_lower(canonicalize(u))) for name, u in urls.items()}
+    root = tmp_path / "text"
+    write_parquet_atomic(_text([(u, "en", "page", None, "nothing to match")
+                                for u in [*urls.values(), *slugs]],
+                               datetime(2026, 10, 20, tzinfo=UTC)), root / "job-1.parquet")
+    cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
+                  alias="isel-text-url-words", host_cap=2,
+                  settings_file=str(ROOT / "config/text_index/icu.json"))
+    client = OpenSearch(node, 60.0, 2, 1.0)
+    index = build(cfg, client, root, datetime(2026, 10, 25, tzinfo=UTC))["index"]
+
+    t = cfg.text_index
+    assert search(client, t, "\u6771\u4eac")[0] == [doc_id["cjk"]]
+    assert search(client, t, "\u65e5\u672c\u8a9e")[0] == [doc_id["idn"]]
+    # The cap reads the stored URL: two of the shop's three pages, and the other host.
+    ids, _ = search(client, t, "rams")
+    shop = {str(md5_number_lower(canonicalize(u))) for u in slugs}
+    assert len(ids) == 3 and doc_id["other"] in ids and len(shop & set(ids)) == 2
+    stored = client.call("GET", f"/{index}/_doc/{doc_id['cjk']}")["_source"]
+    assert stored["url"] == urls["cjk"] and "url_words" not in stored
+
+
+def test_a_doc_without_real_text_is_found_by_its_decoded_url(node, tmp_path):
+    no_page = "https://ja.wikipedia.org/wiki/%E6%9D%B1%E4%BA%AC"            # never fetched
+    challenged = "https://zh.example.org/wiki/%E9%A2%B1%E9%A2%A8%E8%AD%A6%E5%A0%B1"
+    sha1 = "f1dbc6923af7384830c2b832bc9859adacbc3b70"
+    root = tmp_path / "text"
+    write_parquet_atomic(_text([DOCS[0]], datetime(2026, 10, 20, tzinfo=UTC)),
+                         root / "job-1.parquet")
+    write_parquet_atomic(
+        _text([(challenged, "en", "Client Challenge", None, "Please enable JavaScript.")],
+              datetime(2026, 10, 21, tzinfo=UTC), payload_sha1=sha1), root / "job-2.parquet")
+    listed = [DOCS[0][0], no_page, challenged]
+    prior = tmp_path / "list" / "run.parquet"
+    write_parquet_atomic(pa.table({
+        "doc_id": pa.array([md5_number_lower(canonicalize(u)) for u in listed], pa.uint64()),
+        "rank": pa.array([0, 1, 2], pa.int64()), "url": listed}), prior)
+    cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
+                  alias="isel-text-combined", prior_file=str(prior), warmup_queries=0,
+                  settings_file=str(ROOT / "config/text_index/icu.json"))
+    cfg = replace(cfg, "recrawl", challenge_sha1=[sha1])
+    client = OpenSearch(node, 60.0, 2, 1.0)
+    out = build(cfg, client, root, datetime(2026, 10, 25, tzinfo=UTC))
+    assert (out["docs"], out["fallback_docs"], out["challenge_docs"]) == (3, 1, 1)
+
+    ids = {name: str(md5_number_lower(canonicalize(u)))
+           for name, u in (("no_page", no_page), ("challenged", challenged))}
+    assert search(client, cfg.text_index, "東京")[0] == [ids["no_page"]]
+    assert search(client, cfg.text_index, "颱風警報")[0] == [ids["challenged"]]
+    assert ids["challenged"] not in search(client, cfg.text_index, "Client Challenge")[0]
+    golden = [{"batch_id": 20, "batch_created_at": datetime(2026, 10, 16, tzinfo=UTC),
+               "query_id": n, "keyword": kw, "frequency": 1, "tags": ["head"], "rank": 1,
+               "raw_url": u, "canonical_url": canonicalize(u), "host": "x"}
+              for n, (kw, u) in enumerate((("東京", no_page), ("颱風警報", challenged)))]
+    write_parquet_atomic(pa.Table.from_pylist(golden, schema=GOLDEN_SCHEMA),
+                         golden_path(cfg.work_dir))
+    measured = evaluate_golden(cfg, client, 20)["all"]
+    assert (measured["presence"], measured["recall_pairs"]) == (1.0, 1.0)
+
+
+def test_a_doc_without_a_page_is_found_by_its_crawlerdb_title_and_anchor(node, tmp_path):
+    vinegary = "https://www.merriam-webster.com/dictionary/vinegary"     # Cloudflare refuses us
+    skillet = "https://shop.example.com/p/88213"                         # never fetched
+    real = DOCS[0][0]
+    listed = [real, vinegary, skillet]
+    ids = {u: md5_number_lower(canonicalize(u)) for u in listed}
+    root = tmp_path / "text"
+    write_parquet_atomic(_text([DOCS[0]], datetime(2026, 10, 20, tzinfo=UTC)),
+                         root / "job-1.parquet")
+    prior = tmp_path / "list" / "run.parquet"
+    write_parquet_atomic(pa.table({"doc_id": pa.array(list(ids.values()), pa.uint64()),
+                                   "rank": pa.array([0, 1, 2], pa.int64()), "url": listed}), prior)
+    write_parquet_atomic(pa.Table.from_pylist([
+        {"doc_id": ids[vinegary], "title": "VINEGARY Definition & Meaning - Merriam-Webster",
+         "anchor": None},
+        {"doc_id": ids[skillet], "title": None, "anchor": "Cast iron skillet"},
+        {"doc_id": ids[real], "title": "Zeppelin definition", "anchor": "zeppelin skillet"}],
+        schema=CRAWLERDB_TEXT_SCHEMA), tmp_path / "crawlerdb_text" / "part-00000.parquet")
+    cfg = replace(small_cfg(tmp_path / "work"), "text_index", url=node, lease_wait_s=90.0,
+                  alias="isel-text-crawlerdb", prior_file=str(prior), warmup_queries=0,
+                  settings_file=str(ROOT / "config/text_index/icu.json"))
+    client = OpenSearch(node, 60.0, 2, 1.0)
+    t = cfg.text_index
+    before = build(cfg, client, root, datetime(2026, 10, 25, tzinfo=UTC))
+    assert (before["docs"], before["fallback_docs"], before["crawlerdb_text_docs"]) == (3, 2, 0)
+    assert search(client, t, "definition")[0] == [] and search(client, t, "skillet")[0] == []
+    real_doc = client.call("GET", f"/{before['index']}/_doc/{ids[real]}")["_source"]
+
+    with_text = replace(cfg, "text_index", crawlerdb_text_root=str(tmp_path / "crawlerdb_text"))
+    out = build(with_text, client, root, datetime(2026, 10, 26, tzinfo=UTC))
+    assert (out["docs"], out["fallback_docs"], out["crawlerdb_text_docs"]) == (3, 2, 2)
+    # Each word is in the crawlerdb text of one doc without a page, and nowhere else. The
+    # doc with a page keeps its own text: crawlerdb's words for it find nothing.
+    assert search(client, t, "definition")[0] == [str(ids[vinegary])]
+    assert search(client, t, "vinegary definition")[0] == [str(ids[vinegary])]
+    assert search(client, t, "skillet")[0] == [str(ids[skillet])]
+    assert search(client, t, "zeppelin")[0] == []
+    assert client.call("GET", f"/{out['index']}/_doc/{ids[real]}")["_source"] == real_doc
+    stored = client.call("GET", f"/{out['index']}/_doc/{ids[skillet]}")["_source"]
+    assert set(stored) == {"url", "sel_prior"}        # the anchor is searched, not returned
+    stored = client.call("GET", f"/{out['index']}/_doc/{ids[vinegary]}")["_source"]
+    assert stored["title"] == "VINEGARY Definition & Meaning - Merriam-Webster"
+
+    golden = [{"batch_id": 20, "batch_created_at": datetime(2026, 10, 16, tzinfo=UTC),
+               "query_id": n, "keyword": kw, "frequency": 1, "tags": ["head"], "rank": 1,
+               "raw_url": u, "canonical_url": canonicalize(u), "host": "x"}
+              for n, (kw, u) in enumerate((("vinegary definition", vinegary),
+                                           ("cast iron skillet", skillet)))]
+    write_parquet_atomic(pa.Table.from_pylist(golden, schema=GOLDEN_SCHEMA),
+                         golden_path(cfg.work_dir))
+    measured = evaluate_golden(cfg, client, 20)["all"]
+    assert (measured["presence"], measured["recall_pairs"]) == (1.0, 1.0)
