@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from pathlib import Path
 
 import pytest
 
 from isel.urlnorm import DomainKeyer, ShardRouter, canonicalize, md5_number_lower, wire_url
+
+# A copy of NTU-CSIE5376/WebCrawler tests/fixtures/url_keys.json: the crawler's url_state keys.
+URL_KEYS = json.loads((Path(__file__).parent / "fixtures" / "url_keys.json")
+                      .read_text(encoding="utf-8"))["vectors"]
 
 
 def test_shard_router_matches_crawler_rule(base_cfg):
@@ -22,6 +28,11 @@ def test_shard_router_matches_crawler_rule(base_cfg):
 def test_canonicalize_and_hash():
     assert canonicalize("https://x.com/a?b=2&a=1#f") == "https://x.com/a?a=1&b=2"
     assert md5_number_lower("x") == int.from_bytes(hashlib.md5(b"x").digest()[8:], "little")
+
+
+@pytest.mark.parametrize("vector", URL_KEYS, ids=[v["url"] for v in URL_KEYS])
+def test_canonicalize_gives_the_crawler_key(vector):
+    assert canonicalize(vector["url"]) == vector["key"]
 
 
 @pytest.mark.parametrize(("url", "wire"), [

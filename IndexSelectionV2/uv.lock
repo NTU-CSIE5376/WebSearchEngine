@@ -349,7 +349,7 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.7" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "tldextract", specifier = "==5.1.1" },
-    { name = "w3lib", specifier = ">=2.5" },
+    { name = "w3lib", specifier = "==2.5.0" },
 ]
 
 [package.metadata.requires-dev]
