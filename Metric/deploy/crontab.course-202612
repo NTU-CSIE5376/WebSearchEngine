@@ -1,0 +1,16 @@
+# December 2026 course schedule (docs/03-dockerfile-operations.md, "Course schedule").
+# Select it with METRIC_CRONTAB=crontab.course-202612. It replaces the default golden
+# jobs: Metric/deploy/course/run_golden.py runs the Dec 1, 8 and 15 batches and keeps its
+# phase state in GOLDEN_COURSE_STATE; measure_golden.py measures each batch once after its
+# last phase. Schedules run in UTC; both scripts work in Taipei time.
+
+# 每小時執行一次 (Status)
+0 * * * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 measure.py --test --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.3:5433 --measure status
+0 * * * * cd /root/WebSearchEngine && /root/system-venv/bin/python3 migrate.py
+
+# 12/1、12/8、12/15 台灣時間 08:00-19:45：runner 依 phase 狀態決定要不要跑
+0,5,15,30,45 0-11 1,8,15 12 * umask 077 && /usr/bin/timeout -k 15s 4h /root/system-venv/bin/python3 -u /root/WebSearchEngine/Metric/deploy/course/run_golden.py
+
+# 每個 batch 最後一個 phase 完成後量測一次（crawler_all，兩個 tag 一起），不花搜尋額度。
+# :20/:50 避開整點的 status 掃描；只到 15:50 UTC，IndexSelection 的 rank job 16:00 讀取後不再重量
+20,50 0-15 1,8,15 12 * umask 077 && cd /root/WebSearchEngine && /usr/bin/timeout -k 15s 2h /root/system-venv/bin/python3 -u Metric/deploy/course/measure_golden.py --metric_db_url 172.16.191.1:5433 --crawler_db_url 172.16.191.3:5433 --select_db_url 172.16.191.1:5445

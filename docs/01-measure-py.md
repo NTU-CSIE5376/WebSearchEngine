@@ -47,18 +47,23 @@ It coordinates three layers:
 Flow:
 
 1. Build `DatabaseRawDataReader(metricDB, modelFactory, update_day)`.
-2. `readData()` returns trending keywords:
-   - Uses latest cached `metric_batches` entry if fresh.
+2. Check the SerpApi key and quota with `require_searches()` (`Metric/Query/SerpApi.py`).
+   It calls `account.json`, which costs no search, and needs
+   `keywordNums × strategies + one per trending geo` searches left.
+   A missing or invalid key, or too few searches, stops the run before any batch is written.
+3. `readData()` returns trending keywords:
+   - Uses the latest non-empty `metric_batches` entry (`meta_total_queries > 0`) if it is under `update_day` days old.
    - Otherwise fetches from SerpApi and persists new batch/query rows.
-3. Read latest batch id via `get_latest_batch_id()`.
-4. For each strategy:
+   - If any geo still fails after its retries, it raises and saves no batch, so the next run fetches again.
+4. Read latest non-empty batch id via `get_latest_batch_id()`.
+5. For each strategy:
    - `random`: sample `keywordNums` keywords.
    - `head`: pick top `keywordNums` by frequency.
-5. For each chosen keyword:
+6. For each chosen keyword:
    - Query Google organic results via SerpApi.
    - Upsert `metric_queries.tags` with strategy tag.
    - Replace associated rows in `metric_url`.
-6. Recompute batch metadata (`meta_total_queries`, `meta_total_urls`, `meta_tag_stats`).
+7. Recompute batch metadata (`meta_total_queries`, `meta_total_urls`, `meta_tag_stats`).
 
 ### 3.3 Measure execution mode (`--test`)
 
