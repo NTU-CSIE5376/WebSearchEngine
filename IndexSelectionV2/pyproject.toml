@@ -16,7 +16,7 @@ dependencies = [
     "scikit-learn>=1.7",
     "sqlalchemy>=2.0",
     "tldextract==5.1.1",
-    "w3lib>=2.5",
+    "w3lib==2.5.0",            # the crawler's url_state key spelling (#52)
 ]
 
 [project.scripts]

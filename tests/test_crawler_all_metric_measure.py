@@ -1,4 +1,6 @@
 from datetime import date
+import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -6,6 +8,10 @@ from sqlalchemy.orm import declarative_base
 
 from Database.ModelFactory.AppModelFactory import AppModelFactory
 from Metric.Measure.CrawlerAllMetricMeasure import coverage_upsert, normalize_golden_url
+
+# The crawler's url_state keys, shared with IndexSelectionV2 (NTU-CSIE5376/WebCrawler#166).
+URL_KEYS = json.loads((Path(__file__).resolve().parents[1] / "IndexSelectionV2" / "tests"
+                       / "fixtures" / "url_keys.json").read_text(encoding="utf-8"))["vectors"]
 
 
 @pytest.mark.parametrize(
@@ -50,6 +56,11 @@ def test_different_raw_forms_map_to_one_url():
     a = "https://play.google.com/store/apps/details?id=com.moonpay&hl=en_US"
     b = "https://play.google.com/store/apps/details?hl=en_US&id=com.moonpay"
     assert normalize_golden_url(a) == normalize_golden_url(b)
+
+
+@pytest.mark.parametrize("vector", URL_KEYS, ids=[v["url"] for v in URL_KEYS])
+def test_golden_key_is_the_crawler_key(vector):
+    assert normalize_golden_url(vector["url"]) == vector["key"]
 
 
 def _compiled_upsert():

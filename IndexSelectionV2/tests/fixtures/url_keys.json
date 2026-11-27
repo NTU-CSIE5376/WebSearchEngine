@@ -1,0 +1,62 @@
+{
+  "description": "Stored URL keys: canonicalize_url(url) == key under the pinned w3lib. Every service that writes or looks up url_state keys must reproduce these. NTU-CSIE5376/WebCrawler#166",
+  "w3lib": "2.5.0",
+  "vectors": [
+    {
+      "url": "https://example.com",
+      "key": "https://example.com/"
+    },
+    {
+      "url": "https://Example.COM/A?b=2&a=1#frag",
+      "key": "https://example.com/A?a=1&b=2"
+    },
+    {
+      "url": "https://example.com/search?q=caf%C3%A9&page=2",
+      "key": "https://example.com/search?page=2&q=caf%C3%A9"
+    },
+    {
+      "url": "https://example.com/?srsltid=AbC&x=1",
+      "key": "https://example.com/?srsltid=AbC&x=1"
+    },
+    {
+      "url": "https://example.com/item?id=12;color=red",
+      "key": "https://example.com/item?id=12%3Bcolor%3Dred"
+    },
+    {
+      "url": "https://example.com/a/../b",
+      "key": "https://example.com/b"
+    },
+    {
+      "url": "https://example.com/a/%2e%2e/b",
+      "key": "https://example.com/b"
+    },
+    {
+      "url": "https://example.com/100%25-cotton",
+      "key": "https://example.com/100%25-cotton"
+    },
+    {
+      "url": "https://example.com/a%3Bb",
+      "key": "https://example.com/a%3Bb"
+    },
+    {
+      "url": "https://example.com/a\\b",
+      "key": "https://example.com/a/b"
+    },
+    {
+      "url": "https://www.amazon.com/St%25C3%25A9phane-Plaza/e/B004MS5ZU6%3Fref=dbs_a_mng_rwt_scns_share",
+      "key": "https://www.amazon.com/St%25C3%25A9phane-Plaza/e/B004MS5ZU6%3Fref=dbs_a_mng_rwt_scns_share"
+    },
+    {
+      "url": "https:example.com/x",
+      "key": "https:example.com/x"
+    },
+    {
+      "url": "https://0x7f.1/",
+      "key": "https://0x7f.1/"
+    },
+    {
+      "url": "https://faß.de/",
+      "key": "https://fass.de/"
+    }
+  ]
+}
