@@ -1,0 +1,20 @@
+# December 2026 golden days (config/december-2026.toml): batches on Dec 1, 8 and 15,
+# new lists only for Dec 1 and 15. Pass it after compose.compute.yaml, per service:
+#   rank:    from its first `up`, before Nov 30 17:30 UTC (the Dec 1 build):
+#     docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml \
+#       -f deploy/compose.december-2026.yaml --profile rank up -d rank
+#   refresh: once, after the Dec 1 cycle is done and before Dec 11 12:00 UTC (DESIGN §11):
+#     docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml \
+#       -f deploy/compose.december-2026.yaml --profile refresh up -d refresh
+# Without it refresh makes the Dec 16 list instead of Dec 15's, and the rank job never
+# ranks Dec 8 or Dec 15. Drop it after Dec 15 is ranked.
+services:
+  rank:
+    entrypoint: ["isel", "--config", "/app/config/isel.toml",
+                 "--config", "/app/config/container.toml",
+                 "--config", "/app/config/text_index/host2.toml",
+                 "--config", "/app/config/december-2026.toml"]
+  refresh:
+    entrypoint: ["isel", "--config", "/app/config/isel.toml",
+                 "--config", "/app/config/container.toml",
+                 "--config", "/app/config/december-2026.toml"]

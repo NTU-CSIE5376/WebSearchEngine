@@ -666,7 +666,7 @@ def test_every_command_decides_whether_it_needs_the_work_lock():
     assert set(subcommands) == set(COMMANDS)
     assert {name for name, c in COMMANDS.items() if not c.work} == {
         "check-config", "report", "verify-live", "recrawl-plan", "recrawl-archive",
-        "text-index-build", "text-index-eval", "validate-manifest", "refresh"}
+        "text-index-build", "text-index-eval", "validate-manifest", "refresh", "rank"}
 
 
 def test_refresh_needs_exactly_one_mode(cli_config, capsys):

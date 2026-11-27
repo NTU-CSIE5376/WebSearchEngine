@@ -24,8 +24,11 @@ from isel.textindex import (
     cap_hosts,
     evaluate_golden,
     latest_docs,
+    pin,
+    pins,
     query_body,
     search,
+    unpin,
 )
 from isel.urlnorm import md5_number_lower
 
@@ -201,6 +204,29 @@ def test_build_without_keep_prev_deletes_the_previous_index(cfg, stub, tmp_path)
     second = build(cfg, client, root, datetime(2026, 10, 23, 2, tzinfo=UTC))
     assert second["deleted"] == [first["index"]]
     assert set(stub.indices) == {second["index"]}
+
+
+def test_build_without_keep_prev_keeps_a_pinned_index(cfg, stub, tmp_path):
+    # A rank job pinned G's index; the next G's build leaves it until G is written.
+    root = tmp_path / "text"
+    _write(root / "a" / "job-1.parquet", [_row(1)])
+    cfg = replace(cfg, "text_index", keep_prev=False)
+    client = _client(stub)
+    first = build(cfg, client, root, datetime(2026, 10, 23, 1, tzinfo=UTC))
+    assert pin(cfg, client, first["index"], {"golden_day": "2026-10-23"})
+    second = build(cfg, client, root, datetime(2026, 10, 23, 2, tzinfo=UTC))
+    third = build(cfg, client, root, datetime(2026, 10, 23, 3, tzinfo=UTC))
+    assert second["deleted"] == [] and third["deleted"] == [second["index"]]
+    assert third["pinned"] == [first["index"]]
+    assert set(stub.indices) == {first["index"], third["index"]}
+    unpin(cfg, first["index"])
+    fourth = build(cfg, client, root, datetime(2026, 10, 23, 4, tzinfo=UTC))
+    assert fourth["deleted"] == [first["index"], third["index"]]
+
+
+def test_a_gone_index_cannot_be_pinned(cfg, stub):
+    assert not pin(cfg, _client(stub), "isel-text-20261023t010000000000z", {})
+    assert pins(cfg) == {}
 
 
 def test_build_drops_the_new_index_when_a_doc_is_missing(cfg, stub, tmp_path):

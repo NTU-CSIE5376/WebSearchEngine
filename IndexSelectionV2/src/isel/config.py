@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import itertools
 import json
 import re
 import tomllib
@@ -204,6 +205,21 @@ class RefreshCfg:
 
 
 @dataclass(frozen=True)
+class RankCfg:
+    """`isel rank`: the index built on G-1 evening, G's rank rate on G (`guard.month_days`)."""
+
+    build_start: str
+    build_latest: str
+    poll_s: float
+    max_attempts: int
+    writer_dsn_env: str
+    coverage_table_fmt: str
+    total_team: str
+    teams: dict[str, list[int]]
+    session: dict[str, str]
+
+
+@dataclass(frozen=True)
 class RecrawlCfg:
     api_url: str
     api_timeout_s: float
@@ -294,6 +310,7 @@ class Config:
     selectdb: SelectDbCfg
     schedule: ScheduleCfg
     refresh: RefreshCfg
+    rank: RankCfg
     recrawl: RecrawlCfg
     text_index: TextIndexCfg
 
@@ -508,6 +525,7 @@ def _validate(cfg: Config) -> None:
     _validate_full(cfg, need)
     _validate_selectdb(cfg, need)
     _validate_refresh(cfg, need)
+    _validate_rank(cfg, need)
     _validate_recrawl(cfg, need)
     _validate_text_index(cfg, need)
 
@@ -624,8 +642,9 @@ def _validate_full(cfg: Config, need: Any) -> None:
 def _validate_selectdb(cfg: Config, need: Any) -> None:
     s = cfg.selectdb
     need(len({s.admin_dsn_env, s.reader_dsn_env, cfg.crawlerdb.dsn_env,
-              cfg.metricdb.dsn_env}) == 4,
-         "selectdb DSN env vars must differ from each other and from the read-only DBs")
+              cfg.metricdb.dsn_env, cfg.rank.writer_dsn_env}) == 5,
+         "selectdb DSN env vars must differ from each other, from the read-only DBs and "
+         "from rank.writer_dsn_env")
     need(bool(s.forbidden_ports), "selectdb.forbidden_ports must not be empty")
     need(min(s.copy_block_bytes, s.swap_retry_attempts, s.max_db_bytes, s.est_bytes_per_row,
              s.verify_chunk, s.connect_timeout_s, s.keepalives_idle_s,
@@ -670,6 +689,28 @@ def _validate_refresh(cfg: Config, need: Any) -> None:
     need(r.max_attempts >= 1, "refresh.max_attempts must be >= 1")
     need(r.poll_s > 0, "refresh.poll_s must be > 0")
     need(r.kill_grace_s >= 0, "refresh.kill_grace_s must be >= 0")
+
+
+def _validate_rank(cfg: Config, need: Any) -> None:
+    r = cfg.rank
+    need(hhmm_minutes(r.build_start) <= hhmm_minutes(r.build_latest) < 24 * 60,
+         "rank.build_start and rank.build_latest must be in order within G-1")
+    # The job ranks every batch day; a refresh cycle's golden day is one of them.
+    need(set(cfg.schedule.swap_freeze_days) <= set(cfg.guard.month_days),
+         "guard.month_days must hold every schedule.swap_freeze_days day")
+    need(r.poll_s > 0, "rank.poll_s must be > 0")
+    need(r.max_attempts >= 1, "rank.max_attempts must be >= 1")
+    need(all(f"{{{k}}}" in r.coverage_table_fmt for k in ("tag", "team")),
+         "rank.coverage_table_fmt must hold {tag} and {team}")
+    need(bool(r.teams) and r.total_team not in r.teams,
+         "rank.teams must not be empty or name rank.total_team")
+    spans = sorted(r.teams.values())
+    need(all(len(s) == 2 and 0 <= s[0] <= s[1] < cfg.crawlerdb.num_shards for s in spans),
+         "rank.teams must map to [first, last] shard ranges")
+    need(all(a[1] < b[0] for a, b in itertools.pairwise(spans)),
+         "rank.teams shard ranges must not overlap")
+    need(timeout_seconds(r.session) <= cfg.guard.timeout_cap_s,
+         "rank.session.statement_timeout must not exceed guard.timeout_cap_s")
 
 
 def load_config(paths: Sequence[str | Path]) -> Config:

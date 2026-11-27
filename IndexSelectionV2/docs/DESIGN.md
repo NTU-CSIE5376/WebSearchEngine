@@ -18,9 +18,11 @@
 
 **Non-goals**
 
-- No automatic rollback and no automatic text index rebuild. Both stay manual (§11).
-- No writes to crawlerdb, metricdb, the v1 selectdb (`:5444`) or `/data/ipc`. The
-  recrawl's results are deleted only through the crawler's API.
+- No automatic rollback (§11). The text index is rebuilt automatically only by the
+  rank job, on the evening before each golden day (`docs/TEXT_INDEX.md`, "The rank job").
+- No writes to crawlerdb, the v1 selectdb (`:5444`) or `/data/ipc`. metricdb takes one
+  write: the rank job sets the rank fields of each golden batch as the role `isel_rank`.
+  The recrawl's results are deleted only through the crawler's API.
 - No page fetching of our own and no index building yet. The recrawl asks the crawler
   to fetch the list and keeps the extracted text; the index is only planned.
 
@@ -341,6 +343,7 @@ distinct canonical golden URLs.
 | `profiles: [job]`, used with `run --rm` | one container per command; `up` starts nothing |
 | except `recrawl-plan`, `recrawl-archive` (`profiles: [recrawl]`) | long-running loops with `restart: unless-stopped`, one instance each (advisory lock). `recrawl-plan` uses `network_mode: host` to reach the crawler API on `127.0.0.1:4000`; both mount `/data/manual_bulk_crawls/results` read-only and `/data/isel` writable |
 | and `refresh` (`profiles: [refresh]`) | the refresh loop (§11) with `restart: unless-stopped`. It extends `isel`: the same bridge network, secrets, `/work` and limits as the jobs it replaces. It runs one step process at a time. `OPENBLAS_NUM_THREADS=1`, because the parent loads numpy and idles for days |
+| and `rank` (`profiles: [rank]`) | the rank loop (`docs/TEXT_INDEX.md`) with `restart: unless-stopped`. It extends `text-index` and adds the secret `metricdb_rank_dsn`, the DSN of the metricdb role `isel_rank` |
 | `read_only: true`, `tmpfs: /tmp` | only `/work` is writable |
 | secrets as `<NAME>_FILE` | DSNs never appear in `docker inspect`, env or logs |
 | `mem_limit` 128g, `cpus` 32 | DuckDB 96 GB and LightGBM 32 threads fit below the limit |
@@ -383,7 +386,9 @@ $J swap --db-run-id <n>
 $J verify-live --batch <b>
 # recrawl (docs/RECRAWL.md §11), against the crawler API as Host2 runs it
 $J recrawl-sync                        # after a manual swap; refused in the freeze window
-$D run --rm text-index text-index-build   # after each sync: index the new list's docs
+$D run --rm text-index text-index-build   # after a manual sync: index the new list's docs
+$D run --rm rank rank --dry-run        # what the rank job would write; builds and writes nothing
+$D --profile rank up -d rank           # index on G-1, G's rank rate on G, every golden day
 $J recrawl-plan --dry-run              # per-host capacity report; sends nothing
 $D --profile recrawl up -d recrawl-archive recrawl-plan
 $D --profile recrawl stop recrawl-plan # stops sending new jobs at once
@@ -447,7 +452,17 @@ when its `model_runs.cutoff_datetime` is at or after `start_at`.
   goes on until `swap_by`.
 - **The first swap** is followed by a cleanup that deletes every selection run but live
   and prev.
-- **The text index** stays manual: run `text-index-build` after the sync.
+- **The text index** is built by the `rank` service on G-1, which then writes G's rank
+  rate (`docs/TEXT_INDEX.md`, "The rank job"). Refresh does not build it.
+- **December 2026** has batches on Dec 1, 8 and 15, and new lists only for Dec 1 and
+  15: `config/december-2026.toml` goes after the other configs, through
+  `deploy/compose.december-2026.yaml`. Recreate `refresh` with it while no cycle sits
+  between its `start_at` and `clear_by` (after the Dec 1 cycle, before Dec 11 12:00
+  UTC), or the cycle ends `skipped_late`:
+  `docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml -f
+  deploy/compose.december-2026.yaml --profile refresh up -d refresh`. Without it the
+  cycle makes a Dec 16 list, which may swap on Dec 15 after Metric measured, and the
+  rank job refuses Dec 15. The `rank` service takes it from its first start.
 
 `$J refresh --status` prints the cycle, its outcome, the evidence, each step's state and
 the next decision. It writes nothing and holds no lock; `work_lock` says who holds

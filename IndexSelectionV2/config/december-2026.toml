@@ -1,0 +1,23 @@
+# December 2026 golden days: pass after config/isel.toml (and the host overlay).
+# The TA's runner creates batches on Dec 1, 8 and 15: seed 00:05, random 01:00, head
+# 07:00 UTC; Dec 8 is an extra head-only set (head 01:00). Its cron ticks 00:00-11:45
+# UTC and each run may last 4 h, so the batch is complete by 16:00. Metric's
+# measure_golden.py measures each batch once after its last phase, before 16:00.
+#
+# deploy/compose.december-2026.yaml passes it to rank and refresh. rank takes it from
+# its first start. refresh only while no cycle sits between its start_at and clear_by:
+# after the Dec 1 cycle is done and before 2026-12-11 12:00 UTC. In between, a cycle
+# whose export is not yet cleared past clear_by ends skipped_late (docs/DESIGN.md §11).
+
+[guard]
+month_days = [1, 8, 15]                  # every batch day: the rank job ranks all three
+month_window = ["00:00", "16:00"]
+
+[schedule]
+swap_freeze_days = [1, 15]               # new lists only for Dec 1 and Dec 15; Dec 8 reads
+swap_freeze_window = ["00:00", "16:00"]  # the Dec 1 list, rebuilt into a newer index
+
+[refresh]
+start_days_before = 4                    # swap ~G-4 evening: ~3 days of recrawl before
+                                         # the G-1 index build. No batch falls in the two
+                                         # extra days, so training loses nothing

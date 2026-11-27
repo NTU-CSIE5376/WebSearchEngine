@@ -13,7 +13,7 @@ metric would count it ([Golden batch 20 as the official metric counts
 it](#golden-batch-20-as-the-official-metric-counts-it)). On 2026-11-07 the index was built
 on Host2 from the list's recrawl text, 52M docs, and the ranking was reworked for that size
 ([Golden batches 20 and 21 on 52M docs](#golden-batches-20-and-21-on-52m-docs)). The official
-metric does not read this index yet.
+metric does not search this index; [the rank job](#the-rank-job) writes its rank rate.
 
 ## Commands
 
@@ -21,6 +21,7 @@ metric does not read this index yet.
 |---|---|
 | `text-index-build [--text-root DIR]` | loads the newest text of each doc, and the URL of each listed doc without text, into a new index `isel-text-<utc id>`, checks the count, merges it, blocks writes, then moves the alias `isel-text` to it in one call |
 | `text-index-eval --batch N` | searches each golden keyword of batch N on the alias and reports Recall@10 against its golden URLs |
+| `rank --loop \| --once \| --dry-run [--golden-day G]` | the rank job below: on G-1 builds the index from the live list; on G writes a shadow count, then G's rank rate into metricdb |
 
 Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d --build`.
 
@@ -98,6 +99,116 @@ Local engine: `OS_HEAP=3g docker compose -f deploy/compose.opensearch.yaml up -d
   the distinct-URL one, a URL golden for c keywords weighs 1/c in each. `presence` is
   the share of golden pairs whose page is in the index, the ceiling of both. With a
   prior, every listed page is in the index, with text or by its URL alone.
+
+## The rank job
+
+`isel rank --loop` (the `rank` service) fills in `ranked_num` and `ranked_rate` for each
+golden day G, every `guard.month_days` day: Metric creates a batch on each one, with or
+without a new list. The index is ready before the batch appears, so G's counts exist the
+same day.
+
+- **When.** On G-1 from `rank.build_start` (17:30 UTC) the job builds the index from the
+  recrawl text of the live list, unless the newest build already holds that list and
+  started in this window. No build starts after `rank.build_latest` (19:00): a 64M build
+  takes about 4.3 h and must end before G. Before G it reads no metricdb. From the end of
+  G's guard window (`guard.month_window`) the batch is complete; the job works on G
+  until the next G's build starts.
+- **Which index.** From G's midnight the job pins G's index: the newest build of the
+  live list that started before G. The pin is a file, `work/text_index/pins/<index>.json`,
+  written under the build lock after checking that the index exists. Every build keeps
+  pinned indices whatever `text_index.keep_prev` says, so the next G's build, or one by
+  hand, leaves G's index on the node; Host2 keeps `keep_prev = false`. At the next G's
+  build G's index is the one the alias serves, so the build peak stays as it is; the
+  pin only keeps the index past the swap, one index (0.07–0.13 TB) until G is written.
+  The build's free-space check still stops a build that would cross the flood stage.
+  The pin goes when G is `done` or `refused`; a `failed` G keeps it for a rerun by
+  hand. Every search of G
+  goes to the pinned physical index, never the alias, so a build that moves the alias
+  mid-run changes nothing. A day without a new list (Dec 8) gets a new build of the same
+  list, which holds the text the recrawl fetched since the last one.
+- **Shadow.** Once the guard window ends the job counts G's batch itself and keeps the
+  counts in the record: indexed as Metric reads it (a lookup URL in
+  `selected_urls_current`), ranked on G's index. Shards are unknown then, so only the
+  total. It writes nothing to metricdb.
+- **Snapshot.** Metric records no measurement id: a strategy rerun deletes a keyword's
+  `metric_url` rows and inserts new ones (new ids, flags false, `shard_id` NULL), and a
+  re-measure rewrites the flags in place. So before it ranks, the job needs:
+  - a coverage row of G in every table of the batch's tags;
+  - no golden row with a NULL `shard_id`: every row was measured after it was inserted
+    (until then it waits);
+  - every row's counts exactly equal to the coverage rows' `total` and `indexed_num`;
+  - every row's `is_indexed` equal to the live list's answer for its lookup URLs, so
+    Metric measured this list. Metric and isel pin the same w3lib (#52), so they
+    spell each golden URL alike;
+  - the live run equal to the pinned index's `prior_run`.
+
+  It then saves `work/rank/<G>.snapshot.json` (the batch rows, the coverage rows, the
+  live run, the index and their sha256) and ranks the snapshot's rows. Every later tick
+  compares what it reads with the snapshot and refuses G on any difference.
+- **What it writes.** Only `metric_url.is_ranked` of the batch and the ranked fields of
+  G's coverage rows, in one transaction, as the metricdb role `isel_rank`. The
+  transaction first locks the batch rows (`FOR UPDATE OF u`) and the coverage rows and
+  compares them with the snapshot; on any difference it writes nothing, uses an attempt,
+  and the next tick refuses. A strategy rerun waits on the lock, and `lock_timeout`
+  (`rank.session`) keeps the job from holding Metric up. A row is ranked if its URL, or
+  its srsltid-free form, is in the top 10 and Metric counted it indexed. Per tag and
+  team it counts distinct canonical URLs, as Metric does. Disc/Crawl/Index are never
+  measured again: the crawler injects golden URLs after G.
+- **The role.** As a superuser in metricdb (`tests/test_integration_pg.py` runs these
+  grants):
+
+  ```sql
+  CREATE ROLE isel_rank LOGIN PASSWORD '...';
+  GRANT USAGE ON SCHEMA public TO isel_rank;
+  GRANT SELECT (id, query_id, url, is_indexed, shard_id), UPDATE (is_ranked)
+      ON metric_url TO isel_rank;
+  GRANT SELECT (id, batch_id, keyword, tags) ON metric_queries TO isel_rank;
+  -- each of metric_{random,head}set_{total,a,b}:
+  GRANT SELECT (stat_date, total, indexed_num), UPDATE (ranked_num, ranked_rate)
+      ON metric_headset_total TO isel_rank;
+  ```
+
+  A column UPDATE grant is what `FOR UPDATE` needs; the role cannot change any other
+  field.
+- **Which rows.** A coverage table has no batch id. G's row is the one dated from G to
+  the day before the next golden day: Metric measures only the newest batch, so a row in
+  that span is G's. The batch is the newest one created before G+1, and it must be
+  created on G. Only the tags it has rows of count (Dec 8 is head only). Each batch is
+  measured once, after its last phase: the December runner's head phase reinserts the
+  rows of keywords it shares with random, so random's row must be measured after it
+  too, or it waits. Metric's `measure_golden.py` (its course crontab) does this, both
+  tags together, before 16:00 UTC.
+- **Refusals.** The job writes nothing, and records why, if the batch is missing, older
+  than G or has no golden rows; if the live run was activated after G's freeze start;
+  if no index of the live list was built before G; if a table holds several rows in the
+  span; if a count or a row's `is_indexed` differs as above; or if the rows changed
+  since the snapshot. `ranked_rate` divides by the row's `total`. Until Metric writes a
+  row the job waits.
+- **Outages.** A lost database connection, an OpenSearch node that does not answer, a
+  manual `text-index-build` holding the build lock, or a 404 from the pinned index
+  defers to the next tick. While the pinned index is missing the job waits; it never
+  falls back to another build. Any other error, an HTTP error reply included, counts an
+  attempt; after `rank.max_attempts` the record is `failed`.
+- **Config.** `isel rank` stops at once unless `text_index.prior_file = "live"`, as
+  `config/text_index/host2.toml` sets it. The job owns the alias: on each G-1 it
+  replaces whatever index the alias holds, a manual experiment's included; build an
+  experiment under another `text_index.alias`. December 2026
+  (`config/december-2026.toml`, batches on Dec 1, 8 and 15) comes through
+  `deploy/compose.december-2026.yaml`, which adds the overlay to the `rank` and
+  `refresh` entrypoints. Start `rank` with it before Nov 30 17:30 UTC, the Dec 1 build:
+  `docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml -f
+  deploy/compose.december-2026.yaml --profile rank up -d rank`. Recreate `refresh` with it
+  only after the Dec 1 cycle, as DESIGN §11 says.
+- **State.** `work/rank/<G>.json` holds `pending`, `done`, `refused` or `failed`, the
+  shadow counts, the written counts and the snapshot's sha256; `<G>.snapshot.json` the
+  snapshot; `<G>.ranked.parquet` each row's flags. Every step can run again after a
+  crash and gives the same values. A G that stays `pending` keeps its pin; delete the
+  pin file by hand to let a build drop the index.
+- `--dry-run` prints what a tick would do, every refusal reason, the coverage rows still
+  missing, the rows not yet measured and those whose `is_indexed` disagrees with the
+  list, plus both counts on G's index (its pin, or the one it would pin); it builds,
+  pins and writes nothing. `--golden-day G` runs G at any time and over a later
+  activation, and builds if G has no index of the live list (a missed build, by hand).
 
 ## Decision rule (written before the NanoMIRACL runs, 2026-10-23 05:40 UTC)
 
@@ -804,7 +915,6 @@ Choices and limits:
 - **Still open** (`docs/RECRAWL.md` §13):
   - compact the text Parquet, before its first 30-day cycle ends;
   - crawlerdb's title and anchor text for docs without text;
-  - a `RankMeasure` for the metric;
   - one read of batch 22 (created 11-16), if it holds no `goto` URLs, with the node restarted.
 
 ## Reproduction
